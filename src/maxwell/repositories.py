@@ -84,6 +84,27 @@ def inspect_repository(path, ref):
     return str(source)
 
 
+def validate_branch(ref):
+    validate_ref(ref)
+    if ref == "HEAD":
+        raise ValueError("A maintained checkout requires a branch name, not HEAD")
+    git("check-ref-format", f"refs/heads/{ref}")
+    return ref
+
+
+def inspect_checkout(path, name):
+    if not path:
+        raise ValueError("Repository directory must not be empty")
+    source = Path(inspect_repository(path, "HEAD"))
+    root = Path(git("rev-parse", "--show-toplevel", cwd=source)).resolve()
+    if root != source:
+        raise ValueError("Repository directory must be the checkout root")
+    origin = github_name(git("remote", "get-url", "origin", cwd=source))
+    if origin.casefold() != name.casefold():
+        raise ValueError("Checkout origin does not match the registered GitHub repository")
+    return str(source)
+
+
 class Repository:
     def __init__(self, paths, record):
         self.record = record
@@ -91,6 +112,36 @@ class Repository:
         self.directory = paths.root / "repos" / key
         self.mirror = self.directory / "mirror.git"
         self.worktrees = self.directory / "worktrees"
+
+    def update_checkout(self, token):
+        ref = validate_branch(self.record["ref"])
+        directory = inspect_checkout(self.record["directory"], self.record["name"])
+        if git("status", "--porcelain", "--untracked-files=all", cwd=directory):
+            raise ValueError("Maintained checkout has uncommitted changes; commit or stash them")
+        source = f"https://github.com/{github_name(self.record['name'])}.git"
+        tracking = f"refs/remotes/origin/{ref}"
+        git(
+            "fetch",
+            "--no-tags",
+            "--",
+            source,
+            f"+refs/heads/{ref}:{tracking}",
+            cwd=directory,
+            token=token,
+        )
+        sha = git("rev-parse", "FETCH_HEAD^{commit}", cwd=directory)
+        branch = git("for-each-ref", "--format=%(refname)", f"refs/heads/{ref}", cwd=directory)
+        if f"refs/heads/{ref}" in branch.splitlines():
+            counts = git(
+                "rev-list", "--left-right", "--count", f"refs/heads/{ref}...{sha}", cwd=directory
+            )
+            if all(int(count) for count in counts.split()):
+                raise ValueError(f"Maintained branch {ref!r} has diverged; cannot fast-forward")
+            git("switch", "--no-guess", "--no-overwrite-ignore", ref, cwd=directory)
+            git("merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", sha, cwd=directory)
+        else:
+            git("switch", "--no-track", "--no-overwrite-ignore", "-c", ref, sha, cwd=directory)
+        return directory
 
     def prepare(self, scan_id, token=None):
         self.worktrees.mkdir(parents=True, exist_ok=True)
@@ -100,6 +151,10 @@ class Repository:
         source = self.record["source"]
         if remote and source != f"https://github.com/{github_name(self.record['name'])}.git":
             raise ValueError("Remote source does not match the registered GitHub repository")
+        ref = self.record["ref"]
+        if self.record.get("directory") is not None:
+            source = self.update_checkout(token)
+            ref, remote = f"refs/heads/{ref}", False
         git(
             "-C",
             str(self.mirror),
@@ -107,7 +162,7 @@ class Repository:
             "--no-tags",
             "--",
             source,
-            self.record["ref"],
+            ref,
             token=token if remote else None,
         )
         sha = git("-C", str(self.mirror), "rev-parse", "FETCH_HEAD^{commit}")

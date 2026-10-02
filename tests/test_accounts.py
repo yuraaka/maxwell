@@ -82,8 +82,9 @@ def test_invalid_remote_identifiers(target):
         github_name(target)
 
 
-def test_remote_registration_uses_profile_and_default_branch_without_checkout(home, github):
+def test_remote_registration_defaults_to_main_without_checkout(home, github):
     config = accounts(home)
+    github["default_branch"] = "develop"
     github["tokens"]["company/backend"] = "Bearer work-token"
     args = parser().parse_args(
         ["repo", "add", "https://github.com/company/backend.git", "--account", "work"]
@@ -96,6 +97,7 @@ def test_remote_registration_uses_profile_and_default_branch_without_checkout(ho
         assert record["source_kind"] == "github"
         assert record["source"] == "https://github.com/company/backend.git"
         assert record["ref"] == "main"
+        assert record["directory"] is None
     finally:
         store.close()
     assert not list((home.root / "repos").iterdir())
@@ -271,7 +273,8 @@ def test_v1_registration_migrates_without_changing_identity(directory):
         assert record["source"] == "/existing"
         assert record["source_kind"] == "local"
         assert record["github_account"] == "default"
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert record["directory"] is None
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 3
     finally:
         store.close()
 

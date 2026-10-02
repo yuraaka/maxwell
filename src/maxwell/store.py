@@ -9,7 +9,7 @@ class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path, timeout=10)
         self.db.row_factory = sqlite3.Row
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 2:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 3:
             self.db.close()
             raise ValueError("State database was created by a newer Maxwell version")
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -53,7 +53,9 @@ class Store:
                     self.db.execute(
                         f"ALTER TABLE repositories ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'"
                     )
-            self.db.execute("PRAGMA user_version=2")
+            if "directory" not in columns:
+                self.db.execute("ALTER TABLE repositories ADD COLUMN directory TEXT")
+            self.db.execute("PRAGMA user_version=3")
 
     def close(self):
         self.db.close()
@@ -71,13 +73,33 @@ class Store:
             (time.time(), kind, json.dumps(data)),
         )
 
-    def register(self, name, source, ref, source_kind="local", github_account="default"):
+    def register(
+        self, name, source, ref, source_kind="local", github_account="default", directory=None
+    ):
         with self.db:
             self.db.execute(
-                "INSERT INTO repositories(name,source,ref,source_kind,github_account) VALUES(?,?,?,?,?)",
-                (name, source, ref, source_kind, github_account),
+                "INSERT INTO repositories(name,source,ref,source_kind,github_account,directory) "
+                "VALUES(?,?,?,?,?,?)",
+                (name, source, ref, source_kind, github_account, directory),
             )
             self.event("repository_registered", {"repository": name})
+
+    def change_repository(self, repository, changes):
+        allowed = {"source", "source_kind", "directory", "ref", "github_account"}
+        if not changes or changes.keys() - allowed:
+            raise ValueError("Invalid repository settings")
+        with self.db:
+            assignments = ",".join(f"{key}=?" for key in changes)
+            if changes.keys() & {"source", "directory", "ref"}:
+                assignments += ",last_sha=NULL"
+            cursor = self.db.execute(
+                f"UPDATE repositories SET {assignments},next_scan=0 WHERE name=?",
+                (*changes.values(), repository),
+            )
+            if not cursor.rowcount:
+                raise ValueError("Unknown repository")
+            self.event("repository_changed", {"repository": repository, "changes": changes})
+            return self.one("SELECT * FROM repositories WHERE name=?", (repository,))
 
     def set_account(self, repository, account):
         with self.db:

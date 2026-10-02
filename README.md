@@ -82,6 +82,7 @@ profiles before startup, or restart after adding/editing profiles in the YAML fi
 maxwell start
 maxwell repo add owner/repository --account personal
 maxwell repo add https://github.com/company/backend --account work
+maxwell repo add company/service --directory /path/to/service --ref develop --account work
 maxwell repo add /path/to/checkout --github company/other-project --account work --ref main
 maxwell repo list
 maxwell status
@@ -93,28 +94,41 @@ maxwell stop
 ```
 
 No existing checkout is needed. For `owner/repository` or a GitHub URL, registration
-checks access using the selected profile and chooses GitHub's default branch unless
-`--ref` is provided. The daemon fetches that branch into its own bare repository at
+checks access using the selected profile. The base branch defaults to `main`; use
+`--ref develop` (for example) to choose another branch. The daemon fetches that branch
+into its own bare repository at
 `~/.maxwell/repos/<repository-id>/mirror.git` before each scan, then creates a detached
 worktree for the pinned revision. GitHub HTTPS and `git@github.com:owner/repo.git`
 input URLs are accepted; remote transport uses HTTPS with the profile's token.
 
-For an existing local path, Maxwell infers the GitHub identity from a GitHub `origin`
-when `--github` is omitted. The default ref is local `HEAD`; an explicit branch such
-as `main` is usually better. This mode scans the committed revision available locally.
-It does not fetch the checkout's upstream, include uncommitted edits, or modify that
-working tree. Keep the local ref up to date yourself, or register the GitHub URL to
-let Maxwell fetch updates. Both modes currently require trusted repository content.
+To maintain an existing checkout, pass `--directory /path/to/checkout`. The directory
+must be the checkout root and its `origin` must identify the registered GitHub repository.
+Before each scan, Maxwell fetches the configured branch using the selected account,
+switches the checkout to it (creating the local branch if needed), and applies a
+fast-forward-only update. Dirty checkouts and diverged branches fail the scan without
+resetting or stashing local work. Local commits ahead of the remote are preserved and
+included in the scan. Discovery still runs in a separate, detached worktree.
 
-Change an existing registration's selected profile with:
+The positional local-path form remains available for scanning locally committed source
+without maintaining the checkout. It infers the GitHub identity from a GitHub `origin`
+when `--github` is omitted, defaults to `main`, and accepts `--ref HEAD` for the current
+commit. It does not fetch upstream or include uncommitted edits. Existing registrations
+keep their ref and source behavior until changed. All modes require trusted content.
+
+Change any of an existing registration's settings with:
 
 ```bash
-maxwell repo set-account company/backend --account work
+maxwell repo change company/backend --directory /path/to/backend --ref develop --account work
+maxwell repo change company/backend --ref main
+maxwell repo change company/backend --no-directory
 ```
 
-The profile must already be configured. New work and subsequent synchronization use
-the selection. Old registrations automatically migrate to local mode and the default
-account; their repository identity, history, and data remain intact.
+Omitted options retain their current values. `--no-directory` stops maintaining the
+checkout and resumes fetching directly into Maxwell's mirror. Profiles must already be
+configured. Settings apply to subsequent scans and synchronization; an active scan can
+finish with its previous settings. The daemon notices changes automatically, and the
+repository identity and history remain intact. `repo set-account` is retained for
+compatibility; use `repo change --account` for new commands.
 
 Starting the daemon immediately schedules discovery for unpaused repositories and
 can spend money and publish GitHub issues. Scheduled scans skip a previously scanned

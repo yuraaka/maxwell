@@ -139,7 +139,10 @@ def github():
             page = int(parse_qs(parsed.query).get("page", ["1"])[0])
             with lock:
                 if len(parts) == 3 and parts[0] == "repos":
-                    data = {"full_name": "/".join(parts[1:3]), "default_branch": "main"}
+                    data = {
+                        "full_name": "/".join(parts[1:3]),
+                        "default_branch": state.get("default_branch", "main"),
+                    }
                 elif len(parts) == 4 and parts[-1] == "issues":
                     data = (
                         [

@@ -14,7 +14,14 @@ from maxwell import __version__
 from maxwell.config import Paths
 from maxwell.daemon import Daemon, request
 from maxwell.github import GitHub
-from maxwell.repositories import git, github_name, inspect_repository, validate_ref
+from maxwell.repositories import (
+    git,
+    github_name,
+    inspect_checkout,
+    inspect_repository,
+    validate_branch,
+    validate_ref,
+)
 from maxwell.store import Store
 
 
@@ -24,16 +31,28 @@ def parser():
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create private configuration and runtime directories")
-    repo = commands.add_parser("repo", help="Register or list repositories")
+    repo = commands.add_parser("repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
     add = repositories.add_parser("add")
     add.add_argument("source", help="Local path, owner/repository, or GitHub repository URL")
     add.add_argument("--github", help="GitHub owner/repository; inferred from origin if possible")
-    add.add_argument("--ref", help="Revision to scan (local: HEAD; remote: GitHub default branch)")
+    add.add_argument("--directory", help="Existing checkout to switch and update before scans")
+    add.add_argument("--ref", default="main", help="Base branch to scan (default: main)")
     add.add_argument(
         "--account", default="default", help="GitHub credential profile from config.yaml"
     )
     repositories.add_parser("list")
+    change = repositories.add_parser("change", help="Change a repository's settings")
+    change.add_argument("repository")
+    directory = change.add_mutually_exclusive_group()
+    directory.add_argument(
+        "--directory", help="Existing checkout to switch and update before scans"
+    )
+    directory.add_argument(
+        "--no-directory", action="store_true", help="Stop maintaining a checkout"
+    )
+    change.add_argument("--ref", help="Base branch to scan")
+    change.add_argument("--account", help="GitHub credential profile from config.yaml")
     account = repositories.add_parser("set-account", help="Change a repository's GitHub profile")
     account.add_argument("repository")
     account.add_argument("--account", required=True)
@@ -66,9 +85,9 @@ def infer_github(path):
 def register_repository(args, paths, config):
     settings = config.github.for_account(args.account)
     local = Path(args.source).expanduser()
+    ref = validate_ref(args.ref)
     if local.is_dir():
-        ref = args.ref or "HEAD"
-        source = inspect_repository(local, ref)
+        source = inspect_repository(local, "HEAD" if args.directory else ref)
         name = github_name(args.github) if args.github else infer_github(source)
         kind = "local"
     else:
@@ -81,11 +100,15 @@ def register_repository(args, paths, config):
         finally:
             client.close()
         name = github_name(metadata["full_name"])
-        ref = validate_ref(args.ref or metadata["default_branch"])
+        source, kind = f"https://github.com/{name}.git", "github"
+    directory = None
+    if args.directory is not None:
+        validate_branch(ref)
+        directory = inspect_checkout(args.directory, name)
         source, kind = f"https://github.com/{name}.git", "github"
     store = Store(paths.db)
     try:
-        store.register(name, source, ref, kind, args.account)
+        store.register(name, source, ref, kind, args.account, directory)
     finally:
         store.close()
     return {
@@ -94,7 +117,36 @@ def register_repository(args, paths, config):
         "source_kind": kind,
         "ref": ref,
         "github_account": args.account,
+        "directory": directory,
     }
+
+
+def change_repository(args, store, config):
+    record = store.one("SELECT * FROM repositories WHERE name=?", (args.repository,))
+    if record is None:
+        raise ValueError("Unknown repository")
+    changes = {}
+    if args.account is not None:
+        config.github.for_account(args.account)
+        changes["github_account"] = args.account
+    if args.ref is not None:
+        changes["ref"] = validate_ref(args.ref)
+    if args.directory is not None:
+        changes.update(
+            directory=inspect_checkout(args.directory, record["name"]),
+            source=f"https://github.com/{record['name']}.git",
+            source_kind="github",
+        )
+    elif args.no_directory:
+        changes["directory"] = None
+    if not changes:
+        raise ValueError("Specify --directory, --no-directory, --ref, or --account")
+    updated = {**record, **changes}
+    if updated["directory"] is not None:
+        validate_branch(updated["ref"])
+    elif "ref" in changes and updated["source_kind"] == "local":
+        inspect_repository(updated["source"], updated["ref"])
+    return store.change_repository(record["name"], changes)
 
 
 def execute(args):
@@ -116,6 +168,8 @@ def execute(args):
         try:
             if args.repo_command == "list":
                 output(store.rows("SELECT * FROM repositories ORDER BY name"))
+            elif args.repo_command == "change":
+                output(change_repository(args, store, config))
             elif args.repo_command == "set-account":
                 config.github.for_account(args.account)
                 store.set_account(args.repository, args.account)
