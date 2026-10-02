@@ -41,6 +41,25 @@ Credentials may be literal values in this file. Configuration files must have mo
 `0600`; runtime directories use `0700`. `init` never overwrites an existing config.
 Restart after configuration changes. No credentials are required for the test suite.
 
+Check configuration before starting the daemon:
+
+```bash
+maxwell config check
+maxwell config check --offline
+```
+
+The command checks YAML structure, field values, file permissions, required credentials,
+model prices, Git, the provider executable, and registered repositories' account selections.
+By default it also authenticates each configured GitHub account, reports its login, and
+checks access to registered repositories. `--offline` skips network requests. The default
+account may be empty when repositories use named profiles; named profiles need tokens.
+Errors identify the settings to fix without printing credential values. The command
+prints a JSON report and exits with status 0 on success or 1 on failure.
+
+Checks do not start the daemon, change configuration or repository settings, publish
+issues, or make model calls. Provider credentials/model access and GitHub write
+permissions are not verified by this command.
+
 For different GitHub accounts or repository-specific access keys, define named profiles:
 
 ```yaml

@@ -12,6 +12,7 @@ import httpx
 
 from maxwell import __version__
 from maxwell.config import Paths
+from maxwell.config_check import check_config
 from maxwell.daemon import Daemon, request
 from maxwell.github import GitHub
 from maxwell.repositories import (
@@ -31,6 +32,10 @@ def parser():
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create private configuration and runtime directories")
+    config = commands.add_parser("config", help="Check configuration")
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    check = config_commands.add_parser("check", help="Validate settings and GitHub access")
+    check.add_argument("--offline", action="store_true", help="Skip GitHub network checks")
     repo = commands.add_parser("repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
     add = repositories.add_parser("add")
@@ -151,6 +156,12 @@ def change_repository(args, store, config):
 
 def execute(args):
     paths = Paths(args.home)
+    if args.command == "config":
+        report = check_config(paths, online=not args.offline)
+        output(report)
+        if not report["valid"]:
+            raise SystemExit(1)
+        return
     if args.command == "init":
         if paths.config.exists():
             raise ValueError("Configuration already exists; it was not overwritten")
