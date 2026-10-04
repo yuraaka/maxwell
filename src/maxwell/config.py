@@ -12,6 +12,7 @@ from pydantic import (
     Field,
     SecretStr,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -71,14 +72,97 @@ class GitHubSettings(Settings):
         )
 
 
-class ProviderSettings(Settings):
-    adapter: Literal["codex"] = "codex"
-    executable: str = "codex"
-    model: str = ""
-    api_key: SecretStr = SecretStr("")
+class ModelSettings(Settings):
     input_usd_per_mtok: float | None = Field(default=None, ge=0)
     cached_input_usd_per_mtok: float | None = Field(default=None, ge=0)
+    cache_write_usd_per_mtok: float | None = Field(default=None, ge=0)
     output_usd_per_mtok: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def complete_prices(self):
+        if (self.input_usd_per_mtok is None) != (self.output_usd_per_mtok is None):
+            raise ValueError("Set both input and output prices, or leave both unpriced")
+        return self
+
+
+class ProviderSettings(ModelSettings):
+    adapter: Literal["codex", "claude"] = "codex"
+    executable: str = ""
+    home: str | None = None
+    profile: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_-]+$")
+    env: list[str] = Field(default_factory=list)
+    model: str = ""
+    models: dict[str, ModelSettings] = Field(default_factory=dict)
+    api_key: SecretStr = SecretStr("")
+
+    @field_validator("home", "executable")
+    @classmethod
+    def connection_paths(cls, value, info: ValidationInfo):
+        if value and (info.field_name == "home" or "/" in value):
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = Path((info.context or {}).get("config_root", Path.cwd())) / path
+            return str(path.resolve())
+        return value
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def model_catalog(cls, value):
+        if isinstance(value, list):
+            return {name: {} for name in value}
+        return value
+
+    @model_validator(mode="after")
+    def connection(self):
+        if not self.executable:
+            self.executable = "codex" if self.adapter == "codex" else "claude"
+        if self.home is not None and not self.home.strip():
+            raise ValueError("Provider home must not be empty")
+        if self.home is not None and self.api_key.get_secret_value():
+            raise ValueError("Use either a native home or an API key for a provider")
+        if self.adapter == "claude" and self.home is None:
+            raise ValueError("Claude Code requires its existing configuration home")
+        if self.profile is not None and (self.adapter != "codex" or self.home is None):
+            raise ValueError("A native profile requires a Codex provider with a home")
+        if any(not name or not name.replace("_", "").isalnum() for name in self.env):
+            raise ValueError("Provider environment entries must be variable names")
+        return self
+
+    def for_model(self, model):
+        if (
+            not isinstance(model, str)
+            or not model.strip()
+            or model.startswith("-")
+            or any(character.isspace() for character in model)
+        ):
+            raise ValueError("Specify a valid --model")
+        if self.models and model not in self.models:
+            raise ValueError("Model is not in the selected provider's model catalog")
+        prices = self.models.get(model)
+        if prices is None:
+            prices = (
+                ModelSettings.model_validate(
+                    self.model_dump(include=set(ModelSettings.model_fields))
+                )
+                if model == self.model
+                else ModelSettings()
+            )
+        return self.model_copy(update={"model": model, **prices.model_dump()})
+
+    def default_model(self):
+        if self.model:
+            return self.model
+        if len(self.models) == 1:
+            return next(iter(self.models))
+        if self.models:
+            raise ValueError("Specify --model when the provider has multiple models")
+        if self.home is not None:
+            from maxwell.provider_runtime import native_settings
+
+            model = native_settings(self)[0].get("model")
+            if isinstance(model, str) and model:
+                return model
+        raise ValueError("Specify --model; the provider has no configured default model")
 
 
 class Limits(Settings):
@@ -90,13 +174,22 @@ class Limits(Settings):
     human_queue_max: int = Field(default=6, ge=1)
     minimum_confidence: float = Field(default=0.8, ge=0, le=1)
     shutdown_grace_seconds: float = Field(default=10, ge=0, le=300)
+    daily_scan_limit: int = Field(default=20, ge=1)
 
 
 class Config(Settings):
     version: Literal[1] = 1
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
+    providers: dict[str, ProviderSettings] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
+
+    @model_validator(mode="before")
+    @classmethod
+    def provider_forms(cls, data):
+        if isinstance(data, dict) and data.get("providers") and "provider" in data:
+            raise ValueError("Use either provider or providers in config.yaml")
+        return data
 
     @model_validator(mode="after")
     def reservation_fits(self):
@@ -108,18 +201,64 @@ class Config(Settings):
         errors = []
         if not shutil.which("git"):
             errors.append("git: executable was not found on PATH")
-        if not shutil.which(self.provider.executable):
-            errors.append("provider.executable: executable was not found on PATH")
+        for name, provider in self.all_providers().items():
+            label = "provider" if not self.providers else f"providers.{name}"
+            if not shutil.which(provider.executable):
+                errors.append(f"{label}.executable: executable was not found on PATH")
+            if provider.home is not None:
+                from maxwell.provider_runtime import native_errors
+
+                errors.extend(f"{label}: {error}" for error in native_errors(provider))
+            elif not provider.api_key.get_secret_value().strip():
+                errors.append(f"{label}.api_key: set an API key or an existing provider home")
         if not any(secret.get_secret_value().strip() for secret in self.github_tokens()):
             errors.append("github: set github.token or a github.accounts token in config.yaml")
-        if not self.provider.api_key.get_secret_value().strip():
-            errors.append("provider.api_key: set a nonempty API key")
-        if not self.provider.model.strip():
-            errors.append("provider.model: set a nonempty model identifier")
-        for field in ("input_usd_per_mtok", "output_usd_per_mtok"):
-            if getattr(self.provider, field) is None:
-                errors.append(f"provider.{field}: set the model price")
+        if not self.providers and self.provider.home is None:
+            if not self.provider.model.strip():
+                errors.append("provider.model: set a nonempty model identifier")
+            for field in ("input_usd_per_mtok", "output_usd_per_mtok"):
+                if getattr(self.provider, field) is None:
+                    errors.append(f"provider.{field}: set the model price")
         return errors
+
+    def all_providers(self):
+        return self.providers or {"default": self.provider}
+
+    def provider_name(self, name=None):
+        providers = self.all_providers()
+        if name is None:
+            if len(providers) != 1:
+                raise ValueError("Specify --provider when multiple providers are configured")
+            return next(iter(providers))
+        if name not in providers:
+            raise ValueError(f"Unknown provider {name!r}")
+        return name
+
+    def route(self, provider=None, model=None, current=None):
+        name = self.provider_name(provider or (current["provider"] if current else None))
+        settings = self.all_providers()[name]
+        if model is None:
+            model = (
+                current["model"]
+                if current and current["provider"] == name
+                else settings.default_model()
+            )
+        settings.for_model(model)
+        return {"provider": name, "model": model}
+
+    def execution(self, route, record):
+        name = self.provider_name(route["provider"])
+        settings = self.all_providers()[name].for_model(route["model"])
+        return {
+            **route,
+            "stage": "discovery",
+            "settings": settings.model_dump(mode="json", exclude={"api_key"}),
+            "repository": {
+                key: record.get(key)
+                for key in ("name", "source", "source_kind", "ref", "directory", "github_account")
+            },
+            "limits": self.limits.model_dump(),
+        }
 
     def ready(self):
         errors = self.readiness_errors()
@@ -131,7 +270,11 @@ class Config(Settings):
 
     def redact(self, text: str) -> str:
         values = {
-            secret.get_secret_value() for secret in (*self.github_tokens(), self.provider.api_key)
+            secret.get_secret_value()
+            for secret in (
+                *self.github_tokens(),
+                *(provider.api_key for provider in self.all_providers().values()),
+            )
         }
         values.update(
             base64.b64encode(f"x-access-token:{secret.get_secret_value()}".encode()).decode()
@@ -166,11 +309,20 @@ class Paths:
             raise ValueError(f"Restrict configuration permissions: chmod 600 {self.config}")
         try:
             data = yaml.safe_load(self.config.read_text())
-            return Config.model_validate({} if data is None else data)
+            return Config.model_validate(
+                {} if data is None else data, context={"config_root": self.root}
+            )
         except Exception as exc:
             # Validation errors can embed credential values.
             if detailed and isinstance(exc, ValidationError):
-                models = (Config, GitHubSettings, GitHubAccount, ProviderSettings, Limits)
+                models = (
+                    Config,
+                    GitHubSettings,
+                    GitHubAccount,
+                    ProviderSettings,
+                    ModelSettings,
+                    Limits,
+                )
                 fields = {name for model in models for name in model.model_fields}
                 errors = []
                 for error in exc.errors(
@@ -190,8 +342,8 @@ class Paths:
 
     def init_config(self):
         self.initialize()
+        data = Config().model_dump(mode="json", exclude_none=True, exclude={"provider"})
+        data["providers"] = {"codex": {"adapter": "codex", "home": "~/.codex"}}
         with self.config.open("x", encoding="utf-8") as stream:
-            yaml.safe_dump(
-                Config().model_dump(mode="json", exclude_none=True), stream, sort_keys=False
-            )
+            yaml.safe_dump(data, stream, sort_keys=False)
         self.config.chmod(0o600)

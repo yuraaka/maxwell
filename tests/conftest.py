@@ -82,6 +82,8 @@ if mode == 'modify':
     (workspace / 'app.py').write_text('changed by worker')
 result = {'summary': 'Completed discovery. ' + os.environ.get('CODEX_API_KEY', ''),
           'findings': [] if mode == 'empty' else [FINDING]}
+if 'ok' in json.loads(Path(args[args.index('--output-schema') + 1]).read_text())['properties']:
+    result = {'ok': True}
 output.write_text('not json' if mode == 'malformed' else json.dumps(result))
 print(json.dumps({'type': 'diagnostic', 'text': os.environ.get('CODEX_API_KEY', '')}), flush=True)
 if mode != 'unknown':
@@ -138,7 +140,9 @@ def github():
             parts = parsed.path.strip("/").split("/")
             page = int(parse_qs(parsed.query).get("page", ["1"])[0])
             with lock:
-                if len(parts) == 3 and parts[0] == "repos":
+                if parts == ["user"]:
+                    data = {"login": "maintainer"}
+                elif len(parts) == 3 and parts[0] == "repos":
                     data = {
                         "full_name": "/".join(parts[1:3]),
                         "default_branch": state.get("default_branch", "main"),

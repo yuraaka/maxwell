@@ -7,9 +7,10 @@ import os
 import signal
 import time
 
+from maxwell.config import Limits, ProviderSettings
 from maxwell.contracts import Usage, estimate_cost, micros
 from maxwell.github import GitHub
-from maxwell.provider import CodexProvider, discovery_prompt
+from maxwell.provider import create_provider, discovery_prompt
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
 from maxwell.repositories import Repository, stop_orphan
 from maxwell.store import Store
@@ -30,7 +31,7 @@ async def request(paths, command, **arguments):
 
 
 class Daemon:
-    def __init__(self, paths, config, provider_factory=CodexProvider):
+    def __init__(self, paths, config, provider_factory=create_provider):
         self.paths, self.config, self.provider_factory = paths, config, provider_factory
         self.store = None
         self.stopping = asyncio.Event()
@@ -64,10 +65,30 @@ class Daemon:
                 if not isinstance(priority, int) or priority not in range(4):
                     raise ValueError("Priority must be P0–P3")
                 repositories = (
-                    [{"name": repo}] if repo else self.store.rows("SELECT name FROM repositories")
+                    [self.store.one("SELECT * FROM repositories WHERE name=?", (repo,))]
+                    if repo
+                    else self.store.rows("SELECT * FROM repositories")
                 )
+                if any(record is None for record in repositories):
+                    raise ValueError("Unknown repository")
+                if not data.get("model"):
+                    raise ValueError("Manual scans require --model")
+                executions = [
+                    self.config.execution(
+                        self.config.route(
+                            data.get("provider"),
+                            data["model"],
+                            self.store.saved_route(record["name"]),
+                        ),
+                        record,
+                    )
+                    for record in repositories
+                ]
                 result = {
-                    "scans": [self.store.enqueue(row["name"], priority) for row in repositories]
+                    "scans": [
+                        self.store.enqueue(record["name"], priority, execution=execution)
+                        for record, execution in zip(repositories, executions, strict=True)
+                    ]
                 }
                 self.wake.set()
             else:
@@ -97,15 +118,35 @@ class Daemon:
             )
 
     async def scan(self, job):
-        record = self.store.one("SELECT * FROM repositories WHERE name=?", (job["repository"],))
-        repository = Repository(self.paths, record)
+        settings = self.config.provider
         artifact = self.paths.root / "artifacts" / job["id"]
         artifact.mkdir(parents=True, exist_ok=True)
-        provider = self.provider_factory(self.paths, self.config)
+        provider = None
         worktree = None
         state, summary, error, findings, cost = "failed", "Discovery failed.", None, [], None
         usage = Usage()
         try:
+            if not job.get("execution"):
+                record = self.store.one(
+                    "SELECT * FROM repositories WHERE name=?", (job["repository"],)
+                )
+                route = self.store.ensure_route(job["repository"], self.config)
+                job = self.store.bind_execution(job["id"], self.config.execution(route, record))
+            execution = json.loads(job["execution"])
+            if execution["stage"] != "discovery":
+                raise ValueError("Only discovery execution is implemented")
+            record = execution["repository"]
+            settings = ProviderSettings.model_validate(execution["settings"])
+            name = self.config.provider_name(execution["provider"])
+            settings.api_key = self.config.all_providers()[name].api_key
+            scan_config = self.config.model_copy(
+                update={
+                    "provider": settings,
+                    "limits": Limits.model_validate(execution["limits"]),
+                }
+            )
+            repository = Repository(self.paths, record)
+            provider = self.provider_factory(self.paths, scan_config)
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE scans SET artifact=? WHERE id=?", (str(artifact), job["id"])
@@ -119,7 +160,12 @@ class Daemon:
             sha, worktree = await asyncio.to_thread(repository.prepare, job["id"], token)
             with self.store.db:
                 self.store.db.execute("UPDATE scans SET sha=? WHERE id=?", (sha, job["id"]))
-            if sha == record["last_sha"] and not job["forced"]:
+            previous = self.store.one(
+                "SELECT id FROM scans WHERE repository=? AND execution IS ? AND sha=? "
+                "AND state='completed' LIMIT 1",
+                (job["repository"], job.get("execution"), sha),
+            )
+            if previous and not job["forced"]:
                 state, summary, cost = "skipped", "Revision already scanned; no model call.", 0
             else:
                 known = [
@@ -130,46 +176,52 @@ class Daemon:
                     )
                 ]
                 prompt = discovery_prompt(
-                    job["repository"], sha, self.config.limits.max_findings_per_scan, known
+                    job["repository"], sha, scan_config.limits.max_findings_per_scan, known
                 )
                 (artifact / "prompt.txt").write_text(self.config.redact(prompt))
-                policy = self.config.model_dump(mode="json")
-                (artifact / "policy.json").write_text(json.dumps(policy, indent=2))
+                policy = execution or self.config.model_dump(mode="json")
+                (artifact / "policy.json").write_text(
+                    self.config.redact(json.dumps(policy, indent=2))
+                )
                 (artifact / "policy.sha256").write_text(
                     hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
                 )
 
                 def started(pid):
                     with self.store.db:
-                        self.store.db.execute("UPDATE scans SET pid=? WHERE id=?", (pid, job["id"]))
+                        self.store.db.execute(
+                            "UPDATE scans SET pid=?,executed=1 WHERE id=?", (pid, job["id"])
+                        )
 
                 result = await provider.scan(worktree, artifact, prompt, started)
                 if not await asyncio.to_thread(repository.unchanged, worktree, sha):
                     raise ValueError("Discovery modified its worktree; findings rejected")
                 slots = (
-                    self.config.limits.human_queue_max
+                    scan_config.limits.human_queue_max
                     - self.store.one(
                         "SELECT COUNT(*) AS n FROM findings WHERE repository=? AND state NOT IN ('closed','confirmed','rejected')",
                         (job["repository"],),
                     )["n"]
                 )
                 seen = set()
+                new_findings = 0
                 for finding in sorted(
                     result.findings, key=lambda item: (item.priority, -item.confidence)
                 ):
                     finding.validate_location(worktree)
-                    if finding.confidence < self.config.limits.minimum_confidence:
+                    if finding.confidence < scan_config.limits.minimum_confidence:
                         continue
                     identity = finding.identity(job["repository"])
                     if identity in seen:
                         continue
                     seen.add(identity)
-                    if self.store.one(
-                        "SELECT id FROM findings WHERE id=?", (finding.identity(job["repository"]),)
+                    existing = self.store.one("SELECT id FROM findings WHERE id=?", (identity,))
+                    if existing or new_findings < min(
+                        slots, scan_config.limits.max_findings_per_scan
                     ):
-                        continue
-                    if len(findings) < min(slots, self.config.limits.max_findings_per_scan):
                         findings.append(finding)
+                        if not existing:
+                            new_findings += 1
                 state, summary = "completed", result.summary
         except asyncio.CancelledError:
             state, summary, error = "cancelled", "Discovery cancelled during shutdown.", "Cancelled"
@@ -180,11 +232,13 @@ class Daemon:
             summary = f"Discovery failed: {error}"
             self.log.warning("Scan %s failed: %s", job["id"], error)
         finally:
-            if provider.started:
+            if provider is not None and provider.started:
                 usage = provider.usage
-                cost = estimate_cost(usage, self.config.provider)
+                cost = estimate_cost(usage, settings)
             elif cost is None:
                 cost = 0
+            if job.get("accounting") == "unpriced" and provider is not None and provider.started:
+                cost = None
             self.store.finish(job, state, self.config.redact(summary), usage, cost, findings, error)
             current = self.store.one("SELECT * FROM scans WHERE id=?", (job["id"],))
             (artifact / "summary.json").write_text(json.dumps(current, indent=2))
@@ -205,10 +259,31 @@ class Daemon:
     async def worker(self):
         profile = f"codex/{self.config.provider.model}/discovery-v1"
         while not self.stopping.is_set():
+            for old in self.store.rows(
+                "SELECT id,repository FROM scans WHERE state='queued' AND execution IS NULL"
+            ):
+                try:
+                    record = self.store.one(
+                        "SELECT * FROM repositories WHERE name=?", (old["repository"],)
+                    )
+                    route = self.store.ensure_route(old["repository"], self.config)
+                    self.store.bind_execution(old["id"], self.config.execution(route, record))
+                except ValueError as exc:
+                    self.log.warning(
+                        "Cannot resolve queued scan %s: %s", old["id"], self.config.redact(str(exc))
+                    )
             for repo in self.store.rows(
                 "SELECT * FROM repositories WHERE paused=0 AND next_scan<=?", (time.time(),)
             ):
-                self.store.enqueue(repo["name"], forced=False)
+                try:
+                    route = self.store.ensure_route(repo["name"], self.config)
+                    self.store.enqueue(
+                        repo["name"], forced=False, execution=self.config.execution(route, repo)
+                    )
+                except ValueError as exc:
+                    self.log.warning(
+                        "Cannot schedule %s: %s", repo["name"], self.config.redact(str(exc))
+                    )
                 with self.store.db:
                     self.store.db.execute(
                         "UPDATE repositories SET next_scan=? WHERE name=?",
@@ -219,6 +294,7 @@ class Daemon:
                 micros(self.config.limits.scan_reservation_usd),
                 self.config.limits.human_queue_max,
                 profile,
+                self.config.limits.daily_scan_limit,
             )
             if job:
                 self.active = asyncio.create_task(self.scan(job))

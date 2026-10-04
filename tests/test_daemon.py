@@ -78,7 +78,9 @@ def test_end_to_end_controls_issue_costs_dedup_and_human_commands(home, register
         )
         assert "Discovery" in next(iter(github["comments"].values()))[0]["body"]
         control(home, "pause", repository="acme/repo")
-        queued = control(home, "scan", repository="acme/repo", priority=1)["scans"][0]
+        queued = control(home, "scan", repository="acme/repo", priority=1, model="fake-model")[
+            "scans"
+        ][0]
         assert registered.one("SELECT state FROM scans WHERE id=?", (queued,))["state"] == "queued"
         control(home, "resume", repository="acme/repo")
         eventually(

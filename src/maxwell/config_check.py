@@ -1,8 +1,15 @@
+import asyncio
+import shutil
 import sqlite3
+import tempfile
+from pathlib import Path
 
 import httpx
 
+from maxwell.config import Paths
 from maxwell.github import GitHub
+from maxwell.provider import create_provider
+from maxwell.provider_runtime import native_errors
 
 
 def registered_repositories(paths):
@@ -14,6 +21,22 @@ def registered_repositories(paths):
         account = "github_account" if "github_account" in columns else "'default'"
         return connection.execute(
             f"SELECT name,{account} FROM repositories ORDER BY name"
+        ).fetchall()
+    finally:
+        connection.close()
+
+
+def registered_routes(paths):
+    if not paths.db.exists():
+        return []
+    connection = sqlite3.connect(paths.db.as_uri() + "?mode=ro", uri=True)
+    try:
+        if not connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='repository_stage_routes'"
+        ).fetchone():
+            return []
+        return connection.execute(
+            "SELECT repository,stage,provider,model FROM repository_stage_routes ORDER BY repository,stage"
         ).fetchall()
     finally:
         connection.close()
@@ -60,6 +83,74 @@ def check_config(paths, online=True):
         elif not profiles[account].token.get_secret_value().strip():
             add(f"repository:{repository}", "error", f"GitHub account {account!r} has no token")
 
+    try:
+        routes = registered_routes(paths)
+    except sqlite3.Error:
+        add("stage_routes", "error", "Cannot read saved provider/model assignments")
+        routes = []
+    assigned = set()
+    pairs = set()
+    for repository, stage, provider, model in routes:
+        if stage == "discovery":
+            assigned.add(repository)
+        try:
+            config.route(provider, model)
+            pairs.add((provider, model))
+            add(f"stage:{repository}:{stage}", "ok", "Saved provider and model are configured")
+        except ValueError as exc:
+            add(f"stage:{repository}:{stage}", "error", str(exc))
+    for repository, _ in repositories:
+        if repository not in assigned:
+            try:
+                route = config.route()
+                pairs.add((route["provider"], route["model"]))
+            except ValueError as exc:
+                add(f"stage:{repository}:discovery", "error", str(exc))
+    for name, settings in config.all_providers().items():
+        errors = []
+        if not shutil.which(settings.executable):
+            errors.append("Provider executable was not found")
+        if settings.home is not None:
+            errors.extend(native_errors(settings))
+        elif not settings.api_key.get_secret_value().strip():
+            errors.append("Set an API key or an existing provider home")
+        add(
+            f"provider:{name}",
+            "error" if errors else "ok",
+            "; ".join(errors)
+            if errors
+            else "Provider configuration and dependencies are available",
+        )
+        models = set(settings.models)
+        if settings.model:
+            models.add(settings.model)
+        if not models and not errors:
+            try:
+                models.add(settings.default_model())
+            except ValueError:
+                if not any(provider == name for provider, _ in pairs):
+                    add(
+                        f"provider:{name}:model",
+                        "error" if online else "skipped",
+                        "Set a provider model, model catalog, or repository stage model to verify access",
+                    )
+        for model in models:
+            try:
+                settings.for_model(model)
+                pairs.add((name, model))
+            except ValueError as exc:
+                add(f"provider:{name}:{model}", "error", str(exc))
+        for provider, model in sorted(pairs):
+            if provider != name:
+                continue
+            label = f"provider:{name}:{model}"
+            if errors:
+                add(label, "skipped", "Online check blocked by provider configuration errors")
+            elif not online:
+                add(label, "skipped", "Authentication and model access were not checked offline")
+            else:
+                provider_check(config, name, model, label, add)
+
     for name, settings in profiles.items():
         label = f"github:{name}"
         if not settings.token.get_secret_value().strip():
@@ -84,17 +175,37 @@ def check_config(paths, online=True):
                         github_check(client, f"repos/{repository}", f"repository:{repository}", add)
         finally:
             client.close()
-    add(
-        "provider",
-        "skipped",
-        "Provider credentials and model access are not verified; no model call was made",
-    )
     for check in checks:
         for key in ("name", "message"):
             check[key] = config.redact(check[key])
     result = report()
     result["config"] = config.redact(result["config"])
     return result
+
+
+def provider_check(config, name, model, label, add):
+    settings = config.all_providers()[name].for_model(model)
+    timeout = min(30, config.limits.scan_timeout_seconds)
+    probe_config = config.model_copy(
+        update={
+            "provider": settings,
+            "limits": config.limits.model_copy(update={"scan_timeout_seconds": timeout}),
+        }
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="maxwell-check-") as directory:
+            root = Path(directory).resolve()
+            workspace, artifact = root / "workspace", root / "artifacts"
+            workspace.mkdir()
+            artifact.mkdir()
+            provider = create_provider(Paths(root / "runtime"), probe_config)
+            asyncio.run(provider.probe(workspace, artifact))
+    except TimeoutError:
+        add(label, "error", f"Provider/model request timed out after {timeout:g} seconds")
+    except (ValueError, OSError) as exc:
+        add(label, "error", f"Provider/model request failed: {exc}")
+    else:
+        add(label, "ok", "Authenticated request succeeded; model access verified")
 
 
 def github_check(client, path, label, add):

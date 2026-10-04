@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import shlex
 import time
 
 from maxwell.github import PublicationUncertain
@@ -14,6 +15,16 @@ def scan_report(scan):
     usage = json.loads(scan["usage"] or "{}")
     if not usage.get("reported"):
         usage = {"complete": False}
+    cost = (
+        "unpriced"
+        if scan.get("accounting") == "unpriced" and scan["cost"] is None
+        else money(scan["cost"])
+    )
+    accounting = (
+        "Unpriced usage is limited by the daily scan count; no dollar estimate is available."
+        if scan.get("accounting") == "unpriced"
+        else "Unknown spending retains its budget reservation; it is never recorded as zero."
+    )
     return f"""<!-- maxwell:scan:{scan["id"]} -->
 ### Discovery scan `{scan["id"][:12]}` — {scan["state"]}
 
@@ -21,26 +32,30 @@ def scan_report(scan):
 
 Revision: `{scan["sha"] or "not resolved"}`  
 Profile: `{scan["profile"] or "not started"}`
+Provider: `{scan.get("provider") or "legacy"}`; model: `{scan.get("model") or "legacy"}`
 
 | Stage | Spending | Result |
 | --- | --- | --- |
-| Discovery | {money(scan["cost"])} | {scan["admitted"]} new candidates |
+| Discovery | {cost} | {scan["admitted"]} new candidates |
 | Reproduction | Not run | Later milestone |
 | Fixing | Not run | Later milestone |
 | Validation / integration | Not run | Later milestone |
 
-**Total: {money(scan["cost"])}.** Includes the failed attempt, if any.
+**Total: {cost}.** Includes the failed attempt, if any.
 Reported tokens: input {usage.get("input_tokens", "unknown")}, cached input
 {usage.get("cached_input_tokens", "unknown")}, output {usage.get("output_tokens", "unknown")}.
 Usage complete: {usage.get("complete", False)}.
 Allocated to findings: {money(scan["allocated"])}; remaining known spending is discovery overhead.
-Unknown spending retains its budget reservation; it is never recorded as zero.
+{accounting}
 """
 
 
 def hunter_ratings(store, repo=None):
     rows = store.rows(
-        "SELECT s.profile, f.state FROM findings f JOIN scans s ON s.id=f.scan_id "
+        "SELECT DISTINCT s.profile, f.id, f.state FROM findings f "
+        "JOIN (SELECT finding_id,scan_id FROM finding_observations UNION "
+        "SELECT id AS finding_id,scan_id FROM findings) o ON o.finding_id=f.id "
+        "JOIN scans s ON s.id=o.scan_id "
         "WHERE (? IS NULL OR f.repository=?) AND f.state IN ('confirmed','rejected')",
         (repo, repo),
     )
@@ -184,7 +199,11 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         )
         findings = self.store.rows("SELECT * FROM findings WHERE repository=?", (repo,))
         total = sum(scan["cost"] or 0 for scan in scans)
-        unknown = sum(scan["cost"] is None and scan["started"] is not None for scan in scans)
+        unknown = sum(
+            scan["accounting"] == "usd" and scan["cost"] is None and scan["started"] is not None
+            for scan in scans
+        )
+        unpriced = sum(scan["accounting"] == "unpriced" and scan["executed"] for scan in scans)
         allocated = sum(scan["allocated"] for scan in scans)
         ratings = hunter_ratings(self.store, repo)
         body = f"""{marker}
@@ -199,6 +218,7 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
 | Allocated discovery spending | {money(allocated)} |
 | Unallocated known overhead | {money(total - allocated)} |
 | Executions with unknown spending | {unknown} |
+| Unpriced executions | {unpriced} |
 | Findings | {len(findings)} |
 | Scans | {len(scans)} |
 
@@ -208,8 +228,13 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
 ### Recent scans
 """
         for scan in scans[:10]:
-            body += f"- `{scan['id'][:12]}`: {scan['state']}, {money(scan['cost'])}\n"
-        body += "\nAuthorized commands: `/maxwell scan`, `/maxwell pause`, `/maxwell resume`.\n"
+            cost = (
+                "unpriced"
+                if scan["accounting"] == "unpriced" and scan["cost"] is None
+                else money(scan["cost"])
+            )
+            body += f"- `{scan['id'][:12]}`: {scan['state']}, {cost}, {scan['provider'] or 'legacy'}/{scan['model'] or 'legacy'}\n"
+        body += "\nAuthorized commands: `/maxwell scan --model MODEL [--provider PROVIDER]`, `/maxwell pause`, `/maxwell resume`.\n"
         body = self.config.redact(body)
         snapshot = self.paths.root / "reports" / (repo.replace("/", "--") + ".md")
         snapshot.write_text(body)
@@ -306,12 +331,51 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                         "INSERT OR IGNORE INTO comments(id) VALUES(?)", (comment["id"],)
                     )
             elif not finding and action in ("scan", "pause", "resume"):
+                execution = None
+                if action == "scan":
+                    try:
+                        options = shlex.split(argument)
+                        if (
+                            not options
+                            or len(options) % 2
+                            or any(
+                                option not in ("--model", "--provider") for option in options[::2]
+                            )
+                            or len(set(options[::2])) != len(options[::2])
+                        ):
+                            raise ValueError(
+                                "Use /maxwell scan --model MODEL [--provider PROVIDER]"
+                            )
+                        values = dict(zip(options[::2], options[1::2], strict=True))
+                        if "--model" not in values:
+                            raise ValueError("Manual scans require --model")
+                        record = self.store.one("SELECT * FROM repositories WHERE name=?", (repo,))
+                        route = self.config.route(
+                            values.get("--provider"),
+                            values["--model"],
+                            self.store.saved_route(repo),
+                        )
+                        execution = self.config.execution(route, record)
+                    except ValueError as exc:
+                        marker = f"<!-- maxwell:command:{comment['id']} -->"
+                        await self.call(
+                            self.github.upsert_comment,
+                            repo,
+                            issue,
+                            marker,
+                            f"{marker}\nCommand rejected: {self.config.redact(str(exc))}",
+                        )
+                        with self.store.db:
+                            self.store.db.execute(
+                                "INSERT OR IGNORE INTO comments(id) VALUES(?)", (comment["id"],)
+                            )
+                        continue
                 with self.store.db:
                     self.store.db.execute(
                         "INSERT OR IGNORE INTO comments(id) VALUES(?)", (comment["id"],)
                     )
                     if action == "scan":
-                        self.store.enqueue(repo)
+                        self.store.enqueue(repo, execution=execution)
                     else:
                         self.store.pause(repo, action == "pause")
             elif (

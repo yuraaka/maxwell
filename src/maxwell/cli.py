@@ -34,8 +34,8 @@ def parser():
     commands.add_parser("init", help="Create private configuration and runtime directories")
     config = commands.add_parser("config", help="Check configuration")
     config_commands = config.add_subparsers(dest="config_command", required=True)
-    check = config_commands.add_parser("check", help="Validate settings and GitHub access")
-    check.add_argument("--offline", action="store_true", help="Skip GitHub network checks")
+    check = config_commands.add_parser("check", help="Validate settings, GitHub, and model access")
+    check.add_argument("--offline", action="store_true", help="Skip GitHub and provider requests")
     repo = commands.add_parser("repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
     add = repositories.add_parser("add")
@@ -43,6 +43,8 @@ def parser():
     add.add_argument("--github", help="GitHub owner/repository; inferred from origin if possible")
     add.add_argument("--directory", help="Existing checkout to switch and update before scans")
     add.add_argument("--ref", default="main", help="Base branch to scan (default: main)")
+    add.add_argument("--provider", help="Configured provider/account for discovery")
+    add.add_argument("--model", help="Discovery model (otherwise use the native default)")
     add.add_argument(
         "--account", default="default", help="GitHub credential profile from config.yaml"
     )
@@ -58,6 +60,13 @@ def parser():
     )
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
+    change.add_argument(
+        "--stage",
+        choices=["discovery", "review", "reproduction", "fix", "validation"],
+        help="Stage whose provider/model settings should change",
+    )
+    change.add_argument("--provider", help="Configured provider/account for the stage")
+    change.add_argument("--model", help="Model for the stage")
     account = repositories.add_parser("set-account", help="Change a repository's GitHub profile")
     account.add_argument("repository")
     account.add_argument("--account", required=True)
@@ -68,6 +77,10 @@ def parser():
     scan = commands.add_parser("scan", help="Queue a scan even if the revision has not changed")
     scan.add_argument("repository", nargs="?")
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
+    scan.add_argument("--model", required=True, help="Model to use for this manual discovery run")
+    scan.add_argument(
+        "--provider", help="Override the repository's saved discovery provider/account"
+    )
     for name in ("pause", "resume"):
         item = commands.add_parser(name)
         item.add_argument("repository", nargs="?")
@@ -88,6 +101,7 @@ def infer_github(path):
 
 
 def register_repository(args, paths, config):
+    route = config.route(args.provider, args.model)
     settings = config.github.for_account(args.account)
     local = Path(args.source).expanduser()
     ref = validate_ref(args.ref)
@@ -113,7 +127,7 @@ def register_repository(args, paths, config):
         source, kind = f"https://github.com/{name}.git", "github"
     store = Store(paths.db)
     try:
-        store.register(name, source, ref, kind, args.account, directory)
+        store.register(name, source, ref, kind, args.account, directory, route)
     finally:
         store.close()
     return {
@@ -123,6 +137,7 @@ def register_repository(args, paths, config):
         "ref": ref,
         "github_account": args.account,
         "directory": directory,
+        "stages": {"discovery": route},
     }
 
 
@@ -144,14 +159,20 @@ def change_repository(args, store, config):
         )
     elif args.no_directory:
         changes["directory"] = None
-    if not changes:
-        raise ValueError("Specify --directory, --no-directory, --ref, or --account")
+    route = None
+    stage = args.stage or "discovery"
+    if args.provider is not None or args.model is not None:
+        route = config.route(args.provider, args.model, store.saved_route(record["name"], stage))
+    elif args.stage is not None:
+        raise ValueError("Specify --provider or --model when changing a stage")
+    if not changes and route is None:
+        raise ValueError("Specify repository settings or --provider/--model")
     updated = {**record, **changes}
     if updated["directory"] is not None:
         validate_branch(updated["ref"])
     elif "ref" in changes and updated["source_kind"] == "local":
         inspect_repository(updated["source"], updated["ref"])
-    return store.change_repository(record["name"], changes)
+    return store.change_repository(record["name"], changes, stage, route)
 
 
 def execute(args):
@@ -167,7 +188,7 @@ def execute(args):
             raise ValueError("Configuration already exists; it was not overwritten")
         paths.init_config()
         Store(paths.db).close()
-        print(f"Created {paths.config}. Set GitHub token, provider API key, model, and prices.")
+        print(f"Created {paths.config}. Configure GitHub credentials and provider homes.")
         return
     config = paths.load()
     paths.initialize()
@@ -178,7 +199,12 @@ def execute(args):
         store = Store(paths.db)
         try:
             if args.repo_command == "list":
-                output(store.rows("SELECT * FROM repositories ORDER BY name"))
+                output(
+                    [
+                        store.repository(row["name"])
+                        for row in store.rows("SELECT name FROM repositories ORDER BY name")
+                    ]
+                )
             elif args.repo_command == "change":
                 output(change_repository(args, store, config))
             elif args.repo_command == "set-account":
@@ -258,6 +284,8 @@ def execute(args):
             arguments["repository"] = args.repository
         if args.command == "scan":
             arguments["priority"] = int(args.priority[1])
+            arguments["model"] = args.model
+            arguments["provider"] = args.provider
         response = asyncio.run(request(paths, args.command, **arguments))
         if args.command == "stop":
             deadline = time.monotonic() + config.limits.shutdown_grace_seconds + 20

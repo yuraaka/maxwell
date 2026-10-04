@@ -45,6 +45,7 @@ class ScanResult(BaseModel):
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     cached_input_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     reported: bool = False
     complete: bool = False
@@ -60,12 +61,21 @@ def estimate_cost(usage: Usage, provider) -> int | None:
     if provider.input_usd_per_mtok is None or provider.output_usd_per_mtok is None:
         return None
     cached = min(usage.cached_input_tokens, usage.input_tokens)
+    written = min(usage.cache_write_tokens, usage.input_tokens - cached)
     cache_price = provider.cached_input_usd_per_mtok
     if cache_price is None:
         cache_price = provider.input_usd_per_mtok
     cost = (
-        Decimal(usage.input_tokens - cached) * Decimal(str(provider.input_usd_per_mtok))
+        Decimal(usage.input_tokens - cached - written) * Decimal(str(provider.input_usd_per_mtok))
         + Decimal(cached) * Decimal(str(cache_price))
+        + Decimal(written)
+        * Decimal(
+            str(
+                provider.cache_write_usd_per_mtok
+                if provider.cache_write_usd_per_mtok is not None
+                else provider.input_usd_per_mtok
+            )
+        )
         + Decimal(usage.output_tokens) * Decimal(str(provider.output_usd_per_mtok))
     )
     return int(cost.to_integral_value(rounding=ROUND_CEILING))

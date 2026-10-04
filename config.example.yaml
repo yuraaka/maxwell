@@ -13,17 +13,23 @@ github:
       token: ""
       allowed_users: [your-work-github-login]
 
-provider:
-  adapter: codex
-  executable: codex
-  model: ""
-  api_key: ""
-  input_usd_per_mtok: null
-  cached_input_usd_per_mtok: null
-  output_usd_per_mtok: null
+providers:
+  codex-work:
+    adapter: codex
+    home: ~/.codex-work
+    env: []
+  codex-second:
+    adapter: codex
+    home: ~/.codex-second
+    env: []
+  claude-work:
+    adapter: claude
+    home: ~/.claude
+    env: []
 
 limits:
   daily_budget_usd: 20
+  daily_scan_limit: 20
   scan_reservation_usd: 1
   scan_timeout_seconds: 600
   scan_interval_seconds: 1800

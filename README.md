@@ -8,8 +8,9 @@ GitHub issues, and reports spending. It does not reproduce, fix, or merge change
 
 Requires macOS or Linux, Python 3.12+, Git, and a current Codex CLI supporting
 `exec --json --output-schema --ignore-user-config --ignore-rules --ephemeral`.
-The initial runtime adapter uses Codex with an OpenAI API key. Subscription login,
-Claude, and Gemini adapters are not implemented in this milestone.
+Discovery supports Codex and Claude Code through their existing native configuration
+homes, including gateway configuration and native login. The legacy Codex API-key
+configuration remains supported. Gemini is not implemented.
 
 ```bash
 uv tool install --editable .
@@ -33,9 +34,10 @@ reference. Supply:
 - `github.allowed_users`: exact GitHub logins permitted to issue control comments.
   This setting applies to the default account. An empty list disables comment commands
   but does not disable scans, issue publication, or local CLI commands.
-- `provider.api_key` and `provider.model`: an API key and the actual model identifier.
-- The current input and output prices in USD per million tokens. Cached input uses
-  its separate price if supplied, otherwise the regular input price conservatively.
+- `providers`: named Codex or Claude Code connections, each pointing to its existing
+  configuration home. GitHub credential profiles are configured independently.
+- Optional prices for each model, in USD per million tokens. Without prices, usage is
+  reported as unpriced and admissions use `limits.daily_scan_limit` (default: 20).
 
 Credentials may be literal values in this file. Configuration files must have mode
 `0600`; runtime directories use `0700`. `init` never overwrites an existing config.
@@ -49,16 +51,27 @@ maxwell config check --offline
 ```
 
 The command checks YAML structure, field values, file permissions, required credentials,
-model prices, Git, the provider executable, and registered repositories' account selections.
+model prices when supplied, Git, provider executables/homes, gateway environment
+dependencies, and saved repository provider/model assignments.
 By default it also authenticates each configured GitHub account, reports its login, and
-checks access to registered repositories. `--offline` skips network requests. The default
+checks access to registered repositories. It sends a small structured request through
+each configured provider/model pair to verify authentication and model access. The
+pairs include catalog models, provider defaults, and saved repository stage models;
+duplicates are checked once. Providers without any selected model must have a `model`,
+catalog, or saved stage assignment before online verification can succeed.
+
+Provider checks use the native home/profile and gateway environment in an empty
+temporary workspace, with a timeout of 30 seconds per pair (or the configured scan
+timeout if shorter). Temporary check files are removed; the repository registry and
+scan history are unchanged. Native credential refresh remains owned by the CLI.
+These requests consume provider usage and are outside the daemon's scan budget.
+`--offline` skips all GitHub and provider requests. The default
 account may be empty when repositories use named profiles; named profiles need tokens.
 Errors identify the settings to fix without printing credential values. The command
 prints a JSON report and exits with status 0 on success or 1 on failure.
 
-Checks do not start the daemon, change configuration or repository settings, publish
-issues, or make model calls. Provider credentials/model access and GitHub write
-permissions are not verified by this command.
+GitHub checks verify identity and repository read access; write permissions are not
+tested.
 
 For different GitHub accounts or repository-specific access keys, define named profiles:
 
@@ -86,8 +99,68 @@ to another account. Tokens stay in configuration, not CLI arguments, database ro
 remote URLs, or Git configuration. HTTPS authentication is supplied only to the fetch
 process; global Git credentials and interactive authentication are disabled for it.
 
-The model configuration still contains only the discovery profile. Later stages
-will add model routing and tier policies without changing the runtime root.
+Configure native provider homes, using the directories your CLIs already use:
+
+```yaml
+providers:
+  codex-work:
+    adapter: codex
+    home: ~/.codex-work
+  codex-second:
+    adapter: codex
+    home: ~/.codex-second
+  claude-work:
+    adapter: claude
+    home: ~/.claude
+```
+
+`home` is the CLI configuration/state directory, rather than a repository directory.
+Maxwell sets `CODEX_HOME` or `CLAUDE_CONFIG_DIR` for that process and reuses native
+authentication. It does not copy credentials or change the global login. Keychain
+credentials and external gateway helpers still need to work in the daemon environment.
+Relative home and executable paths resolve against the Maxwell configuration directory.
+
+For Codex, optional `profile: work` selects `HOME/work.config.toml`, overlaid on
+`HOME/config.toml`. Maxwell uses the merged settings to resolve the default model and
+gateway environment dependencies. It passes connection/model settings as explicit CLI
+overrides with `--ignore-user-config`, while authentication continues to use the original
+`CODEX_HOME`. Native MCP servers and other interactive integrations are excluded before
+Codex parses configuration, so incompatible MCP transports cannot block scans or checks.
+Static gateway headers and bearer tokens are passed in the child environment rather than
+command-line arguments. Configuration and credential files stay in place. Native profiles
+require Codex 0.134 or newer; legacy `[profiles.work]` and `profile = "work"` settings in the
+native config must be migrated to separate profile files.
+
+The native configuration supplies the endpoint, credential helper, and default model.
+Codex gateway `env_key` and `env_http_headers` dependencies are forwarded automatically.
+Claude's native `settings.json` environment is reused. For additional variables needed
+by a gateway, proxy, or login helper, list their names under the provider's `env`, for
+example `env: [COMPANY_GATEWAY_TOKEN]`. Their values must be available when starting
+the daemon. Shell aliases are not executables; use an executable wrapper if needed.
+Unrelated shell credentials are not inherited.
+
+The model catalog is optional. Without it, explicit model IDs/aliases are passed to
+the selected CLI. A catalog restricts selections and can attach model-specific prices:
+
+```yaml
+providers:
+  codex-work:
+    adapter: codex
+    home: ~/.codex-work
+    models:
+      your-model-id:
+        input_usd_per_mtok: 2
+        cached_input_usd_per_mtok: 0.2
+        output_usd_per_mtok: 8
+```
+
+These prices are illustrative; use your gateway's actual rates. Claude cache creation
+can be priced with `cache_write_usd_per_mtok`; it otherwise uses the regular input rate.
+Both input and output prices must be set together. A plain list such as
+`models: [model-a, model-b]` restricts models without assigning prices.
+
+Existing singleton `provider` configurations keep working as the provider named
+`default`. Use either the old `provider` form or the new `providers` form.
 
 ## Run against a repository
 
@@ -99,13 +172,13 @@ profiles before startup, or restart after adding/editing profiles in the YAML fi
 
 ```bash
 maxwell start
-maxwell repo add owner/repository --account personal
-maxwell repo add https://github.com/company/backend --account work
-maxwell repo add company/service --directory /path/to/service --ref develop --account work
-maxwell repo add /path/to/checkout --github company/other-project --account work --ref main
+maxwell repo add owner/repository --account personal --provider codex-work --model model-a
+maxwell repo add https://github.com/company/backend --account work --provider codex-work --model model-a
+maxwell repo add company/service --directory /path/to/service --ref develop --account work --provider codex-work --model model-a
+maxwell repo add /path/to/checkout --github company/other-project --account work --ref main --provider codex-work --model model-a
 maxwell repo list
 maxwell status
-maxwell scan owner/repository --priority P1
+maxwell scan owner/repository --model model-a --priority P1
 maxwell pause owner/repository
 maxwell resume owner/repository
 maxwell logs --follow
@@ -149,15 +222,41 @@ finish with its previous settings. The daemon notices changes automatically, and
 repository identity and history remain intact. `repo set-account` is retained for
 compatibility; use `repo change --account` for new commands.
 
+Each repository has a saved provider/model pair for each configured stage:
+
+```bash
+maxwell repo change owner/repository --stage discovery --provider codex-work --model model-a
+maxwell repo change owner/repository --stage review --provider claude-work --model model-b
+maxwell scan owner/repository --model model-c
+maxwell scan owner/repository --provider codex-second --model model-c
+```
+
+With multiple providers, registration requires `--provider`. With one, it is selected
+and saved automatically. Registration accepts the native default model when no model
+catalog is given; otherwise use `--model` or configure a single catalog entry. Saved
+assignments remain stable when more providers are added. `repo list` shows stage routes.
+Legacy registrations acquire their discovery route when it can be resolved uniquely.
+
+Every manual scan requires `--model`, including GitHub control comments. An omitted
+`--provider` uses the saved discovery provider. Overrides affect that run only; scheduled
+discovery uses the saved pair. All selections are validated before queuing multi-repo
+requests, and queued runs retain their provider, model, source settings, limits, and
+prices. Authentication remains a live reference so native token refresh can work.
+
+Review, reproduction, fix, and validation routes may be stored now; their execution
+workflows are later milestones. `scan` executes discovery only.
+
 Starting the daemon immediately schedules discovery for unpaused repositories and
-can spend money and publish GitHub issues. Scheduled scans skip a previously scanned
-revision; `scan` requests a fresh inspection even when the revision is unchanged.
+can consume provider usage and publish GitHub issues. Scheduled scans skip a previously
+scanned revision with the same execution settings; `scan` requests a fresh inspection
+even when the revision is unchanged.
 Each scan currently inspects a whole pinned revision rather than only a diff.
 
 `scan`, `pause`, and `resume` target all registered repositories when the repository
 argument is omitted. They require a running daemon. Pause stops new work; active
 scans may finish and publish. Status works both online and offline and prints JSON.
-An explicit scan request coalesces with an already queued/running scan for that repo.
+An explicit scan request coalesces with already queued/running work only when its
+execution settings match. Requests using different providers or models remain separate.
 
 One daemon and one active discovery worker run per Maxwell home. P0 is dispatched
 first; other queued scans use priority with aging. Existing active scans are not
@@ -198,7 +297,8 @@ processed once per comment ID; edit-free new comments are required for new decis
 On the status issue:
 
 ```text
-/maxwell scan
+/maxwell scan --model model-a
+/maxwell scan --provider codex-second --model model-a
 /maxwell pause
 /maxwell resume
 ```
@@ -213,7 +313,7 @@ usage, result, timestamps, and artifacts. Cost calculations use integer microdol
 and the price configuration captured for that execution. Cached input is not charged
 twice. All reported dollar amounts are **estimates**, not billing receipts.
 
-The controller reserves the configured amount before launching a scan. Daily budget
+For priced models, the controller reserves the configured amount before launching a scan. Daily budget
 windows use UTC. An execution with unknown spending retains its reservation, including
 across days; known spending settles the reservation. Unknown usage is not zero usage.
 The Codex CLI does not provide a controller-enforced hard dollar ceiling here: a call
@@ -221,6 +321,13 @@ may cost more than its reservation before usage is available. After an overrun, 
 dispatch stops when the remaining budget cannot cover another reservation. Use a
 provider billing limit for a hard account-wide cap. Unknown reservations currently
 require operator investigation; there is no automatic financial settlement command.
+
+For unpriced models, tokens are recorded without claiming a dollar estimate.
+These runs do not reserve dollars or retain unknown-dollar holds. The global
+`limits.daily_scan_limit` caps unpriced model executions per UTC day, including failed
+or interrupted calls. Preparation failures and skipped revisions consume no count.
+The same configured scan timeout applies. Known-priced models continue using the dollar
+budget; both modes share the single discovery worker and human review queue limit.
 
 Scan costs are allocated equally among newly admitted findings after deduplication.
 Rounding is reconciled exactly. Scans with no admitted findings remain repository
@@ -275,8 +382,11 @@ Discovery is instructed not to run repository builds, tests, or installation scr
 that semantic restriction is not an operating-system guarantee. Output is validated,
 paths/line numbers must exist in the snapshot, and modified worktrees are rejected.
 
-The provider does not inherit Maxwell's GitHub token through its environment. It uses
-a managed Codex home under `~/.maxwell/runtimes/`. Exact configured secrets are redacted
+The provider does not inherit Maxwell's GitHub token through its environment. Native
+providers use the selected existing home; legacy API-key Codex uses a managed home under
+`~/.maxwell/runtimes/`. Discovery disables native hooks and external tools; Claude is
+restricted to Read/Grep/Glob and Codex uses its read-only sandbox. Exact configured and
+resolved native credential values are redacted
 from collected output and reports. This is not a defense against encoded secrets or
 arbitrary filesystem reads; provider credentials are available to the CLI process.
 Do not use this milestone on hostile repositories. Container/VM isolation and stronger
