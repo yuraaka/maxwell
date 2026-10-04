@@ -13,6 +13,19 @@ def test_help_shows_nested_command_tree_and_global_options():
     assert "├── models" in help_text and "│   └── list" in help_text
     assert "--home HOME" in help_text and "--json" in help_text
     assert "\033[" not in help_text
+    for command in ("set-account", "start", "stop", "status", "logs", "pause", "resume"):
+        assert f"── {command}" not in help_text
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [[command] for command in ("start", "stop", "status", "logs", "pause", "resume")]
+    + [["repo", "set-account", "acme/repo", "--account", "personal"]],
+)
+def test_daemon_and_duplicate_account_commands_are_removed(arguments):
+    with pytest.raises(SystemExit) as error:
+        parser().parse_args(arguments)
+    assert error.value.code == 2
 
 
 def test_tree_help_uses_terminal_colors_and_respects_no_color(monkeypatch):

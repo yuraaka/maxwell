@@ -1,22 +1,20 @@
 import argparse
 import asyncio
 import json
-import logging
 import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import httpx
 
 from maxwell import __version__
 from maxwell.cli_help import TreeParser
-from maxwell.cli_output import check_line, color, model_lines, output
+from maxwell.cli_output import check_line, color, model_lines, output, scan_line
 from maxwell.config import Paths
 from maxwell.config_apply import apply_config
-from maxwell.daemon import Daemon, request
 from maxwell.github import GitHub
+from maxwell.manual import run_scans
 from maxwell.repositories import (
     git,
     github_name,
@@ -40,7 +38,7 @@ def add_command(commands, name, **options):
 
 
 def parser():
-    root = TreeParser(prog="maxwell", description="Repository discovery daemon")
+    root = TreeParser(prog="maxwell", description="Manual repository discovery")
     root.add_argument("--version", action="version", version=f"maxwell {__version__}")
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     root.add_argument(
@@ -94,14 +92,7 @@ def parser():
     change.add_argument("--provider", help="Configured provider/account for the stage")
     change.add_argument("--model", help="Model for the stage")
     change.add_argument("--effort", help="Stage effort; use 'default' to reset")
-    account = add_command(repositories, "set-account", help="Change a repository's GitHub profile")
-    account.add_argument("repository")
-    account.add_argument("--account", required=True)
-    start = add_command(commands, "start", help="Start the daemon; also begins scheduled discovery")
-    start.add_argument("--foreground", action="store_true")
-    add_command(commands, "stop", help="Request graceful shutdown")
-    add_command(commands, "status", help="Show health, jobs, spending, and publication failures")
-    scan = add_command(commands, "scan", help="Queue a scan even if the revision has not changed")
+    scan = add_command(commands, "scan", help="Run discovery now and publish findings")
     scan.add_argument("repository", nargs="?")
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     scan.add_argument("--model", required=True, help="Model to use for this manual discovery run")
@@ -111,15 +102,6 @@ def parser():
     scan.add_argument(
         "--provider", help="Override the repository's saved discovery provider/account"
     )
-    for name in ("pause", "resume"):
-        item = add_command(
-            commands,
-            name,
-            help=f"{'Pause' if name == 'pause' else 'Resume'} scheduled repository scans",
-        )
-        item.add_argument("repository", nargs="?")
-    logs = add_command(commands, "logs", help="Show daemon logs")
-    logs.add_argument("--follow", action="store_true")
     return root
 
 
@@ -253,112 +235,24 @@ def execute(args):
                 )
             elif args.repo_command == "change":
                 emit(change_repository(args, store, config))
-            elif args.repo_command == "set-account":
-                config.github.for_account(args.account)
-                store.set_account(args.repository, args.account)
-                emit({"repository": args.repository, "github_account": args.account})
         finally:
             store.close()
-    elif args.command == "start":
-        config.ready()
-        if not args.json:
-            print("Starting daemon...", flush=True)
-        if args.foreground:
-            logging.basicConfig(
-                filename=paths.log,
-                level=logging.INFO,
-                format="%(asctime)s %(levelname)s %(message)s",
+    elif args.command == "scan":
+        report = asyncio.run(
+            run_scans(
+                paths,
+                config,
+                args.repository,
+                args.model,
+                provider=args.provider,
+                effort=args.effort,
+                priority=int(args.priority[1]),
+                on_progress=None if args.json else scan_line,
             )
-            asyncio.run(Daemon(paths, config).serve())
-        else:
-            try:
-                response = asyncio.run(request(paths, "status"))
-                emit(response)
-                return
-            except (OSError, TimeoutError):
-                pass
-            with paths.log.open("a") as log:
-                process = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "maxwell",
-                        "--home",
-                        str(paths.root),
-                        "start",
-                        "--foreground",
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=log,
-                    start_new_session=True,
-                    cwd=paths.root,
-                )
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise ValueError(f"Daemon failed to start; inspect {paths.log}")
-                try:
-                    emit(asyncio.run(request(paths, "status")))
-                    return
-                except (OSError, TimeoutError):
-                    time.sleep(0.1)
-            raise ValueError(f"Daemon startup timed out; inspect {paths.log}")
-    elif args.command == "logs":
-        if not paths.log.exists():
-            print(json.dumps({"logs": []}) if args.json else "No daemon logs yet", flush=True)
-            return
-        with paths.log.open() as log:
-            lines = log.readlines()[-100:]
-            if args.json and not args.follow:
-                print(
-                    json.dumps({"logs": [line.rstrip("\n") for line in lines]}, indent=2),
-                    flush=True,
-                )
-            elif args.json:
-                for line in lines:
-                    print(json.dumps({"line": line.rstrip("\n")}), flush=True)
-            else:
-                print("".join(lines), end="", flush=True)
-            if args.follow:
-                while True:
-                    line = log.readline()
-                    if line:
-                        if args.json:
-                            print(json.dumps({"line": line.rstrip("\n")}), flush=True)
-                        else:
-                            print(line, end="", flush=True)
-                    else:
-                        time.sleep(0.2)
-    elif args.command == "status":
-        try:
-            emit(asyncio.run(request(paths, "status")))
-        except (OSError, TimeoutError):
-            store = Store(paths.db)
-            try:
-                emit({"daemon": "stopped", **store.status()})
-            finally:
-                store.close()
-    else:
-        if args.command == "stop" and not args.json:
-            print("Stopping daemon...", flush=True)
-        arguments = {}
-        if hasattr(args, "repository"):
-            arguments["repository"] = args.repository
-        if args.command == "scan":
-            arguments["priority"] = int(args.priority[1])
-            arguments["model"] = args.model
-            arguments["provider"] = args.provider
-            arguments["effort"] = args.effort
-        response = asyncio.run(request(paths, args.command, **arguments))
-        if args.command == "stop":
-            deadline = time.monotonic() + config.limits.shutdown_grace_seconds + 20
-            while time.monotonic() < deadline and paths.socket.exists():
-                time.sleep(0.1)
-            if paths.socket.exists():
-                raise ValueError("Shutdown still pending; inspect logs (no PID was blindly killed)")
-            response = {"daemon": "stopped"}
-        emit(response)
+        )
+        emit(report)
+        if not report["valid"]:
+            raise SystemExit(1)
 
 
 def main():
@@ -371,6 +265,8 @@ def main():
         execute(args)
     except KeyboardInterrupt:
         raise SystemExit(130)
+    except asyncio.CancelledError:
+        raise SystemExit(143)
     except (
         ValueError,
         OSError,

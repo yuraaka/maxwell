@@ -63,7 +63,7 @@ def test_human_config_failure_keeps_nonzero_exit(directory):
     assert result.stderr == ""
 
 
-def test_repository_and_status_output_preserve_useful_settings(home, source, capsys):
+def test_repository_output_preserves_useful_settings(home, source, capsys):
     store = Store(home.db)
     store.register(
         "acme/repo", str(source), "main", route={"provider": "default", "model": "fake-model"}
@@ -76,27 +76,13 @@ def test_repository_and_status_output_preserve_useful_settings(home, source, cap
     for expected in (
         "acme/repo",
         "Branch: main",
-        "Scans: paused",
         "Discovery: default / fake-model",
     ):
         assert expected in text
-    execute(parser().parse_args([*prefix, "status"]))
-    text = capsys.readouterr().out
-    assert "Daemon stopped" in text and "Committed scan budget: $0.00" in text
-    assert "Discovery: default / fake-model" in text
-    execute(parser().parse_args([*prefix, "status", "--json"]))
+    assert "Scans: paused" not in text
+    execute(parser().parse_args([*prefix, "repo", "list", "--json"]))
     report = json.loads(capsys.readouterr().out)
-    assert report["daemon"] == "stopped"
-    assert report["repositories"][0]["stages"]["discovery"]["model"] == "fake-model"
-
-
-def test_log_output_is_text_unless_json_requested(home, capsys):
-    home.log.write_text("First log line\nSecond log line\n")
-    prefix = ["--home", str(home.root), "logs"]
-    execute(parser().parse_args(prefix))
-    assert capsys.readouterr().out == "First log line\nSecond log line\n"
-    execute(parser().parse_args([*prefix, "--json"]))
-    assert json.loads(capsys.readouterr().out) == {"logs": ["First log line", "Second log line"]}
+    assert report[0]["stages"]["discovery"]["model"] == "fake-model"
 
 
 @pytest.mark.parametrize("status,code", [("ok", "32"), ("error", "31"), ("skipped", "33")])

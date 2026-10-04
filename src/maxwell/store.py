@@ -248,15 +248,6 @@ class Store:
             self.event("repository_changed", {"repository": repository, "changes": changes})
             return self.repository(repository)
 
-    def set_account(self, repository, account):
-        with self.db:
-            cursor = self.db.execute(
-                "UPDATE repositories SET github_account=? WHERE name=?", (account, repository)
-            )
-            if not cursor.rowcount:
-                raise ValueError("Unknown repository")
-            self.event("repository_account_changed", {"repository": repository, "account": account})
-
     def enqueue(self, repository, priority=2, forced=True, execution=None):
         snapshot = json.dumps(execution, sort_keys=True) if execution is not None else None
         with self.db:
@@ -341,19 +332,30 @@ class Store:
         )
         return row["amount"]
 
-    def claim(self, daily_limit, reservation, queue_max, profile=None, daily_scan_limit=20):
+    def claim(
+        self,
+        daily_limit,
+        reservation,
+        queue_max,
+        profile=None,
+        daily_scan_limit=20,
+        *,
+        scan_id=None,
+        manual=False,
+    ):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             jobs = self.rows(
                 """
                 SELECT s.* FROM scans s JOIN repositories r ON r.name=s.repository
-                WHERE s.state='queued' AND r.paused=0 AND
+                WHERE s.state='queued' AND (? OR r.paused=0) AND
+                  (? IS NULL OR s.id=?) AND
                   (SELECT COUNT(*) FROM findings f WHERE f.repository=r.name
                    AND f.state NOT IN ('closed','rejected','confirmed')) < ?
                 ORDER BY CASE WHEN priority=0 THEN -1000 ELSE
                     priority - MIN(3, (?-created)/86400.0) END, created
             """,
-                (queue_max, time.time()),
+                (manual, scan_id, scan_id, queue_max, time.time()),
             )
             start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             unpriced = self.one(
@@ -389,6 +391,15 @@ class Store:
             )
             self.event("scan_started", {"id": job["id"], "lease": lease})
             return self.one("SELECT * FROM scans WHERE id=?", (job["id"],))
+
+    def fail_queued(self, identifier, error):
+        with self.db:
+            self.db.execute(
+                "UPDATE scans SET state='failed',finished=?,cost=0,summary=?,error=? "
+                "WHERE id=? AND state='queued'",
+                (time.time(), error, error, identifier),
+            )
+            self.event("scan_blocked", {"id": identifier, "error": error})
 
     def finish(self, job, state, summary, usage, cost, findings=(), error=None):
         with self.db:

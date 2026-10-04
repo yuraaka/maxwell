@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import signal
 import subprocess
@@ -33,7 +32,14 @@ def control(home, command, **kwargs):
 
 def launch(home):
     return subprocess.Popen(
-        [sys.executable, "-m", "maxwell", "--home", str(home.root), "start", "--foreground"],
+        [
+            sys.executable,
+            "-c",
+            "import asyncio,sys; from maxwell.config import Paths; "
+            "from maxwell.daemon import Daemon; paths=Paths(sys.argv[1]); "
+            "asyncio.run(Daemon(paths,paths.load()).serve())",
+            str(home.root),
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -214,21 +220,6 @@ def test_daemon_singleton_and_hard_crash_recovery(home, registered, directory):
         shutdown(home, first)
         if second:
             shutdown(home, second)
-
-
-def test_background_cli_start_and_stop(home, registered):
-    registered.pause("acme/repo", True)
-    prefix = [sys.executable, "-m", "maxwell", "--home", str(home.root), "--json"]
-    result = subprocess.run([*prefix, "start"], capture_output=True, text=True, timeout=15)
-    try:
-        assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["daemon"] == "running"
-        stopped = subprocess.run([*prefix, "stop"], capture_output=True, text=True, timeout=15)
-        assert stopped.returncode == 0, stopped.stderr
-        assert json.loads(stopped.stdout)["daemon"] == "stopped"
-    finally:
-        if home.socket.exists():
-            control(home, "stop")
 
 
 def test_timeout_retains_unknown_spending_and_cleans_workspace(home, registered, directory):

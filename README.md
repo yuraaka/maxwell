@@ -1,6 +1,6 @@
 # Maxwell
 
-Maxwell is a local repository maintenance daemon. Milestone 1 runs a discovery agent
+Maxwell runs repository discovery manually from your terminal. Milestone 1 runs a discovery agent
 against committed source snapshots, creates deduplicated **suspected** findings as
 GitHub issues, and reports spending. It does not reproduce, fix, or merge changes yet.
 
@@ -31,9 +31,8 @@ reference. Supply:
 - `github.token`, or tokens under `github.accounts`: fine-grained GitHub tokens with
   repository metadata read and Issues read/write access. Remote repositories also
   need Contents read access for fetching source. No code-write permission is needed.
-- `github.allowed_users`: exact GitHub logins permitted to issue control comments.
-  This setting applies to the default account. An empty list disables comment commands
-  but does not disable scans, issue publication, or local CLI commands.
+- Optional `github.allowed_users`: retained for future GitHub control comments.
+  Manual runs do not process comment commands.
 - `providers`: named Codex or Claude Code connections, each pointing to its existing
   configuration home. GitHub credential profiles are configured independently.
 - Optional prices for each model, in USD per million tokens. Without prices, usage is
@@ -44,7 +43,7 @@ Credentials may be literal values in this file. Configuration files must have mo
 runtime directories, and the state database; it never overwrites an existing config.
 After editing settings, run `config apply`. No credentials are required for the test suite.
 
-Apply configuration before starting the daemon:
+Apply configuration before running discovery:
 
 ```bash
 maxwell config apply
@@ -71,7 +70,7 @@ Provider checks use the native home/profile and gateway environment in an empty
 temporary workspace, with a timeout of 30 seconds per pair (or the configured scan
 timeout if shorter). Temporary check files are removed; the repository registry and
 scan history are unchanged. Native credential refresh remains owned by the CLI.
-These requests consume provider usage and are outside the daemon's scan budget.
+These requests consume provider usage and are outside the scan budget.
 Model metadata, probe outcomes, and the apply timestamp are stored in SQLite.
 Models with unavailable access or no known effort levels/default are excluded from the
 stored catalog. Failed checks remain in the apply report; other accounts are still checked.
@@ -84,11 +83,9 @@ with status 0 on success or 1 on failure. `--json` prints one complete JSON repo
 after all checks finish, without progress text. Terminal output uses colored status
 labels and brief success lines; failures keep their diagnostics. Piped output and
 JSON stay plain. Set `NO_COLOR` to disable terminal colors.
-Successful apply reloads a running daemon's settings and GitHub clients; active and
-queued scans retain their execution settings. It does not start a daemon or queue
-repository scans. Apply with errors still saves model results and exits with status 1,
-but leaves a running daemon's configuration unchanged. Invalid YAML or configuration
-changes during apply preserve the previous stored catalog. `config check` and the old
+Apply with errors still saves eligible model metadata and exits with status 1.
+Invalid YAML or configuration changes during apply preserve the previous stored catalog.
+`config check` and the old
 top-level `init` command have been removed. `maxwell --help` displays a command tree;
 subcommand help shows the detailed options.
 
@@ -139,7 +136,7 @@ providers:
 `home` is the CLI configuration/state directory, rather than a repository directory.
 Maxwell sets `CODEX_HOME` or `CLAUDE_CONFIG_DIR` for that process and reuses native
 authentication. It does not copy credentials or change the global login. Keychain
-credentials and external gateway helpers still need to work in the daemon environment.
+credentials and external gateway helpers still need to work in the scan environment.
 Relative home and executable paths resolve against the Maxwell configuration directory.
 
 For Codex, optional `profile: work` selects `HOME/work.config.toml`, overlaid on
@@ -157,8 +154,7 @@ The native configuration supplies the endpoint, credential helper, and default m
 Codex gateway `env_key` and `env_http_headers` dependencies are forwarded automatically.
 Claude's native `settings.json` environment is reused. For additional variables needed
 by a gateway, proxy, or login helper, list their names under the provider's `env`, for
-example `env: [COMPANY_GATEWAY_TOKEN]`. Their values must be available when starting
-the daemon. Shell aliases are not executables; use an executable wrapper if needed.
+example `env: [COMPANY_GATEWAY_TOKEN]`. Their values must be available when running scans. Shell aliases are not executables; use an executable wrapper if needed.
 Unrelated shell credentials are not inherited.
 
 The model catalog is optional. Without it, explicit model IDs/aliases are passed to
@@ -221,30 +217,23 @@ Existing singleton `provider` configurations keep working as the provider named
 
 ## Run against a repository
 
-`maxwell start` can run from any directory. The daemon manages the shared registry
-under `~/.maxwell`; it is not attached to the shell's current repository. Register
-repositories before or after starting it. A running daemon notices new registrations
-automatically; GitHub synchronization follows its configured interval. Configure
-profiles before startup, or run `config apply` after adding/editing profiles in the YAML file.
+Register repositories and run scans from any directory. Maxwell uses the shared
+registry under `~/.maxwell`; it is not attached to your shell's current repository.
+Each `scan` runs in the foreground, publishes findings and a summary to GitHub,
+saves a local report, and exits. No daemon is required.
 
 ```bash
-maxwell start
 maxwell repo add owner/repository --account personal --provider codex-work --model model-a
 maxwell repo add https://github.com/company/backend --account work --provider codex-work --model model-a
 maxwell repo add company/service --directory /path/to/service --ref develop --account work --provider codex-work --model model-a
 maxwell repo add /path/to/checkout --github company/other-project --account work --ref main --provider codex-work --model model-a
 maxwell repo list
-maxwell status
-maxwell scan owner/repository --model model-a --priority P1
-maxwell pause owner/repository
-maxwell resume owner/repository
-maxwell logs --follow
-maxwell stop
+maxwell scan owner/repository --model model-a
 ```
 
 No existing checkout is needed. For `owner/repository` or a GitHub URL, registration
 checks access using the selected profile. The base branch defaults to `main`; use
-`--ref develop` (for example) to choose another branch. The daemon fetches that branch
+`--ref develop` (for example) to choose another branch. Maxwell fetches that branch
 into its own bare repository at
 `~/.maxwell/repos/<repository-id>/mirror.git` before each scan, then creates a detached
 worktree for the pinned revision. GitHub HTTPS and `git@github.com:owner/repo.git`
@@ -274,10 +263,9 @@ maxwell repo change company/backend --no-directory
 
 Omitted options retain their current values. `--no-directory` stops maintaining the
 checkout and resumes fetching directly into Maxwell's mirror. Profiles must already be
-configured. Settings apply to subsequent scans and synchronization; an active scan can
-finish with its previous settings. The daemon notices changes automatically, and the
-repository identity and history remain intact. `repo set-account` is retained for
-compatibility; use `repo change --account` for new commands.
+configured. Settings apply to subsequent scans; an active scan retains its previous
+settings. Repository identity and history remain intact. Change GitHub profiles with
+`repo change --account`; there is no separate `repo set-account` command.
 
 Each repository has a saved provider/model pair for each configured stage:
 
@@ -297,15 +285,14 @@ catalog is given; otherwise use `--model` or configure a single catalog entry. S
 assignments remain stable when more providers are added. `repo list` shows stage routes.
 Legacy registrations acquire their discovery route when it can be resolved uniquely.
 
-Every manual scan requires `--model`, including GitHub control comments. An omitted
-`--provider` uses the saved discovery provider. Overrides affect that run only; scheduled
-discovery uses the saved pair. All selections are validated before queuing multi-repo
-requests, and queued runs retain their provider, model, source settings, limits, and
-prices. `--effort` overrides the effort for one run. For the same saved provider/model,
+Every manual scan requires `--model`. An omitted `--provider` uses the saved discovery
+provider. Overrides affect that run only. All selections are validated before any
+multi-repository scan begins, and runs retain their provider, model, source settings,
+limits, and prices. `--effort` overrides the effort for one run. For the same saved provider/model,
 an omitted effort keeps the stage's override; switching provider or model drops that
 override. `--effort default` clears a saved or per-run override and uses the configured
 model/provider default, then the native CLI default if neither is set. Explicit effort
-selections and configured defaults are frozen in queued scan settings. Effort names
+selections and configured defaults are frozen in each run's settings. Effort names
 are passed through to the CLI; declared `efforts` lists are validated locally, while
 unknown capabilities are validated by the native CLI/gateway during execution.
 Authentication remains a live reference so native token refresh can work.
@@ -313,71 +300,36 @@ Authentication remains a live reference so native token refresh can work.
 Review, reproduction, fix, and validation routes may be stored now; their execution
 workflows are later milestones. `scan` executes discovery only.
 
-Starting the daemon immediately schedules discovery for unpaused repositories and
-can consume provider usage and publish GitHub issues. Scheduled scans skip a previously
-scanned revision with the same execution settings; `scan` requests a fresh inspection
-even when the revision is unchanged.
-Each scan currently inspects a whole pinned revision rather than only a diff.
+`scan` requests a fresh inspection even when the revision is unchanged. Each scan
+currently inspects a whole pinned revision rather than only a diff. Omit the repository
+argument to scan all registered repositories sequentially. Manual runs ignore legacy
+pause settings and leave unrelated queued jobs untouched. Budget, scan-count, and
+human review queue limits still apply; blocked runs fail instead of waiting in a queue.
 
-`scan`, `pause`, and `resume` target all registered repositories when the repository
-argument is omitted. They require a running daemon. Pause stops new work; active
-scans may finish and publish. Status works both online and offline and shows readable
-repository settings, recent scans, spending, and publication problems. Commands use
-human-readable output by default; pass `--json` before or after the command for the
-structured format, for example `maxwell status --json` or `maxwell --json repo list`.
-`logs --json` returns a JSON log list; `logs --follow --json` streams one JSON object
-per log line. Runtime errors use JSON on stderr when `--json` is selected.
-An explicit scan request coalesces with already queued/running work only when its
-execution settings match. Requests using different providers or models remain separate.
+Progress is printed as each scan starts, publishes, and finishes. Output includes local
+report paths and finding URLs. Pass `--json` before or after the command for one complete
+structured result, for example `maxwell scan owner/repository --model model-a --json`
+or `maxwell --json repo list`. Scan or publication failures exit with status 1.
+Runtime errors use JSON on stderr when `--json` is selected.
 
-One daemon and one active discovery worker run per Maxwell home. P0 is dispatched
-first; other queued scans use priority with aging. Existing active scans are not
-preempted. Candidate findings carry P0–P3 labels for later agent stages.
-
-Use `maxwell start --foreground` under a service manager. Ordinary `start` launches
-that same process in the background and waits for a health handshake. M1 does not
-install launchd/systemd services or restart automatically after reboot. A file lock
-enforces singleton execution, and an owner-only Unix socket handles commands.
-`stop` requests graceful shutdown; it never blindly signals a PID from a stale file.
-Git operations and in-flight HTTP requests also have bounded timeouts. Restart a
-running daemon after upgrading Maxwell so it loads the updated code and configuration.
+A file lock permits one active run per Maxwell home. Ctrl+C or termination cancels the
+provider process, records the interruption, and cleans up its worktree. Git operations
+and HTTP requests also have bounded timeouts. There are no `start`, `stop`, `status`,
+`logs`, `pause`, or `resume` CLI commands in the manual workflow.
 
 ## GitHub interaction
 
-Maxwell creates one **Maxwell status** issue per repository and posts a summary for
-every completed, failed, cancelled, interrupted, or skipped scan. You can pin this
-issue in GitHub. It contains discovery spending, recent scans, and hunter assessments.
+On each publication pass, Maxwell updates one **Maxwell status** issue per repository
+with recorded scan results, discovery spending, and hunter assessments. You can pin
+this issue in GitHub. Cancelled or blocked runs are included in the next publication pass.
 
 Each finding includes its scanned SHA, location, source evidence, expected behavior,
 confidence, priority, and allocated discovery cost. Findings are explicitly suspected;
 an LLM's confidence is not independent verification.
 
-Authorized users can comment on a finding:
-
-```text
-/maxwell confirm
-/maxwell reject explanation
-/maxwell priority P1
-```
-
-Confirmation records a human assessment and leaves the issue open for future stages;
-it does not claim a reproduced regression test. Rejection closes the issue. Closing an
-issue directly removes it from the review queue but does not imply a quality assessment.
-Confirmed/rejected findings receive corresponding state labels. Comment commands are
-processed once per comment ID; edit-free new comments are required for new decisions.
-
-On the status issue:
-
-```text
-/maxwell scan --model model-a
-/maxwell scan --provider codex-second --model model-a
-/maxwell scan --model model-a --effort high
-/maxwell pause
-/maxwell resume
-```
-
-Only explicitly allowlisted users can make these decisions. Instructions embedded in
-source files or arbitrary issue prose do not control the daemon.
+GitHub comment commands are not processed during manual runs. Closing an issue
+directly removes it from the review queue on the next manual scan, but
+does not imply a quality assessment.
 
 ## Spending and recovery
 
@@ -400,15 +352,15 @@ These runs do not reserve dollars or retain unknown-dollar holds. The global
 `limits.daily_scan_limit` caps unpriced model executions per UTC day, including failed
 or interrupted calls. Preparation failures and skipped revisions consume no count.
 The same configured scan timeout applies. Known-priced models continue using the dollar
-budget; both modes share the single discovery worker and human review queue limit.
+budget; both modes share the single active run and human review queue limit.
 
 Scan costs are allocated equally among newly admitted findings after deduplication.
 Rounding is reconciled exactly. Scans with no admitted findings remain repository
 overhead. The status report sums the original ledger, not allocated costs again.
 Other stages are shown as **not run**, not executed for zero dollars.
 
-The SQLite database stores jobs, events, publication intents, and assessments. On a
-restart, interrupted jobs are marked as such and retain their reservations. A surviving
+The SQLite database stores jobs, events, publication intents, and assessments. On the
+next manual run, interrupted jobs are marked as such and retain their reservations. A surviving
 provider process is stopped only when its process group and unique artifact path match
 the recorded attempt. Interrupted scans are not silently rerun; request another scan
 explicitly. Worktrees from interrupted attempts may remain for investigation.
@@ -420,19 +372,12 @@ require human rejection. Previously recorded findings remain suppressed after cl
 
 Issue bodies contain unique machine markers. Before creating an issue, Maxwell checks
 for an existing marker. If creation has an ambiguous outcome, Maxwell records
-`uncertain` and reconciles it rather than blindly retrying. If you have independently
-verified that a finding was not published, authorize another attempt on the status issue:
-
-```text
-/maxwell retry-publication <full-finding-id-from-maxwell-status>
-```
-
-If creation of the status issue itself was ambiguous and no such issue exists, create
+`uncertain` and reconciles it rather than blindly retrying. If creation of the status issue itself was ambiguous and no such issue exists, create
 a status issue containing `<!-- maxwell:dashboard:v1 -->`; Maxwell will adopt it.
 Comment publication also searches for its marker before retrying. GitHub writes are
 reconciled and idempotent where possible; exactly-once external delivery is not promised.
-Transient publication failures remain visible in `status` and are retried at the
-configured synchronization interval.
+Publication failures are reported by the scan command and retained in SQLite.
+The next manual scan of that repository retries or reconciles pending publications.
 
 ## Ratings and Entropy
 
@@ -477,13 +422,13 @@ uv build
 
 Tests use temporary Git repositories, a fake Codex executable, and a local GitHub HTTP
 server. They verify the full issue/report flow, priority and budget admission, privacy,
-duplicate suppression, stale results, singleton execution, background startup/shutdown,
+duplicate suppression, stale results, singleton execution, foreground runs and interruption cleanup,
 hard-crash recovery, and ambiguous publication. No paid model calls or real issues are
 created. Focused tests own edge cases; the end-to-end test exercises the integration.
 
 ## Next milestones
 
-1. Discovery daemon and issue publication — this release.
+1. Manual discovery and issue publication — this release.
 2. Independent tester/reproducer consuming discovery issues.
 3. Fixer consuming confirmed issues and producing patches.
 4. Independent validator, integration checks, and GitHub-based merge approval.

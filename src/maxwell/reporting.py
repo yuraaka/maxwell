@@ -398,7 +398,26 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                         "publication_retry_authorized", {"finding": argument, "actor": actor}
                     )
 
-    async def sync(self, repository=None):
+    async def refresh_findings(self, repository, *, process_commands=True):
+        for finding in self.store.rows(
+            "SELECT * FROM findings WHERE repository=? AND issue IS NOT NULL", (repository,)
+        ):
+            if process_commands:
+                await self.commands(repository, finding["issue"], finding)
+            remote = await self.call(
+                self.github.request, "GET", f"repos/{repository}/issues/{finding['issue']}"
+            )
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE findings SET state='closed' WHERE id=? "
+                    "AND state='published' AND ?='closed'",
+                    (finding["id"], remote["state"]),
+                )
+                self.store.db.execute(
+                    "UPDATE findings SET checked=? WHERE id=?", (time.time(), finding["id"])
+                )
+
+    async def sync(self, repository=None, *, process_commands=True):
         for finding in self.store.rows(
             "SELECT * FROM findings WHERE state IN ('pending','uncertain') "
             "AND (? IS NULL OR repository=?) ORDER BY scan_id,id",
@@ -411,24 +430,9 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
             name = repo["name"]
             try:
                 issue = await self.dashboard(name)
-                if issue:
+                if issue and process_commands:
                     await self.commands(name, issue)
-                for finding in self.store.rows(
-                    "SELECT * FROM findings WHERE repository=? AND issue IS NOT NULL", (name,)
-                ):
-                    await self.commands(name, finding["issue"], finding)
-                    remote = await self.call(
-                        self.github.request, "GET", f"repos/{name}/issues/{finding['issue']}"
-                    )
-                    with self.store.db:
-                        self.store.db.execute(
-                            "UPDATE findings SET state='closed' WHERE id=? "
-                            "AND state='published' AND ?='closed'",
-                            (finding["id"], remote["state"]),
-                        )
-                        self.store.db.execute(
-                            "UPDATE findings SET checked=? WHERE id=?", (time.time(), finding["id"])
-                        )
+                await self.refresh_findings(name, process_commands=process_commands)
                 with self.store.db:
                     self.store.db.execute(
                         "UPDATE dashboards SET error=NULL WHERE repository=?", (name,)

@@ -11,7 +11,7 @@ import yaml
 
 from maxwell.cli import parser, register_repository
 from maxwell.config import Config
-from maxwell.daemon import Daemon, request
+from maxwell.daemon import Daemon
 from maxwell.repositories import Repository, git, github_name
 from maxwell.store import Store
 
@@ -105,76 +105,42 @@ def test_remote_registration_defaults_to_main_without_checkout(home, github):
     assert github["requests"] == [("GET", "company/backend", "Bearer work-token")]
 
 
-def test_repository_can_be_added_after_start_from_another_directory(
-    home, source, directory, github
-):
+def test_manual_run_and_repo_account_change_from_another_directory(home, source, directory, github):
     accounts(home)
     github["tokens"]["company/late"] = "Bearer work-token"
     prefix = [sys.executable, "-m", "maxwell", "--home", str(home.root)]
-    process = subprocess.Popen(
-        [*prefix, "start", "--foreground"],
+    registered = subprocess.run(
+        [*prefix, "repo", "add", str(source), "--github", "company/late", "--account", "work"],
+        capture_output=True,
+        text=True,
         cwd=directory,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        timeout=5,
     )
-
-    async def exercise():
-        store = Store(home.db)
-        try:
-            async with asyncio.timeout(5):
-                while True:
-                    try:
-                        await request(home, "status")
-                        break
-                    except OSError:
-                        await asyncio.sleep(0.02)
-            registered = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    *prefix,
-                    "repo",
-                    "add",
-                    str(source),
-                    "--github",
-                    "company/late",
-                    "--account",
-                    "work",
-                ],
-                capture_output=True,
-                text=True,
-                cwd=directory,
-                timeout=5,
-            )
-            assert registered.returncode == 0, registered.stderr
-            async with asyncio.timeout(8):
-                while not store.one("SELECT id FROM findings WHERE state='published'"):
-                    await asyncio.sleep(0.02)
-            assert store.one("SELECT github_account FROM repositories")["github_account"] == "work"
-            assert store.one("SELECT state FROM scans")["state"] == "completed"
-            updated = await asyncio.to_thread(
-                subprocess.run,
-                [*prefix, "repo", "set-account", "company/late", "--account", "personal"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            assert updated.returncode == 0, updated.stderr
-            assert (
-                store.one("SELECT github_account FROM repositories")["github_account"] == "personal"
-            )
-        finally:
-            store.close()
-            if home.socket.exists():
-                await request(home, "stop")
-
+    assert registered.returncode == 0, registered.stderr
+    scanned = subprocess.run(
+        [*prefix, "scan", "company/late", "--model", "fake-model", "--json"],
+        capture_output=True,
+        text=True,
+        cwd=directory,
+        timeout=10,
+    )
+    assert scanned.returncode == 0, scanned.stderr
+    assert json.loads(scanned.stdout)["scans"][0]["state"] == "completed"
+    updated = subprocess.run(
+        [*prefix, "repo", "change", "company/late", "--account", "personal"],
+        capture_output=True,
+        text=True,
+        cwd=directory,
+        timeout=5,
+    )
+    assert updated.returncode == 0, updated.stderr
+    store = Store(home.db)
     try:
-        asyncio.run(exercise())
-        assert process.wait(timeout=10) == 0
+        assert store.one("SELECT github_account FROM repositories")["github_account"] == "personal"
+        assert store.one("SELECT state FROM findings")["state"] == "published"
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
-        process.stderr.close()
+        store.close()
+    assert not home.socket.exists()
 
 
 def test_remote_fetch_refreshes_managed_worktree_without_persisting_auth(home, source, monkeypatch):

@@ -40,6 +40,27 @@ def check_line(check):
     print(f"{badge} {name}{suffix}", flush=True)
 
 
+def scan_line(scan):
+    name = scan["repository"]
+    if scan["state"] == "running":
+        effort = f" / {scan['effort']}" if scan.get("effort") else ""
+        print(
+            f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}",
+            flush=True,
+        )
+    elif scan["state"] == "publishing":
+        print(f"{color('[PUB]', '36')} {name}: publishing results", flush=True)
+    else:
+        success = scan["state"] == "completed" and not scan["publication_errors"]
+        badge = color("[OK]" if success else "[FAIL]", "32" if success else "31")
+        detail = (
+            f"{scan['admitted']} new findings"
+            if success
+            else scan["error"] or "; ".join(scan["publication_errors"]) or scan["state"]
+        )
+        print(f"{badge} {name}: {detail}", flush=True)
+
+
 def table(headers, rows, *, bordered=False, cell_style=None):
     if not rows:
         return []
@@ -139,80 +160,9 @@ def repository_lines(record):
             lines.append(f"  {label}: {record[key]}")
     if "directory" in record:
         lines.append(f"  Local directory: {record['directory'] or 'none'}")
-    if "paused" in record:
-        lines.append(f"  Scans: {'paused' if record['paused'] else 'enabled'}")
     for stage, route in record.get("stages", {}).items():
         effort = f" / {route['effort']}" if route.get("effort") else ""
         lines.append(f"  {stage.capitalize()}: {route['provider']} / {route['model']}{effort}")
-    return lines
-
-
-def status_lines(value):
-    pid = f" (PID {value['pid']})" if value.get("pid") else ""
-    lines = [f"Daemon {value['daemon']}{pid}"]
-    if "budget_committed_usd" in value:
-        lines.append(f"Committed scan budget: ${value['budget_committed_usd']:.2f}")
-    if "repositories" in value:
-        lines.append("\nRepositories:")
-        for repository in value["repositories"]:
-            lines.extend(repository_lines(repository))
-        if not value["repositories"]:
-            lines.append("  No repositories registered.")
-    if value.get("scans"):
-        lines.append("\nRecent scans:")
-        rows = []
-        for scan in value["scans"]:
-            if scan.get("cost") is not None:
-                cost = f"${scan['cost'] / 1_000_000:.4f}"
-            elif scan.get("accounting") == "unpriced":
-                cost = "unpriced"
-            else:
-                cost = "unknown"
-            rows.append(
-                [
-                    scan["id"],
-                    scan["repository"],
-                    scan["state"],
-                    f"P{scan['priority']}",
-                    f"{scan.get('provider') or 'legacy'} / {scan.get('model') or 'legacy'}"
-                    + (f" / {scan['effort']}" if scan.get("effort") else ""),
-                    cost,
-                ]
-            )
-        lines.extend(
-            table(["ID", "Repository", "State", "Priority", "Provider / model", "Cost"], rows)
-        )
-        for scan in value["scans"]:
-            if scan.get("error"):
-                lines.append(f"  Scan {scan['id']}: {scan['error']}")
-    for key, label in (
-        ("publication_problems", "Finding publication"),
-        ("dashboard_problems", "Status publication"),
-    ):
-        for problem in value.get(key, []):
-            lines.append(
-                f"  {label} problem ({problem.get('repository', problem.get('id'))}): {problem.get('error') or problem['state']}"
-            )
-    if value.get("ratings"):
-        lines.append("\nModel ratings (provisional):")
-        lines.extend(
-            table(
-                ["Provider / model", "Rating", "Confirmed", "Rejected"],
-                [
-                    [
-                        rating["profile"],
-                        f"{rating['rating']}%",
-                        rating["confirmed"],
-                        rating["rejected"],
-                    ]
-                    for rating in value["ratings"]
-                ],
-            )
-        )
-    elif value.get("hunter_rating"):
-        lines.append(f"Model ratings: {value['hunter_rating']}")
-    if value.get("entropy"):
-        lines.append(f"Entropy: {value['entropy']}")
     return lines
 
 
@@ -242,19 +192,20 @@ def human_lines(value, command, repo_command=None):
                 "No repositories registered."
             ]
         verb = "Registered" if repo_command == "add" else "Updated"
-        if repo_command == "set-account":
-            return [f"Updated {value['repository']}: GitHub account {value['github_account']}"]
         lines = repository_lines(value)
         lines[0] = f"{verb} {lines[0]}"
         return lines
-    if command in ("status", "start", "stop"):
-        return status_lines(value)
     if command == "scan":
-        return [f"Queued scan {identifier}" for identifier in value["scans"]] or [
-            "No repositories to scan."
-        ]
-    if command in ("pause", "resume"):
-        return [f"{'Paused' if value['paused'] else 'Resumed'} scans for {value['repository']}"]
+        if not value["scans"]:
+            return ["No repositories to scan."]
+        lines = []
+        for scan in value["scans"]:
+            if scan["report"]:
+                lines.append(f"Report: {scan['report']}")
+            for finding in scan["findings"]:
+                if finding["url"]:
+                    lines.append(f"Finding: {finding['url']}")
+        return lines
     return []
 
 
