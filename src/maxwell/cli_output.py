@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from datetime import datetime
 
 
 def color(text, code, stream=None):
@@ -39,17 +40,91 @@ def check_line(check):
     print(f"{badge} {name}{suffix}", flush=True)
 
 
-def table(headers, rows):
+def table(headers, rows, *, bordered=False, cell_style=None):
     if not rows:
         return []
     rows = [[str(value) if value is not None else "-" for value in row] for row in rows]
     widths = [
         max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)
     ]
+    if not bordered:
+        return [
+            "  ".join(value.ljust(width) for value, width in zip(row, widths, strict=True)).rstrip()
+            for row in [headers, *rows]
+        ]
+
+    def rule(left, middle, right):
+        return color(left + middle.join("─" * (width + 2) for width in widths) + right, "2")
+
+    def cells(row, heading=False):
+        values = []
+        for index, (value, width) in enumerate(zip(row, widths, strict=True)):
+            padded = value.ljust(width)
+            code = "1" if heading else cell_style(index, value) if cell_style else None
+            values.append(" " + (color(padded, code) if code else padded) + " ")
+        return color("│", "2") + color("│", "2").join(values) + color("│", "2")
+
     return [
-        "  ".join(value.ljust(width) for value, width in zip(row, widths, strict=True)).rstrip()
-        for row in [headers, *rows]
+        rule("┌", "┬", "┐"),
+        cells(headers, heading=True),
+        rule("├", "┼", "┤"),
+        *(cells(row) for row in rows),
+        rule("└", "┴", "┘"),
     ]
+
+
+def model_lines(report):
+    lines = [color("Models", "1;36")]
+    if report.get("checked_at"):
+        lines[0] += color(
+            " — "
+            + datetime.fromtimestamp(report["checked_at"])
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M %Z"),
+            "2",
+        )
+    rows = []
+    for provider in report["providers"]:
+        for model in provider["models"]:
+            efforts = (
+                ", ".join(model["efforts"])
+                if model["efforts"]
+                else model["default_effort"] or ("unknown" if model["efforts"] is None else "none")
+            )
+            rows.append([provider["provider"], model["model"], efforts])
+
+    def model_style(index, value):
+        if value in ("unknown", "none"):
+            return "2"
+        if index == 0:
+            return "1;36"
+        if index == 1:
+            return "36"
+        return None
+
+    lines.extend(
+        "  " + line
+        for line in table(
+            ["Provider", "Model", "Efforts"],
+            rows,
+            bordered=True,
+            cell_style=model_style,
+        )
+    )
+    if not rows:
+        lines.append("  No models stored.")
+    for provider in report["providers"]:
+        if provider.get("error"):
+            lines.append(f"  {color('[FAIL]', '31')} {provider['provider']}: {provider['error']}")
+        elif not provider["models"]:
+            lines.append(f"  {provider['provider']}: no models stored.")
+    if any(
+        model["access"] == "unverified"
+        for provider in report["providers"]
+        for model in provider["models"]
+    ):
+        lines.append("  Unverified models could not be checked during the last apply.")
+    return lines
 
 
 def repository_lines(record):
@@ -67,7 +142,8 @@ def repository_lines(record):
     if "paused" in record:
         lines.append(f"  Scans: {'paused' if record['paused'] else 'enabled'}")
     for stage, route in record.get("stages", {}).items():
-        lines.append(f"  {stage.capitalize()}: {route['provider']} / {route['model']}")
+        effort = f" / {route['effort']}" if route.get("effort") else ""
+        lines.append(f"  {stage.capitalize()}: {route['provider']} / {route['model']}{effort}")
     return lines
 
 
@@ -98,7 +174,8 @@ def status_lines(value):
                     scan["repository"],
                     scan["state"],
                     f"P{scan['priority']}",
-                    f"{scan.get('provider') or 'legacy'} / {scan.get('model') or 'legacy'}",
+                    f"{scan.get('provider') or 'legacy'} / {scan.get('model') or 'legacy'}"
+                    + (f" / {scan['effort']}" if scan.get("effort") else ""),
                     cost,
                 ]
             )
@@ -141,6 +218,8 @@ def status_lines(value):
 
 def human_lines(value, command, repo_command=None):
     if command == "config":
+        if "checks" not in value:
+            return [f"Created {value['config']}. Edit it, then run `maxwell config apply`."]
         counts = {
             status: sum(check["status"] == status for check in value["checks"])
             for status in ("ok", "error", "skipped")
@@ -150,13 +229,13 @@ def human_lines(value, command, repo_command=None):
             for status, label in (("ok", "passed"), ("error", "failed"), ("skipped", "skipped"))
             if counts[status]
         )
-        result = color("Valid" if value["valid"] else "Invalid", "32" if value["valid"] else "31")
+        result = color(
+            "Applied" if value["valid"] else "Apply has errors", "32" if value["valid"] else "31"
+        )
         lines = [f"\n{result}: {summary}."]
         if not value["valid"]:
             lines.append(f"Config: {value['config']}")
         return lines
-    if command == "init":
-        return [f"Created {value['config']}. Configure GitHub credentials and provider homes."]
     if command == "repo":
         if repo_command == "list":
             return [line for record in value for line in repository_lines(record)] or [

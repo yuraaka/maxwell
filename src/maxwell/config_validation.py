@@ -8,6 +8,7 @@ import httpx
 
 from maxwell.config import Paths
 from maxwell.github import GitHub
+from maxwell.model_discovery import discover_models, redact_metadata
 from maxwell.provider import create_provider
 from maxwell.provider_runtime import native_errors
 
@@ -35,15 +36,20 @@ def registered_routes(paths):
             "SELECT name FROM sqlite_master WHERE type='table' AND name='repository_stage_routes'"
         ).fetchone():
             return []
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(repository_stage_routes)")
+        }
+        effort = "effort" if "effort" in columns else "NULL"
         return connection.execute(
-            "SELECT repository,stage,provider,model FROM repository_stage_routes ORDER BY repository,stage"
+            f"SELECT repository,stage,provider,model,{effort} FROM repository_stage_routes ORDER BY repository,stage"
         ).fetchall()
     finally:
         connection.close()
 
 
-def check_config(paths, online=True, on_check=None):
+def validate_config(paths, online=True, on_check=None, discover=False):
     checks = []
+    catalogs = []
     config = None
 
     def add(name, status, message):
@@ -57,12 +63,15 @@ def check_config(paths, online=True, on_check=None):
             on_check(dict(check))
 
     def report():
-        return {
+        result = {
             "config": str(paths.config),
             "valid": not any(check["status"] == "error" for check in checks),
             "online": online,
             "checks": checks,
         }
+        if discover and config is not None:
+            result["providers"] = catalogs
+        return result
 
     try:
         config = paths.load(detailed=True)
@@ -98,20 +107,28 @@ def check_config(paths, online=True, on_check=None):
         routes = []
     assigned = set()
     pairs = set()
-    for repository, stage, provider, model in routes:
+    for repository, stage, provider, model, effort in routes:
         if stage == "discovery":
             assigned.add(repository)
         try:
-            config.route(provider, model)
-            pairs.add((provider, model))
-            add(f"stage:{repository}:{stage}", "ok", "Saved provider and model are configured")
+            route = config.route(provider, model, effort=effort)
+            selected = config.with_effort(
+                config.all_providers()[provider].for_model(model), route.get("effort")
+            )
+            pairs.add((provider, model, selected.effort))
+            add(
+                f"stage:{repository}:{stage}",
+                "ok",
+                "Saved provider, model, and effort are configured",
+            )
         except ValueError as exc:
             add(f"stage:{repository}:{stage}", "error", str(exc))
     for repository, _ in repositories:
         if repository not in assigned:
             try:
                 route = config.route()
-                pairs.add((route["provider"], route["model"]))
+                selected = config.all_providers()[route["provider"]].for_model(route["model"])
+                pairs.add((route["provider"], route["model"], selected.effort))
             except ValueError as exc:
                 add(f"stage:{repository}:discovery", "error", str(exc))
     for name, settings in config.all_providers().items():
@@ -129,16 +146,45 @@ def check_config(paths, online=True, on_check=None):
             if errors
             else "Provider configuration and dependencies are available",
         )
+        catalog = None
+        if discover:
+            catalog = asyncio.run(discover_models(config, name))["providers"][0]
+            known = {entry["model"] for entry in catalog["models"]}
+            for provider, model, effort in pairs:
+                if provider == name and model and model not in known:
+                    catalog["models"].append(
+                        {
+                            "model": model,
+                            "name": model,
+                            "efforts": None,
+                            "default_effort": effort,
+                            "resolved_model": None,
+                            "source": "stage",
+                            "access": "unverified",
+                            "selectable": not settings.models or model in settings.models,
+                            "configured": False,
+                        }
+                    )
+                    known.add(model)
+            catalog["models"].sort(key=lambda entry: entry["model"])
+            catalogs.append(catalog)
+            add(
+                f"models:{name}",
+                "error" if catalog.get("error") else "ok",
+                catalog.get("error") or f"Discovered {len(catalog['models'])} models",
+            )
         models = set(settings.models)
+        if catalog:
+            models.update(model["model"] for model in catalog["models"])
         if settings.model:
             models.add(settings.model)
         if not models and not errors:
             try:
                 models.add(settings.default_model())
             except ValueError:
-                if not any(provider == name for provider, _ in pairs):
+                if not any(provider == name for provider, _, _ in pairs):
                     if settings.adapter == "claude":
-                        pairs.add((name, None))
+                        pairs.add((name, None, settings.effort))
                     else:
                         add(
                             f"provider:{name}:model",
@@ -147,20 +193,51 @@ def check_config(paths, online=True, on_check=None):
                         )
         for model in models:
             try:
-                settings.for_model(model)
-                pairs.add((name, model))
+                model_settings = settings
+                if discover and model not in settings.models:
+                    model_settings = settings.model_copy(update={"models": {}})
+                selected = model_settings.for_model(model)
+                pairs.add((name, model, selected.effort))
             except ValueError as exc:
                 add(f"provider:{name}:{model}", "error", str(exc))
-        for provider, model in sorted(pairs, key=lambda pair: (pair[0], pair[1] or "")):
+        for provider, model, effort in sorted(
+            pairs, key=lambda pair: (pair[0], pair[1] or "", pair[2] or "")
+        ):
             if provider != name:
                 continue
-            label = f"provider:{name}:{model or 'default'}"
+            label = f"provider:{name}:{model or 'default'}" + (f" / {effort}" if effort else "")
             if errors:
                 add(label, "skipped", "Online check blocked by provider configuration errors")
             elif not online:
                 add(label, "skipped", "Authentication and model access were not checked offline")
             else:
-                provider_check(config, name, model, label, add)
+                outcome = []
+
+                def checked(name, status, message):
+                    outcome.append(
+                        {"effort": effort, "status": status, "message": config.redact(message)}
+                    )
+                    add(name, status, message)
+
+                provider_check(
+                    config, name, model, label, checked, effort=effort, unrestricted=discover
+                )
+                if catalog:
+                    entry = next(
+                        (
+                            entry
+                            for entry in catalog["models"]
+                            if entry["model"] == (model or "default")
+                        ),
+                        None,
+                    )
+                    if entry:
+                        entry.setdefault("checks", []).extend(outcome)
+                        entry["access"] = (
+                            "verified"
+                            if any(check["status"] == "ok" for check in entry["checks"])
+                            else "unavailable"
+                        )
 
     for name, settings in profiles.items():
         label = f"github:{name}"
@@ -190,17 +267,22 @@ def check_config(paths, online=True, on_check=None):
         for key in ("name", "message"):
             check[key] = config.redact(check[key])
     result = report()
+    if discover:
+        result["providers"] = redact_metadata(catalogs, config, [])
     result["config"] = config.redact(result["config"])
     return result
 
 
-def provider_check(config, name, model, label, add):
+def provider_check(config, name, model, label, add, effort=None, unrestricted=False):
     settings = config.all_providers()[name]
+    if unrestricted and model not in settings.models:
+        settings = settings.model_copy(update={"models": {}})
     settings = (
         settings.for_model(model)
         if model is not None
         else settings.model_copy(update={"model": ""})
     )
+    settings = config.with_effort(settings, effort)
     timeout = min(30, config.limits.scan_timeout_seconds)
     probe_config = config.model_copy(
         update={

@@ -234,7 +234,7 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                 else money(scan["cost"])
             )
             body += f"- `{scan['id'][:12]}`: {scan['state']}, {cost}, {scan['provider'] or 'legacy'}/{scan['model'] or 'legacy'}\n"
-        body += "\nAuthorized commands: `/maxwell scan --model MODEL [--provider PROVIDER]`, `/maxwell pause`, `/maxwell resume`.\n"
+        body += "\nAuthorized commands: `/maxwell scan --model MODEL [--provider PROVIDER] [--effort EFFORT]`, `/maxwell pause`, `/maxwell resume`.\n"
         body = self.config.redact(body)
         snapshot = self.paths.root / "reports" / (repo.replace("/", "--") + ".md")
         snapshot.write_text(body)
@@ -339,12 +339,13 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                             not options
                             or len(options) % 2
                             or any(
-                                option not in ("--model", "--provider") for option in options[::2]
+                                option not in ("--model", "--provider", "--effort")
+                                for option in options[::2]
                             )
                             or len(set(options[::2])) != len(options[::2])
                         ):
                             raise ValueError(
-                                "Use /maxwell scan --model MODEL [--provider PROVIDER]"
+                                "Use /maxwell scan --model MODEL [--provider PROVIDER] [--effort EFFORT]"
                             )
                         values = dict(zip(options[::2], options[1::2], strict=True))
                         if "--model" not in values:
@@ -354,6 +355,7 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                             values.get("--provider"),
                             values["--model"],
                             self.store.saved_route(repo),
+                            effort=values.get("--effort"),
                         )
                         execution = self.config.execution(route, record)
                     except ValueError as exc:

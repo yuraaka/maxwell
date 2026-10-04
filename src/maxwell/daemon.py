@@ -37,6 +37,8 @@ class Daemon:
         self.stopping = asyncio.Event()
         self.wake = asyncio.Event()
         self.active = None
+        self.config_changed = asyncio.Event()
+        self.config_generation = 0
         self.log = logging.getLogger("maxwell")
 
     async def handle(self, reader, writer):
@@ -56,6 +58,29 @@ class Daemon:
                 self.stopping.set()
                 self.wake.set()
                 result = {"daemon": "stopping"}
+            elif command == "reload_config":
+                digest = hashlib.sha256(self.paths.config.read_bytes()).hexdigest()
+                applied = self.store.one(
+                    "SELECT config_digest,valid FROM config_application WHERE id=1"
+                )
+                if (
+                    digest != data.get("config_digest")
+                    or not applied
+                    or applied["config_digest"] != digest
+                    or not applied["valid"]
+                ):
+                    raise ValueError("Run `maxwell config apply` successfully before reloading")
+                config = self.paths.load()
+                config.ready()
+                if hashlib.sha256(self.paths.config.read_bytes()).hexdigest() != digest:
+                    raise ValueError(
+                        "Configuration changed while reloading; run `maxwell config apply` again"
+                    )
+                self.config = config
+                self.config_generation += 1
+                self.config_changed.set()
+                self.wake.set()
+                result = {"daemon": "reloaded"}
             elif command in ("pause", "resume"):
                 self.store.pause(repo, command == "pause")
                 self.wake.set()
@@ -79,6 +104,7 @@ class Daemon:
                             data.get("provider"),
                             data["model"],
                             self.store.saved_route(record["name"]),
+                            effort=data.get("effort"),
                         ),
                         record,
                     )
@@ -309,9 +335,18 @@ class Daemon:
 
     async def synchronize(self):
         clients, reporters = {}, {}
+        generation = None
         try:
             while not self.stopping.is_set():
+                if generation != self.config_generation:
+                    for client in clients.values():
+                        client.close()
+                    clients, reporters = {}, {}
+                    generation = self.config_generation
+                    self.config_changed.clear()
                 for record in self.store.rows("SELECT name,github_account FROM repositories"):
+                    if generation != self.config_generation:
+                        break
                     name, account = record["name"], record["github_account"]
                     try:
                         if account not in clients:
@@ -331,10 +366,20 @@ class Daemon:
                                 "UPDATE dashboards SET error=? WHERE repository=?",
                                 (self.config.redact(str(exc))[:1000], name),
                             )
+                waiting = [
+                    asyncio.create_task(self.stopping.wait()),
+                    asyncio.create_task(self.config_changed.wait()),
+                ]
                 try:
-                    await asyncio.wait_for(self.stopping.wait(), self.config.github.sync_seconds)
-                except TimeoutError:
-                    pass
+                    await asyncio.wait(
+                        waiting,
+                        timeout=self.config.github.sync_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in waiting:
+                        task.cancel()
+                    await asyncio.gather(*waiting, return_exceptions=True)
         finally:
             for client in clients.values():
                 client.close()

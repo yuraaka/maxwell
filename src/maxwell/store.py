@@ -9,7 +9,7 @@ class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path, timeout=10)
         self.db.row_factory = sqlite3.Row
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 6:
             self.db.close()
             raise ValueError("State database was created by a newer Maxwell version")
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -53,6 +53,13 @@ class Store:
                 scan_id TEXT NOT NULL REFERENCES scans(id), data TEXT NOT NULL,
                 PRIMARY KEY(finding_id,scan_id)
             );
+            CREATE TABLE IF NOT EXISTS model_catalogs (
+                provider TEXT PRIMARY KEY, data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS config_application (
+                id INTEGER PRIMARY KEY CHECK(id=1), config_digest TEXT NOT NULL,
+                checked_at REAL NOT NULL, valid INTEGER NOT NULL, checks TEXT NOT NULL
+            );
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -77,7 +84,12 @@ class Store:
                     self.db.execute(f"ALTER TABLE scans ADD COLUMN {name} {definition}")
             if "executed" not in scan_columns:
                 self.db.execute("UPDATE scans SET executed=1 WHERE started IS NOT NULL")
-            self.db.execute("PRAGMA user_version=4")
+            route_columns = {
+                row["name"] for row in self.db.execute("PRAGMA table_info(repository_stage_routes)")
+            }
+            if "effort" not in route_columns:
+                self.db.execute("ALTER TABLE repository_stage_routes ADD COLUMN effort TEXT")
+            self.db.execute("PRAGMA user_version=6")
 
     def close(self):
         self.db.close()
@@ -94,6 +106,68 @@ class Store:
             "INSERT INTO events(created,kind,data) VALUES(?,?,?)",
             (time.time(), kind, json.dumps(data)),
         )
+
+    def apply_models(self, report, digest):
+        checked_at = time.time()
+        with self.db:
+            self.db.execute("DELETE FROM model_catalogs")
+            for catalog in report["providers"]:
+                catalog["checked_at"] = checked_at
+                stored_catalog = {
+                    **catalog,
+                    "models": [
+                        model
+                        for model in catalog["models"]
+                        if (model.get("efforts") or model.get("default_effort"))
+                        and model["access"] != "unavailable"
+                    ],
+                }
+                self.db.execute(
+                    "INSERT INTO model_catalogs(provider,data) VALUES(?,?)",
+                    (catalog["provider"], json.dumps(stored_catalog)),
+                )
+            self.db.execute(
+                "INSERT INTO config_application(id,config_digest,checked_at,valid,checks) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET config_digest=excluded.config_digest,checked_at=excluded.checked_at,valid=excluded.valid,checks=excluded.checks",
+                (digest, checked_at, report["valid"], json.dumps(report["checks"])),
+            )
+            self.event(
+                "configuration_applied", {"valid": report["valid"], "checked_at": checked_at}
+            )
+        return checked_at
+
+    @staticmethod
+    def cached_models(path, provider=None):
+        if not path.exists():
+            raise ValueError("Run `maxwell config apply` to discover and check models first")
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        try:
+            connection.execute("BEGIN")
+            if not connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='config_application'"
+            ).fetchone():
+                raise ValueError("Run `maxwell config apply` to discover and check models first")
+            application = connection.execute(
+                "SELECT checked_at,valid FROM config_application WHERE id=1"
+            ).fetchone()
+            if not application:
+                raise ValueError("Run `maxwell config apply` to discover and check models first")
+            rows = connection.execute(
+                "SELECT data FROM model_catalogs"
+                + (" WHERE provider=?" if provider else "")
+                + " ORDER BY provider",
+                (provider,) if provider else (),
+            ).fetchall()
+            if provider and not rows:
+                raise ValueError(
+                    f"No stored models for provider {provider!r}; run `maxwell config apply`"
+                )
+            return {
+                "providers": [json.loads(row[0]) for row in rows],
+                "checked_at": application[0],
+                "valid": bool(application[1]),
+            }
+        finally:
+            connection.close()
 
     def register(
         self,
@@ -116,16 +190,19 @@ class Store:
             self.event("repository_registered", {"repository": name})
 
     def saved_route(self, repository, stage="discovery"):
-        return self.one(
-            "SELECT provider,model FROM repository_stage_routes WHERE repository=? AND stage=?",
+        route = self.one(
+            "SELECT provider,model,effort FROM repository_stage_routes WHERE repository=? AND stage=?",
             (repository, stage),
         )
+        if route and route["effort"] is None:
+            del route["effort"]
+        return route
 
     def write_route(self, repository, stage, route):
         self.db.execute(
-            "INSERT INTO repository_stage_routes(repository,stage,provider,model) VALUES(?,?,?,?) "
-            "ON CONFLICT(repository,stage) DO UPDATE SET provider=excluded.provider,model=excluded.model",
-            (repository, stage, route["provider"], route["model"]),
+            "INSERT INTO repository_stage_routes(repository,stage,provider,model,effort) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(repository,stage) DO UPDATE SET provider=excluded.provider,model=excluded.model,effort=excluded.effort",
+            (repository, stage, route["provider"], route["model"], route.get("effort")),
         )
 
     def ensure_route(self, repository, config):
@@ -140,7 +217,11 @@ class Store:
         record = self.one("SELECT * FROM repositories WHERE name=?", (name,))
         if record:
             record["stages"] = {
-                row["stage"]: {"provider": row["provider"], "model": row["model"]}
+                row["stage"]: {
+                    "provider": row["provider"],
+                    "model": row["model"],
+                    **({"effort": row["effort"]} if row["effort"] else {}),
+                }
                 for row in self.rows(
                     "SELECT * FROM repository_stage_routes WHERE repository=? ORDER BY stage",
                     (name,),
@@ -375,7 +456,7 @@ class Store:
                 for row in self.rows("SELECT name FROM repositories ORDER BY name")
             ],
             "scans": self.rows(
-                "SELECT id,repository,state,priority,created,summary,error,cost,accounting,stage,provider,model "
+                "SELECT id,repository,state,priority,created,summary,error,cost,accounting,stage,provider,model,json_extract(execution,'$.settings.effort') AS effort "
                 "FROM scans ORDER BY created DESC LIMIT 20"
             ),
             "budget_committed_usd": self.committed_today() / 1_000_000,

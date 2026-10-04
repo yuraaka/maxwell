@@ -15,7 +15,7 @@ configuration remains supported. Gemini is not implemented.
 ```bash
 uv tool install --editable .
 maxwell --help
-maxwell init
+maxwell config init
 ```
 
 For development, use `uv sync --group dev` and `uv run maxwell ...` instead.
@@ -40,42 +40,57 @@ reference. Supply:
   reported as unpriced and admissions use `limits.daily_scan_limit` (default: 20).
 
 Credentials may be literal values in this file. Configuration files must have mode
-`0600`; runtime directories use `0700`. `init` never overwrites an existing config.
-Restart after configuration changes. No credentials are required for the test suite.
+`0600`; runtime directories use `0700`. `config init` creates private configuration,
+runtime directories, and the state database; it never overwrites an existing config.
+After editing settings, run `config apply`. No credentials are required for the test suite.
 
-Check configuration before starting the daemon:
+Apply configuration before starting the daemon:
 
 ```bash
-maxwell config check
-maxwell config check --offline
-maxwell config check --json
+maxwell config apply
+maxwell config apply --json
 ```
 
-The command checks YAML structure, field values, file permissions, required credentials,
+The command rereads configuration and checks YAML structure, field values, file
+permissions, required credentials,
 model prices when supplied, Git, provider executables/homes, gateway environment
 dependencies, and saved repository provider/model assignments.
-By default it also authenticates each configured GitHub account, reports its login, and
-checks access to registered repositories. It sends a small structured request through
-each configured provider/model pair to verify authentication and model access. The
-pairs include catalog models, provider defaults, and saved repository stage models;
-duplicates are checked once. Claude providers without a selected model are checked
+It authenticates each configured GitHub account, reports its login, and checks access
+to registered repositories. It rediscovers each account's models and efforts, then
+sends a small structured request through **every discovered model**, including models
+outside Maxwell's configured selection catalog. Configured model defaults and saved
+repository stage selections are also checked; duplicate model/effort selections are
+checked once. Models are checked at the native/configured default effort, with separate
+checks for distinct saved stage efforts. It does not probe every advertised effort level.
+Claude providers without a selected model are checked
 using the Claude CLI's default (including its native settings and gateway environment).
-Codex providers need a model in their native settings, Maxwell config, catalog, or saved
-stage assignment. Manual scans still require `--model`.
+Discovery does not require a configured default model. Repository registration needs
+an explicit model when no default can be resolved; manual scans still require `--model`.
 
 Provider checks use the native home/profile and gateway environment in an empty
 temporary workspace, with a timeout of 30 seconds per pair (or the configured scan
 timeout if shorter). Temporary check files are removed; the repository registry and
 scan history are unchanged. Native credential refresh remains owned by the CLI.
 These requests consume provider usage and are outside the daemon's scan budget.
-`--offline` skips all GitHub and provider requests. The default
-account may be empty when repositories use named profiles; named profiles need tokens.
+Model metadata, probe outcomes, and the apply timestamp are stored in SQLite.
+Models with unavailable access or no known effort levels/default are excluded from the
+stored catalog. Failed checks remain in the apply report; other accounts are still checked.
+Applying replaces the previous catalog, including removing
+entries for deleted providers and models. The default account may be empty when
+repositories use named profiles; named profiles need tokens.
 Errors identify the settings to fix without printing credential values. The command
 prints each result as soon as the check finishes, followed by a summary, and exits
 with status 0 on success or 1 on failure. `--json` prints one complete JSON report
 after all checks finish, without progress text. Terminal output uses colored status
 labels and brief success lines; failures keep their diagnostics. Piped output and
 JSON stay plain. Set `NO_COLOR` to disable terminal colors.
+Successful apply reloads a running daemon's settings and GitHub clients; active and
+queued scans retain their execution settings. It does not start a daemon or queue
+repository scans. Apply with errors still saves model results and exits with status 1,
+but leaves a running daemon's configuration unchanged. Invalid YAML or configuration
+changes during apply preserve the previous stored catalog. `config check` and the old
+top-level `init` command have been removed. `maxwell --help` displays a command tree;
+subcommand help shows the detailed options.
 
 GitHub checks verify identity and repository read access; write permissions are not
 tested.
@@ -156,6 +171,8 @@ providers:
     home: ~/.codex-work
     models:
       your-model-id:
+        efforts: [low, medium, high]
+        effort: medium
         input_usd_per_mtok: 2
         cached_input_usd_per_mtok: 0.2
         output_usd_per_mtok: 8
@@ -165,6 +182,39 @@ These prices are illustrative; use your gateway's actual rates. Claude cache cre
 can be priced with `cache_write_usd_per_mtok`; it otherwise uses the regular input rate.
 Both input and output prices must be set together. A plain list such as
 `models: [model-a, model-b]` restricts models without assigning prices.
+`effort` sets a provider or model default. An optional `efforts` list declares supported
+levels and rejects other selections before queueing. Leave `effort` unset to retain
+the native CLI's default; leave `efforts` unset when capabilities are unknown.
+
+Read the models and reasoning efforts stored by the most recent apply:
+
+```bash
+maxwell models list
+maxwell models list --provider codex-work
+maxwell models list --provider claude-work --json
+```
+
+During `config apply`, each provider/account is queried separately using its configured
+native home, profile,
+and gateway environment. Codex uses the app-server `model/list` protocol, including
+hidden models and all result pages. Claude uses the same initialization metadata as
+the Agent SDK's `supportedModels()`, preserving aliases and resolved model IDs.
+Discovery reads supported efforts and default efforts when supplied by the CLI.
+An empty effort list means effort selection is unsupported. Native configured model
+defaults and Maxwell catalog entries supplement discovery, and configured effort
+metadata takes precedence. Models without known effort levels or a default effort
+are excluded from the stored catalog, as are models with unavailable access.
+
+`models list` reads only the database and makes no provider or GitHub requests. It shows
+the last apply timestamp and one table of providers, model names, and supported efforts.
+`--json` also includes default efforts, sources, selection restrictions, access status,
+and individual probe results for stored models. Edited configuration takes effect in this list only after
+the next apply; it can still be read when config.yaml is missing or invalid.
+Before the first apply, the command tells you to run `maxwell config apply`.
+A CLI or company gateway may return an incomplete catalog, so native configured
+defaults and Maxwell catalog entries supplement discovery. Native CLIs still own
+their credential refresh and caches. Each metadata request and each model probe has
+a timeout of 30 seconds (or the configured scan timeout if shorter).
 
 Existing singleton `provider` configurations keep working as the provider named
 `default`. Use either the old `provider` form or the new `providers` form.
@@ -175,7 +225,7 @@ Existing singleton `provider` configurations keep working as the provider named
 under `~/.maxwell`; it is not attached to the shell's current repository. Register
 repositories before or after starting it. A running daemon notices new registrations
 automatically; GitHub synchronization follows its configured interval. Configure
-profiles before startup, or restart after adding/editing profiles in the YAML file.
+profiles before startup, or run `config apply` after adding/editing profiles in the YAML file.
 
 ```bash
 maxwell start
@@ -234,8 +284,11 @@ Each repository has a saved provider/model pair for each configured stage:
 ```bash
 maxwell repo change owner/repository --stage discovery --provider codex-work --model model-a
 maxwell repo change owner/repository --stage review --provider claude-work --model model-b
+maxwell repo change owner/repository --stage review --effort high
+maxwell repo change owner/repository --stage review --effort default
 maxwell scan owner/repository --model model-c
 maxwell scan owner/repository --provider codex-second --model model-c
+maxwell scan owner/repository --model model-c --effort high
 ```
 
 With multiple providers, registration requires `--provider`. With one, it is selected
@@ -248,7 +301,14 @@ Every manual scan requires `--model`, including GitHub control comments. An omit
 `--provider` uses the saved discovery provider. Overrides affect that run only; scheduled
 discovery uses the saved pair. All selections are validated before queuing multi-repo
 requests, and queued runs retain their provider, model, source settings, limits, and
-prices. Authentication remains a live reference so native token refresh can work.
+prices. `--effort` overrides the effort for one run. For the same saved provider/model,
+an omitted effort keeps the stage's override; switching provider or model drops that
+override. `--effort default` clears a saved or per-run override and uses the configured
+model/provider default, then the native CLI default if neither is set. Explicit effort
+selections and configured defaults are frozen in queued scan settings. Effort names
+are passed through to the CLI; declared `efforts` lists are validated locally, while
+unknown capabilities are validated by the native CLI/gateway during execution.
+Authentication remains a live reference so native token refresh can work.
 
 Review, reproduction, fix, and validation routes may be stored now; their execution
 workflows are later milestones. `scan` executes discovery only.
@@ -311,6 +371,7 @@ On the status issue:
 ```text
 /maxwell scan --model model-a
 /maxwell scan --provider codex-second --model model-a
+/maxwell scan --model model-a --effort high
 /maxwell pause
 /maxwell resume
 ```

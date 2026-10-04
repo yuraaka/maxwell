@@ -2,7 +2,7 @@ import base64
 import os
 import shutil
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import yaml
@@ -72,7 +72,12 @@ class GitHubSettings(Settings):
         )
 
 
+Effort = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]*$")]
+
+
 class ModelSettings(Settings):
+    effort: Effort | None = None
+    efforts: list[Effort] | None = None
     input_usd_per_mtok: float | None = Field(default=None, ge=0)
     cached_input_usd_per_mtok: float | None = Field(default=None, ge=0)
     cache_write_usd_per_mtok: float | None = Field(default=None, ge=0)
@@ -82,6 +87,10 @@ class ModelSettings(Settings):
     def complete_prices(self):
         if (self.input_usd_per_mtok is None) != (self.output_usd_per_mtok is None):
             raise ValueError("Set both input and output prices, or leave both unpriced")
+        if self.effort == "default":
+            raise ValueError("Omit effort to use the provider default")
+        if self.efforts is not None and self.effort is not None and self.effort not in self.efforts:
+            raise ValueError("Effort is not in the model's supported efforts")
         return self
 
 
@@ -147,7 +156,12 @@ class ProviderSettings(ModelSettings):
                 if model == self.model
                 else ModelSettings()
             )
-        return self.model_copy(update={"model": model, **prices.model_dump()})
+        values = prices.model_dump()
+        for key in ("effort", "efforts"):
+            if values[key] is None:
+                values[key] = getattr(self, key)
+        ModelSettings.model_validate(values)
+        return self.model_copy(update={"model": model, **values})
 
     def default_model(self):
         if self.model:
@@ -234,7 +248,7 @@ class Config(Settings):
             raise ValueError(f"Unknown provider {name!r}")
         return name
 
-    def route(self, provider=None, model=None, current=None):
+    def route(self, provider=None, model=None, current=None, effort=None):
         name = self.provider_name(provider or (current["provider"] if current else None))
         settings = self.all_providers()[name]
         if model is None:
@@ -243,12 +257,33 @@ class Config(Settings):
                 if current and current["provider"] == name
                 else settings.default_model()
             )
-        settings.for_model(model)
-        return {"provider": name, "model": model}
+        selected = settings.for_model(model)
+        if effort == "default":
+            effort = None
+        elif (
+            effort is None and current and current["provider"] == name and current["model"] == model
+        ):
+            effort = current.get("effort")
+        self.with_effort(selected, effort)
+        return {"provider": name, "model": model, **({"effort": effort} if effort else {})}
+
+    @staticmethod
+    def with_effort(settings, effort):
+        if effort is None:
+            return settings
+        if settings.efforts is not None and effort not in settings.efforts:
+            raise ValueError("Effort is not in the model's supported efforts")
+        try:
+            selected = ModelSettings.model_validate({"effort": effort})
+        except ValidationError:
+            raise ValueError("Specify a valid --effort") from None
+        return settings.model_copy(update={"effort": selected.effort})
 
     def execution(self, route, record):
         name = self.provider_name(route["provider"])
-        settings = self.all_providers()[name].for_model(route["model"])
+        settings = self.with_effort(
+            self.all_providers()[name].for_model(route["model"]), route.get("effort")
+        )
         return {
             **route,
             "stage": "discovery",
@@ -304,7 +339,7 @@ class Paths:
 
     def load(self, detailed=False) -> Config:
         if not self.config.exists():
-            raise ValueError("Run `maxwell init` first")
+            raise ValueError("Run `maxwell config init` first")
         if self.config.stat().st_mode & 0o077:
             raise ValueError(f"Restrict configuration permissions: chmod 600 {self.config}")
         try:

@@ -70,6 +70,14 @@ def executable(directory, finding):
     source = """import json, os, sys, time
 from pathlib import Path
 args = sys.argv
+if args[1] == 'app-server':
+    for line in sys.stdin:
+        message = json.loads(line)
+        if message['method'] == 'initialized':
+            continue
+        result = {} if message['method'] == 'initialize' else {'data':[{'model':'fake-model', 'supportedReasoningEfforts':[{'reasoningEffort':'low'}, {'reasoningEffort':'high'}], 'defaultReasoningEffort':'low'}], 'nextCursor':None}
+        print(json.dumps({'id':message['id'], 'result':result}), flush=True)
+    sys.exit(0)
 output = Path(args[args.index('--output-last-message') + 1])
 workspace = Path(args[args.index('--cd') + 1])
 mode_path = Path(__file__).parent / 'mode'

@@ -1,12 +1,13 @@
 import json
+import re
 import subprocess
 import sys
 
 import pytest
 
 from maxwell.cli import execute, parser
-from maxwell.cli_output import check_line
-from maxwell.config_check import check_config
+from maxwell.cli_output import check_line, model_lines
+from maxwell.config_validation import validate_config
 from maxwell.github import GitHub
 from maxwell.store import Store
 
@@ -14,9 +15,9 @@ from maxwell.store import Store
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["--json", "config", "check", "--offline"],
-        ["config", "--json", "check", "--offline"],
-        ["config", "check", "--offline", "--json"],
+        ["--json", "config", "apply"],
+        ["config", "--json", "apply"],
+        ["config", "apply", "--json"],
         ["--json", "repo", "list"],
         ["repo", "--json", "list"],
         ["repo", "list", "--json"],
@@ -28,12 +29,12 @@ def test_json_flag_works_at_each_command_level(arguments):
 
 
 def test_default_config_output_is_readable_with_summary(home, capsys):
-    execute(parser().parse_args(["--home", str(home.root), "config", "check", "--offline"]))
+    execute(parser().parse_args(["--home", str(home.root), "config", "apply"]))
     result = capsys.readouterr().out
-    assert result.startswith("Checking config (offline)...\n")
+    assert result.startswith("Applying config...\n")
     assert "[OK] config" in result
-    assert "[SKIP] default / fake-model: offline" in result
-    assert "Valid:" in result
+    assert "[OK] default / fake-model" in result
+    assert "Applied:" in result
     assert "YAML, settings" not in result
     assert "fake-github-secret" not in result and "fake-provider-secret" not in result
 
@@ -41,7 +42,7 @@ def test_default_config_output_is_readable_with_summary(home, capsys):
 def test_streamed_checks_are_redacted_before_callback(home, monkeypatch):
     monkeypatch.setattr(GitHub, "request", lambda *args, **kwargs: {"login": "fake-github-secret"})
     streamed = []
-    report = check_config(home, on_check=streamed.append)
+    report = validate_config(home, on_check=streamed.append)
     assert report["valid"], report
     assert streamed == report["checks"]
     assert "fake-github-secret" not in json.dumps(streamed)
@@ -50,15 +51,15 @@ def test_streamed_checks_are_redacted_before_callback(home, monkeypatch):
 
 def test_human_config_failure_keeps_nonzero_exit(directory):
     result = subprocess.run(
-        [sys.executable, "-m", "maxwell", "--home", str(directory / "missing"), "config", "check"],
+        [sys.executable, "-m", "maxwell", "--home", str(directory / "missing"), "config", "apply"],
         capture_output=True,
         text=True,
         timeout=5,
     )
     assert result.returncode == 1
     assert "[FAIL] config:" in result.stdout
-    assert "Invalid:" in result.stdout
-    assert "maxwell init" in result.stdout
+    assert "Apply has errors:" in result.stdout
+    assert "maxwell config init" in result.stdout
     assert result.stderr == ""
 
 
@@ -133,9 +134,52 @@ def test_json_stays_uncolored_in_terminal(home, monkeypatch, capsys):
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm")
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-    execute(
-        parser().parse_args(["--home", str(home.root), "config", "check", "--offline", "--json"])
-    )
+    execute(parser().parse_args(["--home", str(home.root), "config", "apply", "--json"]))
     text = capsys.readouterr().out
     assert "\033[" not in text
     assert json.loads(text)["valid"]
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_model_tables_align_with_and_without_colors(terminal, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: terminal)
+    catalog = {
+        "provider": "codex-work",
+        "adapter": "codex",
+        "models": [
+            {
+                "model": name,
+                "efforts": efforts,
+                "default_effort": "medium" if name == "configured" else None,
+                "source": "native",
+                "selectable": True,
+                "access": access,
+            }
+            for name, efforts, access in (
+                ("short", ["low", "high"], "verified"),
+                ("long-model-name", None, "unavailable"),
+                ("default", [], "unverified"),
+                ("configured", None, "verified"),
+            )
+        ],
+    }
+    other = {**catalog, "provider": "claude-personal", "models": catalog["models"][:1]}
+    text = "\n".join(model_lines({"providers": [catalog, other], "checked_at": 1_791_000_000}))
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    rows = [line for line in plain.splitlines() if line.startswith("  │")]
+    assert len(rows) == 6
+    positions = [[index for index, char in enumerate(row) if char == "│"] for row in rows]
+    assert all(row == positions[0] for row in positions)
+    assert plain.count("┌") == plain.count("└") == 1
+    assert "codex-work" in plain and "claude-personal" in plain
+    assert plain.splitlines()[0].startswith("Models — ")
+    assert "low, high" in plain and "unknown" in plain
+    assert "configured" in plain and "medium" in plain
+    for heading in ("Default", "Source", "Selectable", "Access"):
+        assert heading not in plain
+    if terminal:
+        assert "\033[36mshort" in text
+    else:
+        assert text == plain

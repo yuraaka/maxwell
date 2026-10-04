@@ -11,8 +11,9 @@ import pytest
 import yaml
 
 from maxwell.cli import execute, parser, register_repository
-from maxwell.config import Config, ProviderSettings
-from maxwell.config_check import check_config
+from maxwell.config import Config, ModelSettings, ProviderSettings
+from maxwell.config_apply import config_digest
+from maxwell.config_validation import validate_config
 from maxwell.contracts import Usage, estimate_cost
 from maxwell.daemon import Daemon
 from maxwell.github import GitHub
@@ -30,8 +31,27 @@ def native_cli(directory, finding):
 import json, os, sys, time, tomllib
 from pathlib import Path
 args = sys.argv[1:]
-codex = args[0] == 'exec'
+codex = args[0] in ('exec', 'app-server')
+metadata = args[0] == 'app-server' or '--input-format' in args
 home = Path(os.environ['CODEX_HOME' if codex else 'CLAUDE_CONFIG_DIR'])
+if metadata:
+    observed = {'pid':os.getpid(), 'workspace':str(Path.cwd()), 'args':args, 'model':None, 'probe':False}
+    (home / 'observed.json').write_text(json.dumps(observed))
+    mode = (home / 'mode').read_text() if (home / 'mode').exists() else 'normal'
+    if mode == 'wait':
+        time.sleep(60)
+    native = tomllib.loads((home / 'config.toml').read_text()) if codex else json.loads((home / 'settings.json').read_text())
+    model = native.get('model') or ('default' if not codex else None)
+    for line in sys.stdin:
+        message = json.loads(line)
+        if codex:
+            if message['method'] == 'initialized':
+                continue
+            result = {} if message['method'] == 'initialize' else {'data':[{'model':model}] if model else [], 'nextCursor':None}
+            print(json.dumps({'id':message['id'], 'result':result}), flush=True)
+        else:
+            print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':message['request_id'],'response':{'models':[{'value':model}]}}}),flush=True)
+    sys.exit(0)
 model = args[args.index('--model') + 1] if '--model' in args else os.environ.get('ANTHROPIC_MODEL', 'cli-default')
 workspace = Path(args[args.index('--cd') + 1]) if codex else Path.cwd()
 schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text()) if codex else json.loads(args[args.index('--json-schema') + 1])
@@ -46,7 +66,7 @@ if codex:
     for position, argument in enumerate(args):
         if argument == '-c':
             for key, value in tomllib.loads(args[position + 1]).items():
-                if key in ('model_provider', 'model_providers', 'cli_auth_credentials_store', 'model_catalog_json'):
+                if key in ('model_provider', 'model_providers', 'cli_auth_credentials_store', 'model_catalog_json', 'model_reasoning_effort'):
                     connection[key] = value
 observed = {
     'model': model, 'home': str(home), 'args': args,
@@ -479,18 +499,18 @@ def test_native_configuration_checks_dependencies_and_saved_routes(
         '[model_providers.gateway]\nbase_url="https://company.invalid"\nenv_key="COMPANY_GATEWAY_TOKEN"\n'
     )
     monkeypatch.delenv("COMPANY_GATEWAY_TOKEN", raising=False)
-    report = check_config(home, online=False)
+    report = validate_config(home, online=False)
     assert not report["valid"]
     assert "COMPANY_GATEWAY_TOKEN" in json.dumps(report)
     monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", "gateway-secret")
-    report = check_config(home, online=False)
+    report = validate_config(home, online=False)
     assert report["valid"], report
     assert "gateway-secret" not in json.dumps(report)
     with daemon.store.db:
         daemon.store.write_route(
             "acme/repo", "discovery", {"provider": "missing", "model": "chosen"}
         )
-    assert not check_config(home, online=False)["valid"]
+    assert not validate_config(home, online=False)["valid"]
 
 
 def test_native_provider_definitions_do_not_mix_with_legacy_config():
@@ -536,10 +556,10 @@ def test_gateway_paths_resolve_against_config_directory(home, native):
 
 
 @pytest.mark.parametrize("content", ['{"env":{"ANTHROPIC_AUTH_TOKEN":1}}', '["invalid"]', "{bad"])
-def test_invalid_native_settings_fail_config_check(home, native, content):
+def test_invalid_native_settings_fail_config_validation(home, native, content):
     homes, _ = native
     (homes["claude"] / "settings.json").write_text(content)
-    report = check_config(home, online=False)
+    report = validate_config(home, online=False)
     assert not report["valid"]
 
 
@@ -562,7 +582,7 @@ def test_online_check_probes_catalog_defaults_and_stage_models_once(
         store.close()
     database_before = home.db.read_bytes()
     files_before = home.config.read_bytes()
-    report = check_config(home)
+    report = validate_config(home)
     assert report["valid"], report
     assert home.db.read_bytes() == database_before
     assert home.config.read_bytes() == files_before
@@ -613,7 +633,7 @@ def test_online_probe_failures_identify_pair_and_redact_secrets(
     data["limits"]["scan_timeout_seconds"] = 1
     home.config.write_text(yaml.safe_dump(data))
     (homes[adapter] / "mode").write_text(mode)
-    report = check_config(home)
+    report = validate_config(home)
     assert not report["valid"]
     failures = [
         check
@@ -637,17 +657,17 @@ def test_online_probe_failures_identify_pair_and_redact_secrets(
 
 def test_offline_check_never_invokes_native_providers(home, native):
     homes, _ = native
-    report = check_config(home, online=False)
+    report = validate_config(home, online=False)
     assert report["valid"], report
     assert all(not (path / "observed.json").exists() for path in homes.values())
     assert any("not checked offline" in check["message"] for check in report["checks"])
 
 
-def test_config_check_streams_results_while_native_probe_is_running(home, native):
+def test_config_apply_streams_results_while_native_probe_is_running(home, native):
     homes, _ = native
     (homes["first"] / "mode").write_text("wait")
     process = subprocess.Popen(
-        [os.sys.executable, "-m", "maxwell", "--home", str(home.root), "config", "check"],
+        [os.sys.executable, "-m", "maxwell", "--home", str(home.root), "config", "apply"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -664,7 +684,7 @@ def test_config_check_streams_results_while_native_probe_is_running(home, native
         assert (homes["first"] / "observed.json").exists()
         assert process.poll() is None
         assert b"[OK] config" in received
-        assert b"Valid:" not in received
+        assert b"Applied:" not in received
         process.send_signal(signal.SIGINT)
         process.communicate(timeout=6)
         assert process.returncode == 130
@@ -687,8 +707,8 @@ def test_config_check_streams_results_while_native_probe_is_running(home, native
 def test_online_check_needs_a_model_when_provider_has_no_default(home, native, github):
     homes, _ = native
     (homes["first"] / "config.toml").write_text("")
-    assert check_config(home, online=False)["valid"]
-    report = check_config(home)
+    assert validate_config(home, online=False)["valid"]
+    report = validate_config(home)
     assert not report["valid"]
     assert any(
         check["name"] == "provider:first:model" and check["status"] == "error"
@@ -708,7 +728,7 @@ def test_saved_stage_model_is_probed_without_a_native_default(home, native, sour
     else:
         (homes[provider] / "settings.json").write_text("{}")
     add_repository(home, home.load(), source, "--model", "stage-model")
-    report = check_config(home)
+    report = validate_config(home)
     assert report["valid"], report
     calls = list(map(json.loads, (homes[provider] / "calls.jsonl").read_text().splitlines()))
     assert [call["model"] for call in calls] == ["stage-model"]
@@ -720,7 +740,7 @@ def test_local_gateway_errors_prevent_online_probe(home, native, monkeypatch):
     data = yaml.safe_load(home.config.read_text())
     data["providers"]["first"]["env"] = ["MISSING_GATEWAY_TOKEN"]
     home.config.write_text(yaml.safe_dump(data))
-    report = check_config(home)
+    report = validate_config(home)
     assert not report["valid"]
     assert "MISSING_GATEWAY_TOKEN" in json.dumps(report)
     assert not (homes["first"] / "observed.json").exists()
@@ -731,7 +751,7 @@ def test_provider_denial_causes_cli_failure(home, native, capsys):
     homes, _ = native
     (homes["claude"] / "mode").write_text("probe-error")
     with pytest.raises(SystemExit) as error:
-        execute(parser().parse_args(["--home", str(home.root), "config", "check", "--json"]))
+        execute(parser().parse_args(["--home", str(home.root), "config", "apply", "--json"]))
     assert error.value.code == 1
     report = json.loads(capsys.readouterr().out)
     assert not report["valid"]
@@ -742,7 +762,7 @@ def test_short_secrets_preserve_native_probe_response_types(home, native):
     data = yaml.safe_load(home.config.read_text())
     data["github"]["token"] = "true"
     home.config.write_text(yaml.safe_dump(data))
-    report = check_config(home)
+    report = validate_config(home)
     assert report["valid"], report
     assert sum("model access verified" in check["message"] for check in report["checks"]) == 3
 
@@ -780,7 +800,7 @@ def test_incompatible_native_mcp_does_not_block_gateway_or_copy_credentials(
         scan = run_next(daemon)
         assert scan["state"] == "completed", scan["error"]
     else:
-        report = check_config(home)
+        report = validate_config(home)
         assert report["valid"], report
     observed = json.loads((native_home / "observed.json").read_text())
     assert observed["home"] == str(native_home)
@@ -831,7 +851,11 @@ def test_rejected_github_scan_does_not_block_later_explicit_request(home, native
     daemon, _ = native_daemon
     github["comments"][42] = [
         {"id": 12001, "body": "/maxwell scan", "user": {"login": "maintainer"}},
-        {"id": 12002, "body": "/maxwell scan --model chosen", "user": {"login": "maintainer"}},
+        {
+            "id": 12002,
+            "body": "/maxwell scan --model chosen --effort high",
+            "user": {"login": "maintainer"},
+        },
     ]
     client = GitHub(daemon.config.github)
     try:
@@ -839,6 +863,7 @@ def test_rejected_github_scan_does_not_block_later_explicit_request(home, native
         asyncio.run(reporter.commands("acme/repo", 42))
         scans = daemon.store.rows("SELECT * FROM scans")
         assert len(scans) == 1 and scans[0]["model"] == "chosen"
+        assert json.loads(scans[0]["execution"])["settings"]["effort"] == "high"
         assert len(daemon.store.rows("SELECT id FROM comments")) == 2
         assert any("Command rejected" in comment["body"] for comment in github["comments"][42])
     finally:
@@ -863,7 +888,7 @@ def test_missing_saved_provider_fails_run_without_fallback(native_daemon):
 def test_claude_check_uses_cli_default_without_selected_model(home, native, settings, expected):
     homes, _ = native
     (homes["claude"] / "settings.json").write_text(json.dumps(settings))
-    report = check_config(home)
+    report = validate_config(home)
     assert report["valid"], report
     assert {
         "name": "provider:claude:default",
@@ -881,7 +906,7 @@ def test_claude_default_probe_reports_denial(home, native):
     homes, _ = native
     (homes["claude"] / "settings.json").write_text("{}")
     (homes["claude"] / "mode").write_text("probe-error")
-    report = check_config(home)
+    report = validate_config(home)
     assert not report["valid"]
     failure = next(
         check for check in report["checks"] if check["name"] == "provider:claude:default"
@@ -893,10 +918,185 @@ def test_claude_default_probe_reports_denial(home, native):
 def test_offline_claude_default_does_not_make_request(home, native):
     homes, _ = native
     (homes["claude"] / "settings.json").write_text("{}")
-    report = check_config(home, online=False)
+    report = validate_config(home, online=False)
     assert report["valid"], report
     assert any(
         check["name"] == "provider:claude:default" and check["status"] == "skipped"
         for check in report["checks"]
     )
     assert not (homes["claude"] / "observed.json").exists()
+
+
+@pytest.mark.parametrize("provider", ["first", "claude"])
+def test_scan_effort_overrides_native_default_and_survives_config_changes(native_daemon, provider):
+    daemon, homes = native_daemon
+    if provider == "first":
+        (homes[provider] / "config.toml").write_text(
+            'model="native-default"\nmodel_reasoning_effort="high"\n'
+        )
+    low = request_scan(
+        daemon, repository="acme/repo", provider=provider, model="chosen-model", effort="low"
+    )
+    high = request_scan(
+        daemon, repository="acme/repo", provider=provider, model="chosen-model", effort="high"
+    )
+    assert "error" not in low and "error" not in high
+    assert low["scans"] != high["scans"]
+    daemon.config.providers[provider].effort = "high"
+    scan = run_next(daemon)
+    assert scan["state"] == "completed", scan["error"]
+    snapshot = json.loads(scan["execution"])
+    assert snapshot["effort"] == "low" and snapshot["settings"]["effort"] == "low"
+    observed = json.loads((homes[provider] / "observed.json").read_text())
+    if provider == "first":
+        assert observed["connection"]["model_reasoning_effort"] == "low"
+    else:
+        assert observed["args"][observed["args"].index("--effort") + 1] == "low"
+    assert (
+        next(row for row in daemon.store.status()["scans"] if row["id"] == scan["id"])["effort"]
+        == "low"
+    )
+
+
+def test_stage_effort_changes_are_saved_and_reset(home, native, source, capsys):
+    _, config = native
+    add_repository(
+        home, config, source, "--provider", "first", "--model", "model-a", "--effort", "high"
+    )
+    prefix = ["--home", str(home.root), "repo", "change", "acme/repo", "--json"]
+    execute(parser().parse_args([*prefix, "--effort", "low"]))
+    record = json.loads(capsys.readouterr().out)
+    assert record["stages"]["discovery"] == {
+        "provider": "first",
+        "model": "model-a",
+        "effort": "low",
+    }
+    execute(
+        parser().parse_args(
+            [
+                *prefix,
+                "--stage",
+                "review",
+                "--provider",
+                "claude",
+                "--model",
+                "model-b",
+                "--effort",
+                "high",
+            ]
+        )
+    )
+    record = json.loads(capsys.readouterr().out)
+    assert record["stages"]["review"]["effort"] == "high"
+    assert record["stages"]["discovery"]["effort"] == "low"
+    execute(parser().parse_args([*prefix, "--effort", "default"]))
+    assert "effort" not in json.loads(capsys.readouterr().out)["stages"]["discovery"]
+    execute(parser().parse_args([*prefix, "--stage", "review", "--model", "model-c"]))
+    assert "effort" not in json.loads(capsys.readouterr().out)["stages"]["review"]
+
+
+def test_known_efforts_are_validated_before_queueing(native_daemon):
+    daemon, _ = native_daemon
+    daemon.config.providers["first"].models = {
+        "native-default": ModelSettings(efforts=["low", "high"])
+    }
+    result = request_scan(daemon, repository="acme/repo", model="native-default", effort="max")
+    assert "supported efforts" in result["error"]
+    assert not daemon.store.rows("SELECT * FROM scans")
+    assert "error" not in request_scan(
+        daemon, repository="acme/repo", model="native-default", effort="low"
+    )
+
+
+@pytest.mark.parametrize("effort", ["", "--bad", "HIGH", "high low", "\nlow"])
+def test_invalid_efforts_are_rejected(effort):
+    config = Config(providers={"only": ProviderSettings(model="model-a")})
+    with pytest.raises(ValueError):
+        config.route(model="model-a", effort=effort)
+
+
+def test_model_defaults_and_saved_efforts_have_explicit_precedence():
+    config = Config(
+        providers={
+            "only": ProviderSettings(
+                effort="medium",
+                models={
+                    "a": ModelSettings(efforts=["low", "medium", "high"], effort="high"),
+                    "b": ModelSettings(),
+                },
+            )
+        }
+    )
+    route = config.route(model="a", effort="low")
+    assert config.execution(route, {})["settings"]["effort"] == "low"
+    assert config.route(current=route)["effort"] == "low"
+    reset = config.route(current=route, effort="default")
+    assert "effort" not in reset
+    assert config.execution(reset, {})["settings"]["effort"] == "high"
+    changed = config.route(model="b", current=route)
+    assert "effort" not in changed
+    assert config.execution(changed, {})["settings"]["effort"] == "medium"
+
+
+def test_config_validation_probes_saved_effort(home, native, source):
+    homes, config = native
+    add_repository(
+        home, config, source, "--provider", "claude", "--model", "stage-model", "--effort", "high"
+    )
+    report = validate_config(home)
+    assert report["valid"], report
+    assert any(
+        check["name"] == "provider:claude:stage-model / high" and check["status"] == "ok"
+        for check in report["checks"]
+    )
+    calls = list(map(json.loads, (homes["claude"] / "calls.jsonl").read_text().splitlines()))
+    stage = next(call for call in calls if call["model"] == "stage-model")
+    assert stage["args"][stage["args"].index("--effort") + 1] == "high"
+
+
+def test_version_four_routes_migrate_without_changing_selection(home, native, source):
+    _, config = native
+    add_repository(home, config, source, "--provider", "first", "--model", "native-default")
+    store = Store(home.db)
+    with store.db:
+        store.db.execute("ALTER TABLE repository_stage_routes DROP COLUMN effort")
+        store.db.execute("PRAGMA user_version=4")
+    store.close()
+    report = validate_config(home, online=False)
+    assert report["valid"], report
+    store = Store(home.db)
+    try:
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert store.saved_route("acme/repo") == {"provider": "first", "model": "native-default"}
+    finally:
+        store.close()
+
+
+def test_daemon_reloads_applied_config_without_changing_queued_execution(home, native_daemon):
+    daemon, _ = native_daemon
+    queued = request_scan(daemon, repository="acme/repo", model="chosen", effort="low")["scans"][0]
+    before = daemon.store.one("SELECT execution FROM scans WHERE id=?", (queued,))["execution"]
+    data = yaml.safe_load(home.config.read_text())
+    data["providers"]["first"]["model"] = "new-default"
+    home.config.write_text(yaml.safe_dump(data))
+    digest = config_digest(home)
+    daemon.store.apply_models({"providers": [], "valid": True, "checks": []}, digest)
+    response = request_scan(daemon, command="reload_config", config_digest=digest)
+    assert response == {"daemon": "reloaded"}
+    assert daemon.config.providers["first"].model == "new-default"
+    assert daemon.config_generation == 1 and daemon.config_changed.is_set()
+    assert (
+        daemon.store.one("SELECT execution FROM scans WHERE id=?", (queued,))["execution"] == before
+    )
+
+
+def test_daemon_rejects_unapplied_configuration(home, native_daemon):
+    daemon, _ = native_daemon
+    before = daemon.config
+    response = request_scan(daemon, command="reload_config", config_digest=config_digest(home))
+    assert "successfully" in response["error"]
+    assert daemon.config is before
+    digest = config_digest(home)
+    daemon.store.apply_models({"providers": [], "valid": False, "checks": []}, digest)
+    response = request_scan(daemon, command="reload_config", config_digest=digest)
+    assert "error" in response and daemon.config is before

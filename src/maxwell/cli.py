@@ -11,9 +11,10 @@ from pathlib import Path
 import httpx
 
 from maxwell import __version__
-from maxwell.cli_output import check_line, color, output
+from maxwell.cli_help import TreeParser
+from maxwell.cli_output import check_line, color, model_lines, output
 from maxwell.config import Paths
-from maxwell.config_check import check_config
+from maxwell.config_apply import apply_config
 from maxwell.daemon import Daemon, request
 from maxwell.github import GitHub
 from maxwell.repositories import (
@@ -39,33 +40,41 @@ def add_command(commands, name, **options):
 
 
 def parser():
-    root = argparse.ArgumentParser(prog="maxwell", description="Repository discovery daemon")
+    root = TreeParser(prog="maxwell", description="Repository discovery daemon")
     root.add_argument("--version", action="version", version=f"maxwell {__version__}")
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     root.add_argument(
         "--json", action="store_true", help="Print JSON instead of human-readable output"
     )
     commands = root.add_subparsers(dest="command", required=True)
-    add_command(commands, "init", help="Create private configuration and runtime directories")
-    config = add_command(commands, "config", help="Check configuration")
+    config = add_command(commands, "config", help="Initialize or apply configuration")
     config_commands = config.add_subparsers(dest="config_command", required=True)
-    check = add_command(
-        config_commands, "check", help="Validate settings, GitHub, and model access"
+    add_command(config_commands, "init", help="Create private configuration and runtime files")
+    add_command(
+        config_commands,
+        "apply",
+        help="Reload settings, discover models, verify access, and save metadata",
     )
-    check.add_argument("--offline", action="store_true", help="Skip GitHub and provider requests")
+    models = add_command(commands, "models", help="Show stored models and efforts")
+    model_commands = models.add_subparsers(dest="models_command", required=True)
+    model_list = add_command(
+        model_commands, "list", help="List stored model metadata and access results"
+    )
+    model_list.add_argument("--provider", help="List one configured provider/account")
     repo = add_command(commands, "repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
-    add = add_command(repositories, "add")
+    add = add_command(repositories, "add", help="Register a repository and discovery settings")
     add.add_argument("source", help="Local path, owner/repository, or GitHub repository URL")
     add.add_argument("--github", help="GitHub owner/repository; inferred from origin if possible")
     add.add_argument("--directory", help="Existing checkout to switch and update before scans")
     add.add_argument("--ref", default="main", help="Base branch to scan (default: main)")
     add.add_argument("--provider", help="Configured provider/account for discovery")
     add.add_argument("--model", help="Discovery model (otherwise use the native default)")
+    add.add_argument("--effort", help="Reasoning effort (otherwise use the provider default)")
     add.add_argument(
         "--account", default="default", help="GitHub credential profile from config.yaml"
     )
-    add_command(repositories, "list")
+    add_command(repositories, "list", help="Show repository settings and stage routes")
     change = add_command(repositories, "change", help="Change a repository's settings")
     change.add_argument("repository")
     directory = change.add_mutually_exclusive_group()
@@ -84,6 +93,7 @@ def parser():
     )
     change.add_argument("--provider", help="Configured provider/account for the stage")
     change.add_argument("--model", help="Model for the stage")
+    change.add_argument("--effort", help="Stage effort; use 'default' to reset")
     account = add_command(repositories, "set-account", help="Change a repository's GitHub profile")
     account.add_argument("repository")
     account.add_argument("--account", required=True)
@@ -96,10 +106,17 @@ def parser():
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     scan.add_argument("--model", required=True, help="Model to use for this manual discovery run")
     scan.add_argument(
+        "--effort", help="Reasoning effort for this run; 'default' uses the provider default"
+    )
+    scan.add_argument(
         "--provider", help="Override the repository's saved discovery provider/account"
     )
     for name in ("pause", "resume"):
-        item = add_command(commands, name)
+        item = add_command(
+            commands,
+            name,
+            help=f"{'Pause' if name == 'pause' else 'Resume'} scheduled repository scans",
+        )
         item.add_argument("repository", nargs="?")
     logs = add_command(commands, "logs", help="Show daemon logs")
     logs.add_argument("--follow", action="store_true")
@@ -114,7 +131,7 @@ def infer_github(path):
 
 
 def register_repository(args, paths, config):
-    route = config.route(args.provider, args.model)
+    route = config.route(args.provider, args.model, effort=args.effort)
     settings = config.github.for_account(args.account)
     local = Path(args.source).expanduser()
     ref = validate_ref(args.ref)
@@ -174,12 +191,14 @@ def change_repository(args, store, config):
         changes["directory"] = None
     route = None
     stage = args.stage or "discovery"
-    if args.provider is not None or args.model is not None:
-        route = config.route(args.provider, args.model, store.saved_route(record["name"], stage))
+    if args.provider is not None or args.model is not None or args.effort is not None:
+        route = config.route(
+            args.provider, args.model, store.saved_route(record["name"], stage), effort=args.effort
+        )
     elif args.stage is not None:
-        raise ValueError("Specify --provider or --model when changing a stage")
+        raise ValueError("Specify --provider, --model, or --effort when changing a stage")
     if not changes and route is None:
-        raise ValueError("Specify repository settings or --provider/--model")
+        raise ValueError("Specify repository settings or --provider/--model/--effort")
     updated = {**record, **changes}
     if updated["directory"] is not None:
         validate_branch(updated["ref"])
@@ -193,22 +212,27 @@ def execute(args):
         output(value, args)
 
     paths = Paths(args.home)
-    if args.command == "config":
+    if args.command == "config" and args.config_command == "apply":
         if not args.json:
-            print(f"Checking config ({'offline' if args.offline else 'online'})...", flush=True)
-        report = check_config(
-            paths, online=not args.offline, on_check=None if args.json else check_line
-        )
+            print("Applying config...", flush=True)
+        report = apply_config(paths, on_check=None if args.json else check_line)
         emit(report)
         if not report["valid"]:
             raise SystemExit(1)
         return
-    if args.command == "init":
+    if args.command == "config" and args.config_command == "init":
         if paths.config.exists():
             raise ValueError("Configuration already exists; it was not overwritten")
         paths.init_config()
         Store(paths.db).close()
         emit({"config": str(paths.config)})
+        return
+    if args.command == "models":
+        report = Store.cached_models(paths.db, args.provider)
+        if args.json:
+            emit(report)
+        else:
+            print("\n".join(model_lines(report)), flush=True)
         return
     config = paths.load()
     paths.initialize()
@@ -325,6 +349,7 @@ def execute(args):
             arguments["priority"] = int(args.priority[1])
             arguments["model"] = args.model
             arguments["provider"] = args.provider
+            arguments["effort"] = args.effort
         response = asyncio.run(request(paths, args.command, **arguments))
         if args.command == "stop":
             deadline = time.monotonic() + config.limits.shutdown_grace_seconds + 20
@@ -337,7 +362,11 @@ def execute(args):
 
 
 def main():
-    args = parser().parse_args()
+    cli = parser()
+    if len(sys.argv) == 1:
+        cli.print_help()
+        return
+    args = cli.parse_args()
     try:
         execute(args)
     except KeyboardInterrupt:

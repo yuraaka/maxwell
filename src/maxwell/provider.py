@@ -67,6 +67,11 @@ class CLIProvider:
         result_file = artifact / "result.json"
         environment, native, self.secrets = runtime_environment(self.paths, settings)
         args = self.arguments(workspace, artifact, schema, native)
+        if settings.effort is not None:
+            if settings.adapter == "codex":
+                args[2:2] = ["-c", f"model_reasoning_effort={json.dumps(settings.effort)}"]
+            else:
+                args.extend(["--effort", settings.effort])
         if settings.adapter == "codex" and settings.home is not None:
             overrides, secrets = codex_connection_overrides(settings, native, environment)
             self.secrets.extend(secrets)
