@@ -218,7 +218,7 @@ def test_daemon_singleton_and_hard_crash_recovery(home, registered, directory):
 
 def test_background_cli_start_and_stop(home, registered):
     registered.pause("acme/repo", True)
-    prefix = [sys.executable, "-m", "maxwell", "--home", str(home.root)]
+    prefix = [sys.executable, "-m", "maxwell", "--home", str(home.root), "--json"]
     result = subprocess.run([*prefix, "start"], capture_output=True, text=True, timeout=15)
     try:
         assert result.returncode == 0, result.stderr

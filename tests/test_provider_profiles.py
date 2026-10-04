@@ -1,7 +1,11 @@
 import asyncio
 import json
 import os
+import selectors
+import signal
 import subprocess
+import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -28,7 +32,7 @@ from pathlib import Path
 args = sys.argv[1:]
 codex = args[0] == 'exec'
 home = Path(os.environ['CODEX_HOME' if codex else 'CLAUDE_CONFIG_DIR'])
-model = args[args.index('--model') + 1]
+model = args[args.index('--model') + 1] if '--model' in args else os.environ.get('ANTHROPIC_MODEL', 'cli-default')
 workspace = Path(args[args.index('--cd') + 1]) if codex else Path.cwd()
 schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text()) if codex else json.loads(args[args.index('--json-schema') + 1])
 probe = 'ok' in schema['properties']
@@ -205,6 +209,7 @@ def test_stage_routes_change_independently_and_are_visible(home, native, source,
                 "repo",
                 "change",
                 "acme/repo",
+                "--json",
                 "--stage",
                 "review",
                 "--provider",
@@ -638,6 +643,47 @@ def test_offline_check_never_invokes_native_providers(home, native):
     assert any("not checked offline" in check["message"] for check in report["checks"])
 
 
+def test_config_check_streams_results_while_native_probe_is_running(home, native):
+    homes, _ = native
+    (homes["first"] / "mode").write_text("wait")
+    process = subprocess.Popen(
+        [os.sys.executable, "-m", "maxwell", "--home", str(home.root), "config", "check"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    received = b""
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            for key, _ in selector.select(timeout=0.1):
+                received += os.read(key.fd, 8192)
+            if (homes["first"] / "observed.json").exists() and b"[OK] config" in received:
+                break
+        assert (homes["first"] / "observed.json").exists()
+        assert process.poll() is None
+        assert b"[OK] config" in received
+        assert b"Valid:" not in received
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=6)
+        assert process.returncode == 130
+        observed = json.loads((homes["first"] / "observed.json").read_text())
+        assert not os.path.exists(observed["workspace"])
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.communicate(timeout=6)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+        if (homes["first"] / "observed.json").exists():
+            observed = json.loads((homes["first"] / "observed.json").read_text())
+            stop_orphan(observed["pid"], Path(observed["workspace"]).parent / "artifacts")
+
+
 def test_online_check_needs_a_model_when_provider_has_no_default(home, native, github):
     homes, _ = native
     (homes["first"] / "config.toml").write_text("")
@@ -651,16 +697,20 @@ def test_online_check_needs_a_model_when_provider_has_no_default(home, native, g
     assert not (homes["first"] / "observed.json").exists()
 
 
-def test_saved_stage_model_is_probed_without_a_native_default(home, native, source):
+@pytest.mark.parametrize("provider", ["first", "claude"])
+def test_saved_stage_model_is_probed_without_a_native_default(home, native, source, provider):
     homes, _ = native
     data = yaml.safe_load(home.config.read_text())
-    data["providers"] = {"first": data["providers"]["first"]}
+    data["providers"] = {provider: data["providers"][provider]}
     home.config.write_text(yaml.safe_dump(data))
-    (homes["first"] / "config.toml").write_text("")
+    if provider == "first":
+        (homes[provider] / "config.toml").write_text("")
+    else:
+        (homes[provider] / "settings.json").write_text("{}")
     add_repository(home, home.load(), source, "--model", "stage-model")
     report = check_config(home)
     assert report["valid"], report
-    calls = list(map(json.loads, (homes["first"] / "calls.jsonl").read_text().splitlines()))
+    calls = list(map(json.loads, (homes[provider] / "calls.jsonl").read_text().splitlines()))
     assert [call["model"] for call in calls] == ["stage-model"]
 
 
@@ -681,7 +731,7 @@ def test_provider_denial_causes_cli_failure(home, native, capsys):
     homes, _ = native
     (homes["claude"] / "mode").write_text("probe-error")
     with pytest.raises(SystemExit) as error:
-        execute(parser().parse_args(["--home", str(home.root), "config", "check"]))
+        execute(parser().parse_args(["--home", str(home.root), "config", "check", "--json"]))
     assert error.value.code == 1
     report = json.loads(capsys.readouterr().out)
     assert not report["valid"]
@@ -804,3 +854,49 @@ def test_missing_saved_provider_fails_run_without_fallback(native_daemon):
     assert "Unknown provider" in scan["error"]
     assert scan["executed"] == 0
     assert not (homes["second"] / "observed.json").exists()
+
+
+@pytest.mark.parametrize(
+    "settings,expected",
+    [({}, "cli-default"), ({"env": {"ANTHROPIC_MODEL": "gateway-default"}}, "gateway-default")],
+)
+def test_claude_check_uses_cli_default_without_selected_model(home, native, settings, expected):
+    homes, _ = native
+    (homes["claude"] / "settings.json").write_text(json.dumps(settings))
+    report = check_config(home)
+    assert report["valid"], report
+    assert {
+        "name": "provider:claude:default",
+        "status": "ok",
+        "message": "Authenticated request succeeded; model access verified",
+    } in report["checks"]
+    observed = json.loads((homes["claude"] / "observed.json").read_text())
+    assert observed["model"] == expected
+    assert "--model" not in observed["args"]
+    assert observed["probe"]
+    assert observed["args"][observed["args"].index("--tools") + 1] == ""
+
+
+def test_claude_default_probe_reports_denial(home, native):
+    homes, _ = native
+    (homes["claude"] / "settings.json").write_text("{}")
+    (homes["claude"] / "mode").write_text("probe-error")
+    report = check_config(home)
+    assert not report["valid"]
+    failure = next(
+        check for check in report["checks"] if check["name"] == "provider:claude:default"
+    )
+    assert failure["status"] == "error"
+    assert "Model access denied" in failure["message"]
+
+
+def test_offline_claude_default_does_not_make_request(home, native):
+    homes, _ = native
+    (homes["claude"] / "settings.json").write_text("{}")
+    report = check_config(home, online=False)
+    assert report["valid"], report
+    assert any(
+        check["name"] == "provider:claude:default" and check["status"] == "skipped"
+        for check in report["checks"]
+    )
+    assert not (homes["claude"] / "observed.json").exists()

@@ -75,6 +75,9 @@ class CLIProvider:
             if settings.adapter == "codex":
                 args[2:2] = ["--skip-git-repo-check", "-c", "project_doc_max_bytes=0"]
             else:
+                if not settings.model:
+                    position = args.index("--model")
+                    del args[position : position + 2]
                 args[args.index("--tools") + 1] = ""
                 position = args.index("--allowedTools")
                 del args[position : position + 2]

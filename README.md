@@ -48,6 +48,7 @@ Check configuration before starting the daemon:
 ```bash
 maxwell config check
 maxwell config check --offline
+maxwell config check --json
 ```
 
 The command checks YAML structure, field values, file permissions, required credentials,
@@ -57,8 +58,10 @@ By default it also authenticates each configured GitHub account, reports its log
 checks access to registered repositories. It sends a small structured request through
 each configured provider/model pair to verify authentication and model access. The
 pairs include catalog models, provider defaults, and saved repository stage models;
-duplicates are checked once. Providers without any selected model must have a `model`,
-catalog, or saved stage assignment before online verification can succeed.
+duplicates are checked once. Claude providers without a selected model are checked
+using the Claude CLI's default (including its native settings and gateway environment).
+Codex providers need a model in their native settings, Maxwell config, catalog, or saved
+stage assignment. Manual scans still require `--model`.
 
 Provider checks use the native home/profile and gateway environment in an empty
 temporary workspace, with a timeout of 30 seconds per pair (or the configured scan
@@ -68,7 +71,11 @@ These requests consume provider usage and are outside the daemon's scan budget.
 `--offline` skips all GitHub and provider requests. The default
 account may be empty when repositories use named profiles; named profiles need tokens.
 Errors identify the settings to fix without printing credential values. The command
-prints a JSON report and exits with status 0 on success or 1 on failure.
+prints each result as soon as the check finishes, followed by a summary, and exits
+with status 0 on success or 1 on failure. `--json` prints one complete JSON report
+after all checks finish, without progress text. Terminal output uses colored status
+labels and brief success lines; failures keep their diagnostics. Piped output and
+JSON stay plain. Set `NO_COLOR` to disable terminal colors.
 
 GitHub checks verify identity and repository read access; write permissions are not
 tested.
@@ -254,7 +261,12 @@ Each scan currently inspects a whole pinned revision rather than only a diff.
 
 `scan`, `pause`, and `resume` target all registered repositories when the repository
 argument is omitted. They require a running daemon. Pause stops new work; active
-scans may finish and publish. Status works both online and offline and prints JSON.
+scans may finish and publish. Status works both online and offline and shows readable
+repository settings, recent scans, spending, and publication problems. Commands use
+human-readable output by default; pass `--json` before or after the command for the
+structured format, for example `maxwell status --json` or `maxwell --json repo list`.
+`logs --json` returns a JSON log list; `logs --follow --json` streams one JSON object
+per log line. Runtime errors use JSON on stderr when `--json` is selected.
 An explicit scan request coalesces with already queued/running work only when its
 execution settings match. Requests using different providers or models remain separate.
 

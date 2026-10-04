@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 
 from maxwell import __version__
+from maxwell.cli_output import check_line, color, output
 from maxwell.config import Paths
 from maxwell.config_check import check_config
 from maxwell.daemon import Daemon, request
@@ -26,19 +27,35 @@ from maxwell.repositories import (
 from maxwell.store import Store
 
 
+def add_command(commands, name, **options):
+    command = commands.add_parser(name, **options)
+    command.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print JSON instead of human-readable output",
+    )
+    return command
+
+
 def parser():
     root = argparse.ArgumentParser(prog="maxwell", description="Repository discovery daemon")
     root.add_argument("--version", action="version", version=f"maxwell {__version__}")
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
+    root.add_argument(
+        "--json", action="store_true", help="Print JSON instead of human-readable output"
+    )
     commands = root.add_subparsers(dest="command", required=True)
-    commands.add_parser("init", help="Create private configuration and runtime directories")
-    config = commands.add_parser("config", help="Check configuration")
+    add_command(commands, "init", help="Create private configuration and runtime directories")
+    config = add_command(commands, "config", help="Check configuration")
     config_commands = config.add_subparsers(dest="config_command", required=True)
-    check = config_commands.add_parser("check", help="Validate settings, GitHub, and model access")
+    check = add_command(
+        config_commands, "check", help="Validate settings, GitHub, and model access"
+    )
     check.add_argument("--offline", action="store_true", help="Skip GitHub and provider requests")
-    repo = commands.add_parser("repo", help="Register, change, or list repositories")
+    repo = add_command(commands, "repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
-    add = repositories.add_parser("add")
+    add = add_command(repositories, "add")
     add.add_argument("source", help="Local path, owner/repository, or GitHub repository URL")
     add.add_argument("--github", help="GitHub owner/repository; inferred from origin if possible")
     add.add_argument("--directory", help="Existing checkout to switch and update before scans")
@@ -48,8 +65,8 @@ def parser():
     add.add_argument(
         "--account", default="default", help="GitHub credential profile from config.yaml"
     )
-    repositories.add_parser("list")
-    change = repositories.add_parser("change", help="Change a repository's settings")
+    add_command(repositories, "list")
+    change = add_command(repositories, "change", help="Change a repository's settings")
     change.add_argument("repository")
     directory = change.add_mutually_exclusive_group()
     directory.add_argument(
@@ -67,14 +84,14 @@ def parser():
     )
     change.add_argument("--provider", help="Configured provider/account for the stage")
     change.add_argument("--model", help="Model for the stage")
-    account = repositories.add_parser("set-account", help="Change a repository's GitHub profile")
+    account = add_command(repositories, "set-account", help="Change a repository's GitHub profile")
     account.add_argument("repository")
     account.add_argument("--account", required=True)
-    start = commands.add_parser("start", help="Start the daemon; also begins scheduled discovery")
+    start = add_command(commands, "start", help="Start the daemon; also begins scheduled discovery")
     start.add_argument("--foreground", action="store_true")
-    commands.add_parser("stop", help="Request graceful shutdown")
-    commands.add_parser("status", help="Show health, jobs, spending, and publication failures")
-    scan = commands.add_parser("scan", help="Queue a scan even if the revision has not changed")
+    add_command(commands, "stop", help="Request graceful shutdown")
+    add_command(commands, "status", help="Show health, jobs, spending, and publication failures")
+    scan = add_command(commands, "scan", help="Queue a scan even if the revision has not changed")
     scan.add_argument("repository", nargs="?")
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     scan.add_argument("--model", required=True, help="Model to use for this manual discovery run")
@@ -82,15 +99,11 @@ def parser():
         "--provider", help="Override the repository's saved discovery provider/account"
     )
     for name in ("pause", "resume"):
-        item = commands.add_parser(name)
+        item = add_command(commands, name)
         item.add_argument("repository", nargs="?")
-    logs = commands.add_parser("logs", help="Show daemon logs")
+    logs = add_command(commands, "logs", help="Show daemon logs")
     logs.add_argument("--follow", action="store_true")
     return root
-
-
-def output(value):
-    print(json.dumps(value, indent=2))
 
 
 def infer_github(path):
@@ -176,10 +189,17 @@ def change_repository(args, store, config):
 
 
 def execute(args):
+    def emit(value):
+        output(value, args)
+
     paths = Paths(args.home)
     if args.command == "config":
-        report = check_config(paths, online=not args.offline)
-        output(report)
+        if not args.json:
+            print(f"Checking config ({'offline' if args.offline else 'online'})...", flush=True)
+        report = check_config(
+            paths, online=not args.offline, on_check=None if args.json else check_line
+        )
+        emit(report)
         if not report["valid"]:
             raise SystemExit(1)
         return
@@ -188,33 +208,37 @@ def execute(args):
             raise ValueError("Configuration already exists; it was not overwritten")
         paths.init_config()
         Store(paths.db).close()
-        print(f"Created {paths.config}. Configure GitHub credentials and provider homes.")
+        emit({"config": str(paths.config)})
         return
     config = paths.load()
     paths.initialize()
     if args.command == "repo":
         if args.repo_command == "add":
-            output(register_repository(args, paths, config))
+            if not args.json:
+                print("Registering repository...", flush=True)
+            emit(register_repository(args, paths, config))
             return
         store = Store(paths.db)
         try:
             if args.repo_command == "list":
-                output(
+                emit(
                     [
                         store.repository(row["name"])
                         for row in store.rows("SELECT name FROM repositories ORDER BY name")
                     ]
                 )
             elif args.repo_command == "change":
-                output(change_repository(args, store, config))
+                emit(change_repository(args, store, config))
             elif args.repo_command == "set-account":
                 config.github.for_account(args.account)
                 store.set_account(args.repository, args.account)
-                output({"repository": args.repository, "github_account": args.account})
+                emit({"repository": args.repository, "github_account": args.account})
         finally:
             store.close()
     elif args.command == "start":
         config.ready()
+        if not args.json:
+            print("Starting daemon...", flush=True)
         if args.foreground:
             logging.basicConfig(
                 filename=paths.log,
@@ -225,7 +249,7 @@ def execute(args):
         else:
             try:
                 response = asyncio.run(request(paths, "status"))
-                output(response)
+                emit(response)
                 return
             except (OSError, TimeoutError):
                 pass
@@ -251,34 +275,49 @@ def execute(args):
                 if process.poll() is not None:
                     raise ValueError(f"Daemon failed to start; inspect {paths.log}")
                 try:
-                    output(asyncio.run(request(paths, "status")))
+                    emit(asyncio.run(request(paths, "status")))
                     return
                 except (OSError, TimeoutError):
                     time.sleep(0.1)
             raise ValueError(f"Daemon startup timed out; inspect {paths.log}")
     elif args.command == "logs":
         if not paths.log.exists():
-            print("No daemon logs yet")
+            print(json.dumps({"logs": []}) if args.json else "No daemon logs yet", flush=True)
             return
         with paths.log.open() as log:
-            print("".join(log.readlines()[-100:]), end="")
+            lines = log.readlines()[-100:]
+            if args.json and not args.follow:
+                print(
+                    json.dumps({"logs": [line.rstrip("\n") for line in lines]}, indent=2),
+                    flush=True,
+                )
+            elif args.json:
+                for line in lines:
+                    print(json.dumps({"line": line.rstrip("\n")}), flush=True)
+            else:
+                print("".join(lines), end="", flush=True)
             if args.follow:
                 while True:
                     line = log.readline()
                     if line:
-                        print(line, end="", flush=True)
+                        if args.json:
+                            print(json.dumps({"line": line.rstrip("\n")}), flush=True)
+                        else:
+                            print(line, end="", flush=True)
                     else:
                         time.sleep(0.2)
     elif args.command == "status":
         try:
-            output(asyncio.run(request(paths, "status")))
+            emit(asyncio.run(request(paths, "status")))
         except (OSError, TimeoutError):
             store = Store(paths.db)
             try:
-                output({"daemon": "stopped", **store.status()})
+                emit({"daemon": "stopped", **store.status()})
             finally:
                 store.close()
     else:
+        if args.command == "stop" and not args.json:
+            print("Stopping daemon...", flush=True)
         arguments = {}
         if hasattr(args, "repository"):
             arguments["repository"] = args.repository
@@ -294,7 +333,7 @@ def execute(args):
             if paths.socket.exists():
                 raise ValueError("Shutdown still pending; inspect logs (no PID was blindly killed)")
             response = {"daemon": "stopped"}
-        output(response)
+        emit(response)
 
 
 def main():
@@ -316,5 +355,11 @@ def main():
             message = Paths(args.home).load().redact(message)
         except ValueError:
             pass
-        print(f"maxwell: {message}", file=sys.stderr)
+        print(
+            json.dumps({"error": message})
+            if args.json
+            else f"{color('maxwell:', '31', sys.stderr)} {message}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise SystemExit(1)

@@ -42,11 +42,19 @@ def registered_routes(paths):
         connection.close()
 
 
-def check_config(paths, online=True):
+def check_config(paths, online=True, on_check=None):
     checks = []
+    config = None
 
     def add(name, status, message):
-        checks.append({"name": name, "status": status, "message": message})
+        check = {
+            "name": config.redact(name) if config else name,
+            "status": status,
+            "message": config.redact(message) if config else message,
+        }
+        checks.append(check)
+        if on_check is not None:
+            on_check(dict(check))
 
     def report():
         return {
@@ -129,21 +137,24 @@ def check_config(paths, online=True):
                 models.add(settings.default_model())
             except ValueError:
                 if not any(provider == name for provider, _ in pairs):
-                    add(
-                        f"provider:{name}:model",
-                        "error" if online else "skipped",
-                        "Set a provider model, model catalog, or repository stage model to verify access",
-                    )
+                    if settings.adapter == "claude":
+                        pairs.add((name, None))
+                    else:
+                        add(
+                            f"provider:{name}:model",
+                            "error" if online else "skipped",
+                            "Set a provider model, model catalog, or repository stage model to verify access",
+                        )
         for model in models:
             try:
                 settings.for_model(model)
                 pairs.add((name, model))
             except ValueError as exc:
                 add(f"provider:{name}:{model}", "error", str(exc))
-        for provider, model in sorted(pairs):
+        for provider, model in sorted(pairs, key=lambda pair: (pair[0], pair[1] or "")):
             if provider != name:
                 continue
-            label = f"provider:{name}:{model}"
+            label = f"provider:{name}:{model or 'default'}"
             if errors:
                 add(label, "skipped", "Online check blocked by provider configuration errors")
             elif not online:
@@ -184,7 +195,12 @@ def check_config(paths, online=True):
 
 
 def provider_check(config, name, model, label, add):
-    settings = config.all_providers()[name].for_model(model)
+    settings = config.all_providers()[name]
+    settings = (
+        settings.for_model(model)
+        if model is not None
+        else settings.model_copy(update={"model": ""})
+    )
     timeout = min(30, config.limits.scan_timeout_seconds)
     probe_config = config.model_copy(
         update={

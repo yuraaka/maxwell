@@ -63,7 +63,7 @@ def register(home, checkout, *options):
 def change(home, *options):
     execute(
         parser().parse_args(
-            ["--home", str(home.root), "repo", "change", "company/backend", *options]
+            ["--home", str(home.root), "repo", "change", "company/backend", "--json", *options]
         )
     )
 

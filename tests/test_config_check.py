@@ -45,7 +45,9 @@ def github_requests(monkeypatch):
 
 def command(home, capsys, *options):
     try:
-        execute(parser().parse_args(["--home", str(home.root), "config", "check", *options]))
+        execute(
+            parser().parse_args(["--home", str(home.root), "config", "check", "--json", *options])
+        )
         code = 0
     except SystemExit as exc:
         code = exc.code
@@ -100,7 +102,7 @@ def test_offline_check_does_not_access_network_or_create_database(home, github_r
 def test_missing_config_has_nonzero_exit_and_does_not_initialize(directory):
     home = directory / "missing"
     result = subprocess.run(
-        [sys.executable, "-m", "maxwell", "--home", str(home), "config", "check"],
+        [sys.executable, "-m", "maxwell", "--home", str(home), "config", "check", "--json"],
         capture_output=True,
         text=True,
         timeout=5,
