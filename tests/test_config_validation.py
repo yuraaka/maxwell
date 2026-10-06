@@ -103,6 +103,21 @@ def test_offline_check_does_not_access_network_or_create_database(home, github_r
     assert github_requests[0] == []
 
 
+def test_publication_limit_above_twenty_passes_config_validation(home):
+    update_config(home, lambda data: data["limits"].update(max_findings_per_scan=200))
+    report = validate_config(home, online=False)
+    assert report["valid"], report
+    assert home.load().limits.max_findings_per_scan == 200
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1.5])
+def test_invalid_publication_limits_are_reported(home, limit):
+    update_config(home, lambda data: data["limits"].update(max_findings_per_scan=limit))
+    report = validate_config(home, online=False)
+    assert not report["valid"]
+    assert "limits.max_findings_per_scan" in json.dumps(report)
+
+
 def test_missing_config_has_nonzero_exit_and_does_not_initialize(directory):
     home = directory / "missing"
     result = subprocess.run(

@@ -17,6 +17,8 @@ from pydantic import (
     model_validator,
 )
 
+from maxwell.contracts import DEFAULT_SCAN_CANDIDATES
+
 
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -184,7 +186,8 @@ class Limits(Settings):
     scan_reservation_usd: float = Field(default=1, gt=0)
     scan_timeout_seconds: float = Field(default=600, ge=1)
     scan_interval_seconds: float = Field(default=1800, ge=1)
-    max_findings_per_scan: int = Field(default=3, ge=1, le=20)
+    max_findings_per_scan: int = Field(default=3, ge=1)
+    max_candidates_per_scan: int = Field(default=DEFAULT_SCAN_CANDIDATES, ge=1)
     human_queue_max: int = Field(default=6, ge=1)
     minimum_confidence: float = Field(default=0.8, ge=0, le=1)
     shutdown_grace_seconds: float = Field(default=10, ge=0, le=300)
@@ -248,22 +251,14 @@ class Config(Settings):
             raise ValueError(f"Unknown provider {name!r}")
         return name
 
-    def route(self, provider=None, model=None, current=None, effort=None):
-        name = self.provider_name(provider or (current["provider"] if current else None))
+    def route(self, provider=None, model=None, effort=None):
+        name = self.provider_name(provider)
         settings = self.all_providers()[name]
         if model is None:
-            model = (
-                current["model"]
-                if current and current["provider"] == name
-                else settings.default_model()
-            )
+            model = settings.default_model()
         selected = settings.for_model(model)
         if effort == "default":
             effort = None
-        elif (
-            effort is None and current and current["provider"] == name and current["model"] == model
-        ):
-            effort = current.get("effort")
         self.with_effort(selected, effort)
         return {"provider": name, "model": model, **({"effort": effort} if effort else {})}
 

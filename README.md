@@ -2,7 +2,7 @@
 
 Maxwell runs repository discovery manually from your terminal. Milestone 1 runs a discovery agent
 against committed source snapshots, creates deduplicated **suspected** findings as
-GitHub issues, and reports spending. It does not reproduce, fix, or merge changes yet.
+GitHub issues, and reports token usage. It does not reproduce, fix, or merge changes yet.
 
 ## Install
 
@@ -31,7 +31,7 @@ reference. Supply:
 - `github.token`, or tokens under `github.accounts`: fine-grained GitHub tokens with
   repository metadata read and Issues read/write access. Remote repositories also
   need Contents read access for fetching source. No code-write permission is needed.
-- Optional `github.allowed_users`: retained for future GitHub control comments.
+- Optional `github.allowed_users`: authors allowed to submit structured GitHub records.
   Manual runs do not process comment commands.
 - `providers`: named Codex or Claude Code connections, each pointing to its existing
   configuration home. GitHub credential profiles are configured independently.
@@ -52,19 +52,17 @@ maxwell config apply --json
 
 The command rereads configuration and checks YAML structure, field values, file
 permissions, required credentials,
-model prices when supplied, Git, provider executables/homes, gateway environment
-dependencies, and saved repository provider/model assignments.
+model prices when supplied, Git, provider executables/homes, and gateway environment
+dependencies.
 It authenticates each configured GitHub account, reports its login, and checks access
 to registered repositories. It rediscovers each account's models and efforts, then
 sends a small structured request through **every discovered model**, including models
-outside Maxwell's configured selection catalog. Configured model defaults and saved
-repository stage selections are also checked; duplicate model/effort selections are
-checked once. Models are checked at the native/configured default effort, with separate
-checks for distinct saved stage efforts. It does not probe every advertised effort level.
+outside Maxwell's configured selection catalog. Configured model defaults are also
+checked; duplicate model/effort selections are checked once. Models are checked at the
+native/configured default effort. It does not probe every advertised effort level.
 Claude providers without a selected model are checked
 using the Claude CLI's default (including its native settings and gateway environment).
-Discovery does not require a configured default model. Repository registration needs
-an explicit model when no default can be resolved; manual scans still require `--model`.
+Repository registration does not select a provider or model. Manual scans require `--model`.
 
 Provider checks use the native home/profile and gateway environment in an empty
 temporary workspace, with a timeout of 30 seconds per pair (or the configured scan
@@ -223,12 +221,12 @@ Each `scan` runs in the foreground, publishes findings and a summary to GitHub,
 saves a local report, and exits. No daemon is required.
 
 ```bash
-maxwell repo add owner/repository --account personal --provider codex-work --model model-a
-maxwell repo add https://github.com/company/backend --account work --provider codex-work --model model-a
-maxwell repo add company/service --directory /path/to/service --ref develop --account work --provider codex-work --model model-a
-maxwell repo add /path/to/checkout --github company/other-project --account work --ref main --provider codex-work --model model-a
+maxwell repo add owner/repository --account personal
+maxwell repo add https://github.com/company/backend --account work
+maxwell repo add company/service --directory /path/to/service --ref develop --account work
+maxwell repo add /path/to/checkout --github company/other-project --account work --ref main
 maxwell repo list
-maxwell scan owner/repository --model model-a
+maxwell scan owner/repository --provider codex-work --model model-a
 ```
 
 No existing checkout is needed. For `owner/repository` or a GitHub URL, registration
@@ -267,46 +265,64 @@ configured. Settings apply to subsequent scans; an active scan retains its previ
 settings. Repository identity and history remain intact. Change GitHub profiles with
 `repo change --account`; there is no separate `repo set-account` command.
 
-Each repository has a saved provider/model pair for each configured stage:
+Repositories are independent of agent connections. Registration and repository changes
+store source, branch, checkout directory, and GitHub account settings. Provider, model,
+and effort are selected for each scan:
 
 ```bash
-maxwell repo change owner/repository --stage discovery --provider codex-work --model model-a
-maxwell repo change owner/repository --stage review --provider claude-work --model model-b
-maxwell repo change owner/repository --stage review --effort high
-maxwell repo change owner/repository --stage review --effort default
-maxwell scan owner/repository --model model-c
-maxwell scan owner/repository --provider codex-second --model model-c
-maxwell scan owner/repository --model model-c --effort high
+maxwell scan owner/repository --provider codex-work --model model-a
+maxwell scan owner/repository --provider claude-work --model model-b --effort high
 ```
 
-With multiple providers, registration requires `--provider`. With one, it is selected
-and saved automatically. Registration accepts the native default model when no model
-catalog is given; otherwise use `--model` or configure a single catalog entry. Saved
-assignments remain stable when more providers are added. `repo list` shows stage routes.
-Legacy registrations acquire their discovery route when it can be resolved uniquely.
+Every manual scan requires `--model`. With multiple configured providers, pass
+`--provider` to select the connection for that run. With one provider, it is selected
+automatically. `--effort` overrides the configured model/provider default; use
+`--effort default` to use that default, then the native CLI default if neither is set.
+The same selection applies to every repository when scanning all registered repositories.
 
-Every manual scan requires `--model`. An omitted `--provider` uses the saved discovery
-provider. Overrides affect that run only. All selections are validated before any
-multi-repository scan begins, and runs retain their provider, model, source settings,
-limits, and prices. `--effort` overrides the effort for one run. For the same saved provider/model,
-an omitted effort keeps the stage's override; switching provider or model drops that
-override. `--effort default` clears a saved or per-run override and uses the configured
-model/provider default, then the native CLI default if neither is set. Explicit effort
-selections and configured defaults are frozen in each run's settings. Effort names
-are passed through to the CLI; declared `efforts` lists are validated locally, while
-unknown capabilities are validated by the native CLI/gateway during execution.
-Authentication remains a live reference so native token refresh can work.
+Selections are validated before any multi-repository scan begins. Each execution keeps
+its own provider, model, effort, source settings, limits, and prices. Provider aliases
+select local connections; published agent identities use the adapter and model.
+Declared supported efforts are checked locally, while unknown capabilities are validated
+by the native CLI/gateway. Authentication remains a live reference so native token
+refresh can work.
 
-Review, reproduction, fix, and validation routes may be stored now; their execution
-workflows are later milestones. `scan` executes discovery only.
+Repository-level provider/model/effort routes have been removed. Existing databases
+migrate automatically, retaining repositories and historical execution snapshots.
+`repo add` and `repo change` no longer accept `--provider`, `--model`, `--effort`, or
+`--stage`. Review, reproduction, fix, and validation execution are later milestones;
+`scan` executes discovery only.
 
 `scan` requests a fresh inspection even when the revision is unchanged. Each scan
-currently inspects a whole pinned revision rather than only a diff. Omit the repository
-argument to scan all registered repositories sequentially. Manual runs ignore legacy
+currently inspects a whole pinned revision rather than only a diff. Discovery asks the agent to
+map components, sweep correctness, configuration, recovery, resource handling, security,
+and maintenance defects, then review interactions. It collects up to
+`limits.max_candidates_per_scan` concrete candidates (default 100, any positive integer)
+independently of `limits.max_findings_per_scan` (the new-finding publication
+limit). This is a heuristic sweep, not a guarantee of exhaustive discovery.
+
+Maxwell filters low-confidence candidates and duplicates, then selects new findings by
+priority, confidence, issue kind, and stable identity. Existing findings do not consume
+new-finding slots. The review queue can further limit selection. Reports and `--json`
+show collected, selected, and skipped counts with reasons; the terminal shows the skipped
+count. A report flags when collection reaches the configured candidate ceiling. Skipped candidates
+remain in local provider result artifacts but are not queued for later publication.
+The provider result must still fit within 2 MiB; larger collection limits may also
+require a longer scan timeout and more output tokens.
+
+Omit the repository argument to scan all registered repositories sequentially. Manual runs ignore legacy
 pause settings and leave unrelated queued jobs untouched. Budget, scan-count, and
 human review queue limits still apply; blocked runs fail instead of waiting in a queue.
+Failure messages identify the blocking limit, include queue or daily execution counts,
+and name the corresponding configuration setting. The default review queue holds six
+unresolved findings. Close reviewed finding issues on GitHub or increase
+`limits.human_queue_max` to admit more discovery runs.
 
-Progress is printed as each scan starts, publishes, and finishes. Output includes local
+Progress shows repository preparation, the pinned revision, agent startup, finding
+validation, cleanup, publication, and completion. While waiting, Maxwell prints the
+current stage and total elapsed time every 15 seconds, including when the agent is
+silent. These updates report activity stages rather than percentage completion.
+Output includes local
 report paths and finding URLs. Pass `--json` before or after the command for one complete
 structured result, for example `maxwell scan owner/repository --model model-a --json`
 or `maxwell --json repo list`. Scan or publication failures exit with status 1.
@@ -320,12 +336,44 @@ and HTTP requests also have bounded timeouts. There are no `start`, `stop`, `sta
 ## GitHub interaction
 
 On each publication pass, Maxwell updates one **Maxwell status** issue per repository
-with recorded scan results, discovery spending, and hunter assessments. You can pin
+with recorded scan results, discovery token usage, and hunter assessments. You can pin
 this issue in GitHub. Cancelled or blocked runs are included in the next publication pass.
 
 Each finding includes its scanned SHA, location, source evidence, expected behavior,
-confidence, priority, and allocated discovery cost. Findings are explicitly suspected;
+confidence, priority, and the originating execution ID. Findings are explicitly suspected;
 an LLM's confidence is not independent verification.
+
+New finding issues and completed scan comments also include versioned machine-readable
+records. GitHub is the shared record for published findings, execution summaries, and
+assessments. Public agent identities contain the adapter (`codex` or `claude`), model,
+role, and optional effort; local provider aliases and native profiles are not published
+as agent identities. One scan summary on the status issue links its finding IDs and
+records input, cached input, cache writes, and output tokens once per execution.
+Cached input and cache writes are included in input; total tokens are input plus output.
+Missing usage is unknown, not zero, and incomplete execution usage is shown explicitly.
+Finding issues reference the execution rather than allocating token usage to findings.
+
+SQLite retains operational scans, stage executions, budget reservations, and publication
+intents. It also projects authorized GitHub records and preserves observed revisions.
+Structured records are accepted from the authenticated GitHub account or its configured
+`allowed_users`, and must match the repository and finding issue. Human assessments must
+identify their actual GitHub author. Edited records are marked changed; missing records
+are marked missing. Previous observed payloads remain available locally. GitHub does not
+provide an immutable assessment ledger, and edits made between synchronizations may not
+be observed.
+
+Assessment records distinguish supported, rejected, and inconclusive verdicts from
+actionability and priority. Corrections use new IDs and explicitly supersede previous
+assessments. Execution status and GitHub issue closure remain separate from validity.
+Assessment publication is append-only: conflicting records are not overwritten, and
+ambiguous comment creation is reconciled before any further write.
+
+These contracts and projections are the foundation for later reviewer and auditor
+stages. Scans still execute discovery only; structured assessments do not yet change
+ratings, queue eligibility, or trigger repairs. Measurement records can describe pinned
+factors, coverage, exclusions, and analyzer/policy versions, but measurement adapters
+and entropy calculation are not implemented yet. Existing issue bodies and scan reports
+without structured records remain compatible and are not retroactively assigned evidence.
 
 GitHub comment commands are not processed during manual runs. Closing an issue
 directly removes it from the review queue on the next manual scan, but
@@ -336,7 +384,9 @@ does not imply a quality assessment.
 Each scan records its configured execution profile, policy snapshot, pinned revision,
 usage, result, timestamps, and artifacts. Cost calculations use integer microdollars
 and the price configuration captured for that execution. Cached input is not charged
-twice. All reported dollar amounts are **estimates**, not billing receipts.
+twice. Dollar accounting remains an internal compatibility feature; GitHub, local
+Markdown reports, and `scan --json` show token counts only. Historical public records
+retain their original fields.
 
 For priced models, the controller reserves the configured amount before launching a scan. Daily budget
 windows use UTC. An execution with unknown spending retains its reservation, including
@@ -354,16 +404,26 @@ or interrupted calls. Preparation failures and skipped revisions consume no coun
 The same configured scan timeout applies. Known-priced models continue using the dollar
 budget; both modes share the single active run and human review queue limit.
 
-Scan costs are allocated equally among newly admitted findings after deduplication.
+Internal legacy scan costs are allocated equally among newly admitted findings after deduplication.
 Rounding is reconciled exactly. Scans with no admitted findings remain repository
-overhead. The status report sums the original ledger, not allocated costs again.
-Other stages are shown as **not run**, not executed for zero dollars.
+overhead. Public reports sum recorded execution tokens without counting findings again.
+Other stages are shown as **not run**.
 
 The SQLite database stores jobs, events, publication intents, and assessments. On the
 next manual run, interrupted jobs are marked as such and retain their reservations. A surviving
 provider process is stopped only when its process group and unique artifact path match
 the recorded attempt. Interrupted scans are not silently rerun; request another scan
 explicitly. Worktrees from interrupted attempts may remain for investigation.
+
+Before discovery, Maxwell fetches GitHub issues and refreshes its local record projection.
+The agent receives the latest 100 open issues and authorized Maxwell findings, with open
+issues first; the context states its coverage. All fetched valid Maxwell finding identities,
+including closed findings and legacy issue markers, are checked for duplicates even in a
+fresh local database. Ordinary open GitHub issues provide context but cannot guarantee
+semantic deduplication. Pull requests are excluded. If GitHub cannot be read completely,
+discovery fails before starting the agent rather than using stale SQLite context.
+The status report combines projected GitHub execution history with local
+runs, deduplicating execution IDs so a fresh home retains published token totals.
 
 Findings have stable identities based on repository, kind, path, symbol, and normalized
 title. Line movement alone does not create another finding. This is deterministic

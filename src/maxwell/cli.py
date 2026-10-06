@@ -61,18 +61,15 @@ def parser():
     model_list.add_argument("--provider", help="List one configured provider/account")
     repo = add_command(commands, "repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
-    add = add_command(repositories, "add", help="Register a repository and discovery settings")
+    add = add_command(repositories, "add", help="Register a repository")
     add.add_argument("source", help="Local path, owner/repository, or GitHub repository URL")
     add.add_argument("--github", help="GitHub owner/repository; inferred from origin if possible")
     add.add_argument("--directory", help="Existing checkout to switch and update before scans")
     add.add_argument("--ref", default="main", help="Base branch to scan (default: main)")
-    add.add_argument("--provider", help="Configured provider/account for discovery")
-    add.add_argument("--model", help="Discovery model (otherwise use the native default)")
-    add.add_argument("--effort", help="Reasoning effort (otherwise use the provider default)")
     add.add_argument(
         "--account", default="default", help="GitHub credential profile from config.yaml"
     )
-    add_command(repositories, "list", help="Show repository settings and stage routes")
+    add_command(repositories, "list", help="Show repository settings")
     change = add_command(repositories, "change", help="Change a repository's settings")
     change.add_argument("repository")
     directory = change.add_mutually_exclusive_group()
@@ -84,14 +81,6 @@ def parser():
     )
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
-    change.add_argument(
-        "--stage",
-        choices=["discovery", "review", "reproduction", "fix", "validation"],
-        help="Stage whose provider/model settings should change",
-    )
-    change.add_argument("--provider", help="Configured provider/account for the stage")
-    change.add_argument("--model", help="Model for the stage")
-    change.add_argument("--effort", help="Stage effort; use 'default' to reset")
     scan = add_command(commands, "scan", help="Run discovery now and publish findings")
     scan.add_argument("repository", nargs="?")
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
@@ -99,9 +88,7 @@ def parser():
     scan.add_argument(
         "--effort", help="Reasoning effort for this run; 'default' uses the provider default"
     )
-    scan.add_argument(
-        "--provider", help="Override the repository's saved discovery provider/account"
-    )
+    scan.add_argument("--provider", help="Connection to use; required with multiple providers")
     return root
 
 
@@ -113,7 +100,6 @@ def infer_github(path):
 
 
 def register_repository(args, paths, config):
-    route = config.route(args.provider, args.model, effort=args.effort)
     settings = config.github.for_account(args.account)
     local = Path(args.source).expanduser()
     ref = validate_ref(args.ref)
@@ -139,7 +125,7 @@ def register_repository(args, paths, config):
         source, kind = f"https://github.com/{name}.git", "github"
     store = Store(paths.db)
     try:
-        store.register(name, source, ref, kind, args.account, directory, route)
+        store.register(name, source, ref, kind, args.account, directory)
     finally:
         store.close()
     return {
@@ -149,7 +135,6 @@ def register_repository(args, paths, config):
         "ref": ref,
         "github_account": args.account,
         "directory": directory,
-        "stages": {"discovery": route},
     }
 
 
@@ -171,22 +156,14 @@ def change_repository(args, store, config):
         )
     elif args.no_directory:
         changes["directory"] = None
-    route = None
-    stage = args.stage or "discovery"
-    if args.provider is not None or args.model is not None or args.effort is not None:
-        route = config.route(
-            args.provider, args.model, store.saved_route(record["name"], stage), effort=args.effort
-        )
-    elif args.stage is not None:
-        raise ValueError("Specify --provider, --model, or --effort when changing a stage")
-    if not changes and route is None:
-        raise ValueError("Specify repository settings or --provider/--model/--effort")
+    if not changes:
+        raise ValueError("Specify --directory, --no-directory, --ref, or --account")
     updated = {**record, **changes}
     if updated["directory"] is not None:
         validate_branch(updated["ref"])
     elif "ref" in changes and updated["source_kind"] == "local":
         inspect_repository(updated["source"], updated["ref"])
-    return store.change_repository(record["name"], changes, stage, route)
+    return store.change_repository(record["name"], changes)
 
 
 def execute(args):

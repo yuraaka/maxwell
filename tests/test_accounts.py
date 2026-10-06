@@ -240,7 +240,7 @@ def test_v1_registration_migrates_without_changing_identity(directory):
         assert record["source_kind"] == "local"
         assert record["github_account"] == "default"
         assert record["directory"] is None
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 9
     finally:
         store.close()
 
@@ -290,6 +290,9 @@ def test_synchronization_routes_api_calls_and_comment_authority_per_repository(
     try:
         asyncio.run(synchronize_once())
         for _, repo, token in github["requests"]:
-            assert token == github["tokens"][repo]
+            if repo:
+                assert token == github["tokens"][repo]
+            else:
+                assert token in github["tokens"].values()
     finally:
         store.close()

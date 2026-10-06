@@ -46,6 +46,23 @@ def test_old_config_commands_are_removed(arguments):
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["repo", "add", "acme/repo", option, "value"]
+        for option in ("--provider", "--model", "--effort")
+    ]
+    + [
+        ["repo", "change", "acme/repo", option, "value"]
+        for option in ("--provider", "--model", "--effort", "--stage")
+    ],
+)
+def test_repository_commands_do_not_accept_agent_settings(arguments):
+    with pytest.raises(SystemExit) as error:
+        parser().parse_args(arguments)
+    assert error.value.code == 2
+
+
 def test_config_init_creates_bootstrap_files_and_refuses_overwrite(directory, capsys):
     paths = Paths(directory / "new-home")
     args = parser().parse_args(["--home", str(paths.root), "config", "init"])

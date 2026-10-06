@@ -1,10 +1,12 @@
 import asyncio
 import fcntl
+import json
 import signal
 
-from maxwell.contracts import micros
+from maxwell.contracts import Usage, micros
 from maxwell.daemon import Daemon
 from maxwell.github import GitHub
+from maxwell.progress import ScanProgress
 from maxwell.reporting import Reporter
 from maxwell.store import Store
 
@@ -46,9 +48,7 @@ async def run_scans(
                     raise ValueError(
                         f"Configure a token for GitHub account {record['github_account']!r}"
                     )
-                route = config.route(
-                    provider, model, store.saved_route(record["name"]), effort=effort
-                )
+                route = config.route(provider, model, effort=effort)
                 executions.append(config.execution(route, record))
             engine.recover()
             results = []
@@ -76,14 +76,25 @@ async def run_scans(
                     manual=True,
                 )
                 if job is None:
+                    reasons = store.admission_blockers(
+                        identifier,
+                        micros(config.limits.daily_budget_usd),
+                        micros(config.limits.scan_reservation_usd),
+                        config.limits.human_queue_max,
+                        config.limits.daily_scan_limit,
+                    )
                     store.fail_queued(
                         identifier,
-                        "Scan blocked by the daily budget, scan limit, or human review queue limit",
+                        "Scan blocked: " + "; ".join(reasons)
+                        if reasons
+                        else "Scan could not be admitted; retry the command",
                     )
                 else:
                     if on_progress:
                         on_progress({**job, "effort": execution["settings"].get("effort")})
-                    await engine.scan(job)
+                    progress = ScanProgress(job, on_progress)
+                    async with progress.watch():
+                        await engine.scan(job, on_progress=progress.update)
                     if task.cancelling():
                         raise asyncio.CancelledError
                 current = store.one("SELECT * FROM scans WHERE id=?", (identifier,))
@@ -91,11 +102,13 @@ async def run_scans(
                 if job is not None:
                     if on_progress:
                         on_progress({**current, "state": "publishing"})
+                    progress.phase = "publishing results to GitHub"
                     client = GitHub(config.github.for_account(record["github_account"]))
                     try:
-                        await Reporter(store, client, config, paths).sync(
-                            repository=record["name"], process_commands=False
-                        )
+                        async with progress.watch():
+                            await Reporter(store, client, config, paths).sync(
+                                repository=record["name"], process_commands=False
+                            )
                     except Exception as exc:
                         publication_errors.append(config.redact(str(exc)))
                     finally:
@@ -123,11 +136,12 @@ async def run_scans(
                         "summary",
                         "error",
                         "admitted",
-                        "cost",
-                        "accounting",
                     )
                 }
                 result.update(
+                    accounting="tokens",
+                    usage=Usage.model_validate_json(current["usage"] or "{}").model_dump(),
+                    selection=json.loads(current["selection"]) if current["selection"] else None,
                     effort=execution["settings"].get("effort"),
                     report=str(report) if report.exists() else None,
                     publication_errors=publication_errors,

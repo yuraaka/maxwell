@@ -5,7 +5,9 @@ from decimal import ROUND_CEILING, Decimal
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
+
+DEFAULT_SCAN_CANDIDATES = 100
 
 
 class Finding(BaseModel):
@@ -39,7 +41,38 @@ class Finding(BaseModel):
 class ScanResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     summary: str = Field(min_length=1, max_length=6000)
-    findings: list[Finding] = Field(max_length=20)
+    findings: list[Finding]
+
+    @classmethod
+    def bounded(cls, limit: int):
+        return create_model(
+            "BoundedScanResult", __base__=cls, findings=(list[Finding], Field(max_length=limit))
+        )
+
+
+class SelectionStats(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collected: int = Field(ge=0)
+    selected: int = Field(ge=0)
+    skipped: int = Field(ge=0)
+    below_confidence: int = Field(default=0, ge=0)
+    duplicate: int = Field(default=0, ge=0)
+    already_known: int = Field(default=0, ge=0)
+    publication_limit: int = Field(default=0, ge=0)
+    review_queue_limit: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def check_counts(self):
+        reasons = (
+            self.below_confidence
+            + self.duplicate
+            + self.already_known
+            + self.publication_limit
+            + self.review_queue_limit
+        )
+        if self.collected != self.selected + self.skipped or reasons != self.skipped:
+            raise ValueError("Candidate selection counts do not reconcile")
+        return self
 
 
 class Usage(BaseModel):

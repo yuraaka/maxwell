@@ -13,6 +13,7 @@ from maxwell.github import GitHub
 from maxwell.provider import create_provider, discovery_prompt
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
 from maxwell.repositories import Repository, stop_orphan
+from maxwell.selection import select_candidates
 from maxwell.store import Store
 
 
@@ -103,7 +104,6 @@ class Daemon:
                         self.config.route(
                             data.get("provider"),
                             data["model"],
-                            self.store.saved_route(record["name"]),
                             effort=data.get("effort"),
                         ),
                         record,
@@ -143,7 +143,11 @@ class Daemon:
                 "Recovered interrupted scan %s; retained budget reservation", job["id"]
             )
 
-    async def scan(self, job):
+    async def scan(self, job, on_progress=None):
+        def progress(phase):
+            if on_progress:
+                on_progress(phase)
+
         settings = self.config.provider
         artifact = self.paths.root / "artifacts" / job["id"]
         artifact.mkdir(parents=True, exist_ok=True)
@@ -151,12 +155,13 @@ class Daemon:
         worktree = None
         state, summary, error, findings, cost = "failed", "Discovery failed.", None, [], None
         usage = Usage()
+        selection = None
         try:
             if not job.get("execution"):
                 record = self.store.one(
                     "SELECT * FROM repositories WHERE name=?", (job["repository"],)
                 )
-                route = self.store.ensure_route(job["repository"], self.config)
+                route = self.config.route()
                 job = self.store.bind_execution(job["id"], self.config.execution(route, record))
             execution = json.loads(job["execution"])
             if execution["stage"] != "discovery":
@@ -183,7 +188,9 @@ class Daemon:
                 raise ValueError(
                     f"Configure a token for GitHub account {record['github_account']!r}"
                 )
+            progress("preparing repository")
             sha, worktree = await asyncio.to_thread(repository.prepare, job["id"], token)
+            progress(f"source ready at {sha[:12]}")
             with self.store.db:
                 self.store.db.execute("UPDATE scans SET sha=? WHERE id=?", (sha, job["id"]))
             previous = self.store.one(
@@ -194,15 +201,20 @@ class Daemon:
             if previous and not job["forced"]:
                 state, summary, cost = "skipped", "Revision already scanned; no model call.", 0
             else:
-                known = [
-                    json.loads(row["data"])["title"]
-                    for row in self.store.rows(
-                        "SELECT data FROM findings WHERE repository=? ORDER BY rowid DESC LIMIT 100",
-                        (job["repository"],),
-                    )
-                ]
+                progress("loading existing issues from GitHub")
+                client = GitHub(access)
+                try:
+                    known, remote_identities = await Reporter(
+                        self.store, client, self.config, self.paths
+                    ).discovery_context(job["repository"])
+                finally:
+                    client.close()
                 prompt = discovery_prompt(
-                    job["repository"], sha, scan_config.limits.max_findings_per_scan, known
+                    job["repository"],
+                    sha,
+                    scan_config.limits.max_findings_per_scan,
+                    known,
+                    candidate_limit=scan_config.limits.max_candidates_per_scan,
                 )
                 (artifact / "prompt.txt").write_text(self.config.redact(prompt))
                 policy = execution or self.config.model_dump(mode="json")
@@ -218,8 +230,13 @@ class Daemon:
                         self.store.db.execute(
                             "UPDATE scans SET pid=?,executed=1 WHERE id=?", (pid, job["id"])
                         )
+                    progress("agent running")
 
+                progress("starting agent")
                 result = await provider.scan(worktree, artifact, prompt, started)
+                if len(result.findings) > scan_config.limits.max_candidates_per_scan:
+                    raise ValueError("Provider exceeded limits.max_candidates_per_scan")
+                progress(f"validating {len(result.findings)} candidate findings")
                 if not await asyncio.to_thread(repository.unchanged, worktree, sha):
                     raise ValueError("Discovery modified its worktree; findings rejected")
                 slots = (
@@ -229,25 +246,24 @@ class Daemon:
                         (job["repository"],),
                     )["n"]
                 )
-                seen = set()
-                new_findings = 0
-                for finding in sorted(
-                    result.findings, key=lambda item: (item.priority, -item.confidence)
-                ):
-                    finding.validate_location(worktree)
-                    if finding.confidence < scan_config.limits.minimum_confidence:
-                        continue
-                    identity = finding.identity(job["repository"])
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    existing = self.store.one("SELECT id FROM findings WHERE id=?", (identity,))
-                    if existing or new_findings < min(
-                        slots, scan_config.limits.max_findings_per_scan
-                    ):
-                        findings.append(finding)
-                        if not existing:
-                            new_findings += 1
+                progress(f"ranking {len(result.findings)} candidates")
+                selected, observations, selection = select_candidates(
+                    result.findings,
+                    job["repository"],
+                    worktree,
+                    publication_limit=scan_config.limits.max_findings_per_scan,
+                    slots=slots,
+                    minimum_confidence=scan_config.limits.minimum_confidence,
+                    local_ids={
+                        row["id"]
+                        for row in self.store.rows(
+                            "SELECT id FROM findings WHERE repository=?", (job["repository"],)
+                        )
+                    },
+                    remote_ids=remote_identities,
+                )
+                findings = selected + observations
+                progress(f"selected {selection.selected} candidates; skipped {selection.skipped}")
                 state, summary = "completed", result.summary
         except asyncio.CancelledError:
             state, summary, error = "cancelled", "Discovery cancelled during shutdown.", "Cancelled"
@@ -265,7 +281,16 @@ class Daemon:
                 cost = 0
             if job.get("accounting") == "unpriced" and provider is not None and provider.started:
                 cost = None
-            self.store.finish(job, state, self.config.redact(summary), usage, cost, findings, error)
+            self.store.finish(
+                job,
+                state,
+                self.config.redact(summary),
+                usage,
+                cost,
+                findings,
+                error,
+                selection=selection if state == "completed" else None,
+            )
             current = self.store.one("SELECT * FROM scans WHERE id=?", (job["id"],))
             (artifact / "summary.json").write_text(json.dumps(current, indent=2))
             (self.paths.root / "reports" / f"{job['id']}.md").write_text(
@@ -273,6 +298,7 @@ class Daemon:
             )
             if worktree:
                 try:
+                    progress("cleaning up worktree")
                     await asyncio.to_thread(repository.cleanup, worktree)
                 except Exception as exc:
                     self.log.warning(
@@ -292,7 +318,7 @@ class Daemon:
                     record = self.store.one(
                         "SELECT * FROM repositories WHERE name=?", (old["repository"],)
                     )
-                    route = self.store.ensure_route(old["repository"], self.config)
+                    route = self.config.route()
                     self.store.bind_execution(old["id"], self.config.execution(route, record))
                 except ValueError as exc:
                     self.log.warning(
@@ -302,7 +328,7 @@ class Daemon:
                 "SELECT * FROM repositories WHERE paused=0 AND next_scan<=?", (time.time(),)
             ):
                 try:
-                    route = self.store.ensure_route(repo["name"], self.config)
+                    route = self.config.route()
                     self.store.enqueue(
                         repo["name"], forced=False, execution=self.config.execution(route, repo)
                     )

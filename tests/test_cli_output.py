@@ -6,10 +6,24 @@ import sys
 import pytest
 
 from maxwell.cli import execute, parser
-from maxwell.cli_output import check_line, model_lines
+from maxwell.cli_output import check_line, model_lines, scan_line
 from maxwell.config_validation import validate_config
 from maxwell.github import GitHub
 from maxwell.store import Store
+
+
+@pytest.mark.parametrize("heartbeat,badge", [(False, "[STEP]"), (True, "[WAIT]")])
+def test_scan_progress_formats_phase_and_elapsed(heartbeat, badge, capsys):
+    scan_line(
+        {
+            "repository": "acme/repo",
+            "state": "progress",
+            "phase": "agent running",
+            "elapsed": 75,
+            "heartbeat": heartbeat,
+        }
+    )
+    assert capsys.readouterr().out == f"{badge} acme/repo: agent running (1:15 elapsed)\n"
 
 
 @pytest.mark.parametrize(
@@ -65,9 +79,7 @@ def test_human_config_failure_keeps_nonzero_exit(directory):
 
 def test_repository_output_preserves_useful_settings(home, source, capsys):
     store = Store(home.db)
-    store.register(
-        "acme/repo", str(source), "main", route={"provider": "default", "model": "fake-model"}
-    )
+    store.register("acme/repo", str(source), "main")
     store.pause("acme/repo", True)
     store.close()
     prefix = ["--home", str(home.root)]
@@ -76,13 +88,14 @@ def test_repository_output_preserves_useful_settings(home, source, capsys):
     for expected in (
         "acme/repo",
         "Branch: main",
-        "Discovery: default / fake-model",
+        "GitHub account: default",
     ):
         assert expected in text
     assert "Scans: paused" not in text
+    assert "Discovery:" not in text
     execute(parser().parse_args([*prefix, "repo", "list", "--json"]))
     report = json.loads(capsys.readouterr().out)
-    assert report[0]["stages"]["discovery"]["model"] == "fake-model"
+    assert "stages" not in report[0]
 
 
 @pytest.mark.parametrize("status,code", [("ok", "32"), ("error", "31"), ("skipped", "33")])

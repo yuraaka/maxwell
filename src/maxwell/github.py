@@ -78,6 +78,18 @@ class GitHub:
     def comments(self, repo, issue):
         return list(self.paginate(f"repos/{repo}/issues/{issue}/comments"))
 
+    def create_comment(self, repo, issue, body):
+        try:
+            return self.request(
+                "POST", f"repos/{repo}/issues/{issue}/comments", json={"body": body}
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                raise PublicationUncertain("Comment creation may have succeeded") from exc
+            raise
+        except httpx.TransportError as exc:
+            raise PublicationUncertain("Comment creation response lost") from exc
+
     def upsert_comment(self, repo, issue, marker, body):
         for comment in self.comments(repo, issue):
             if marker in comment["body"]:

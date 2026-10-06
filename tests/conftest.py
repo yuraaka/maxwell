@@ -187,6 +187,7 @@ def github():
                     number = len(state["issues"]) + 1
                     data.update(
                         _repo="/".join(parts[1:3]),
+                        user={"login": "maintainer"},
                         number=number,
                         html_url=f"https://github.invalid/acme/repo/issues/{number}",
                         state="open",
@@ -202,7 +203,7 @@ def github():
                     self.respond(201, data)
                 elif parts[-1] == "comments":
                     state["comment_id"] += 1
-                    data.update(id=state["comment_id"], user={"login": "maxwell-bot"})
+                    data.update(id=state["comment_id"], user={"login": "maintainer"})
                     state["comments"].setdefault(int(parts[-2]), []).append(data)
                     self.respond(201, data)
                 else:

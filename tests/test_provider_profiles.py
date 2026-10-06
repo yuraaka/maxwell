@@ -149,10 +149,12 @@ def add_repository(home, config, source, *options):
     return register_repository(args, home, config)
 
 
-def request_scan(daemon, **arguments):
+def request_scan(daemon, *, provider="first", **arguments):
     class Reader:
         async def readline(self):
-            return json.dumps({"version": 1, "command": "scan", **arguments}).encode()
+            return json.dumps(
+                {"version": 1, "command": "scan", "provider": provider, **arguments}
+            ).encode()
 
     class Writer:
         def write(self, value):
@@ -184,7 +186,7 @@ def run_next(daemon):
 @pytest.fixture
 def native_daemon(home, native, source):
     homes, config = native
-    add_repository(home, config, source, "--provider", "first")
+    add_repository(home, config, source)
     daemon = Daemon(home, config)
     daemon.store = Store(home.db)
     yield daemon, homes
@@ -197,54 +199,51 @@ def test_manual_scan_requires_model_even_with_one_provider():
     assert error.value.code == 2
 
 
-def test_multiple_providers_require_explicit_selection(home, native, source):
+def test_registration_does_not_require_provider_selection(home, native, source):
     _, config = native
-    with pytest.raises(ValueError, match="Specify --provider"):
-        add_repository(home, config, source)
-    store = Store(home.db)
-    assert not store.rows("SELECT * FROM repositories")
-    store.close()
-
-
-def test_single_provider_native_default_is_saved_and_stays_selected(home, native, source):
-    _, config = native
-    only = config.model_copy(update={"providers": {"first": config.providers["first"]}})
-    add_repository(home, only, source)
+    record = add_repository(home, config, source)
+    assert "stages" not in record
     store = Store(home.db)
     try:
-        assert store.saved_route("acme/repo") == {"provider": "first", "model": "native-default"}
-        assert store.ensure_route("acme/repo", config)["provider"] == "first"
+        assert "stages" not in store.repository("acme/repo")
+        assert not store.one("SELECT name FROM sqlite_master WHERE name='repository_stage_routes'")
     finally:
         store.close()
 
 
-def test_stage_routes_change_independently_and_are_visible(home, native, source, capsys):
-    _, config = native
-    add_repository(home, config, source, "--provider", "first", "--model", "model-a")
+def test_remote_registration_with_multiple_connections_only_saves_repository_settings(
+    home, native, capsys
+):
     execute(
-        parser().parse_args(
-            [
-                "--home",
-                str(home.root),
-                "repo",
-                "change",
-                "acme/repo",
-                "--json",
-                "--stage",
-                "review",
-                "--provider",
-                "claude",
-                "--model",
-                "model-b",
-            ]
-        )
+        parser().parse_args(["--home", str(home.root), "repo", "add", "yuraaka/maxwell", "--json"])
     )
-    record = json.loads(capsys.readouterr().out)
-    assert record["stages"] == {
-        "discovery": {"provider": "first", "model": "model-a"},
-        "review": {"provider": "claude", "model": "model-b"},
-    }
-    assert record["github_account"] == "default"
+    result = json.loads(capsys.readouterr().out)
+    assert result["repository"] == "yuraaka/maxwell"
+    assert "stages" not in result
+    store = Store(home.db)
+    try:
+        record = store.repository("yuraaka/maxwell")
+        assert record["source_kind"] == "github"
+        assert record["github_account"] == "default"
+        assert not {"provider", "model", "effort", "stages"}.intersection(record)
+        assert not store.rows("SELECT * FROM scans")
+    finally:
+        store.close()
+
+
+def test_scan_requires_connection_when_multiple_providers_are_configured(native_daemon):
+    daemon, _ = native_daemon
+    result = request_scan(daemon, provider=None, repository="acme/repo", model="model-a")
+    assert "Specify --provider" in result["error"]
+    assert not daemon.store.rows("SELECT * FROM scans")
+
+
+def test_registration_does_not_require_a_native_model_default(home, native, source):
+    homes, config = native
+    for name in ("first", "second"):
+        (homes[name] / "config.toml").write_text("")
+    (homes["claude"] / "settings.json").write_text("{}")
+    assert add_repository(home, config, source)["repository"] == "acme/repo"
 
 
 def test_model_catalog_is_optional_and_prices_are_model_specific():
@@ -267,7 +266,7 @@ def test_model_catalog_is_optional_and_prices_are_model_specific():
 
 def test_manual_requests_keep_distinct_models_and_do_not_change_routing(native_daemon):
     daemon, _ = native_daemon
-    before = daemon.store.saved_route("acme/repo")
+    before = daemon.store.repository("acme/repo")
     first = request_scan(daemon, repository="acme/repo", model="model-a")["scans"][0]
     same = request_scan(daemon, repository="acme/repo", model="model-a")["scans"][0]
     second = request_scan(daemon, repository="acme/repo", model="model-b")["scans"][0]
@@ -276,16 +275,14 @@ def test_manual_requests_keep_distinct_models_and_do_not_change_routing(native_d
     ][0]
     assert first == same
     assert len({first, second, other}) == 3
-    assert daemon.store.saved_route("acme/repo") == before
+    assert daemon.store.repository("acme/repo") == before
     assert "error" in request_scan(daemon, repository="acme/repo")
 
 
 def test_all_repository_requests_validate_before_queueing(native_daemon, source):
     daemon, _ = native_daemon
-    daemon.config.providers["second"].models = {"different": {}}
-    daemon.store.register(
-        "acme/other", str(source), "main", route={"provider": "second", "model": "different"}
-    )
+    daemon.config.providers["first"].models = {"different": ModelSettings()}
+    daemon.store.register("acme/other", str(source), "main")
     result = request_scan(daemon, model="model-a")
     assert "error" in result
     assert daemon.store.rows("SELECT * FROM scans") == []
@@ -321,7 +318,8 @@ def test_native_cli_uses_selected_home_and_gateway_without_api_key(
         assert (homes[provider] / filename).read_bytes() == content
     assert scan["cost"] is None and scan["accounting"] == "unpriced"
     assert daemon.store.committed_today() == 0
-    assert "unpriced" in scan_report(scan)
+    assert "1,100 tokens" in scan_report(scan)
+    assert "$" not in scan_report(scan)
     for path in (home.root / "artifacts").rglob("*"):
         if path.is_file():
             assert "gateway-secret" not in path.read_text(errors="replace")
@@ -378,6 +376,61 @@ def test_existing_observations_leave_capacity_for_new_findings(native_daemon, fi
     assert scan["admitted"] == 1
     assert len(daemon.store.rows("SELECT * FROM findings")) == 2
     assert len(daemon.store.rows("SELECT * FROM finding_observations")) == 3
+    assert json.loads(scan["selection"])["already_known"] == 1
+
+
+@pytest.mark.parametrize("count,limit", [(60, 100), (125, 125)])
+def test_collection_exceeds_twenty_and_publishes_ranked_top_with_skipped_report(
+    native_daemon, finding, home, count, limit
+):
+    daemon, homes = native_daemon
+    daemon.config.limits.max_findings_per_scan = 1
+    daemon.config.limits.max_candidates_per_scan = limit
+    candidates = [
+        {
+            **finding,
+            "title": f"Concrete maintenance candidate {index:03d}",
+            "evidence": "E" * 6000,
+            "priority": "P1" if index == count - 1 else "P2",
+        }
+        for index in range(count)
+    ]
+    (homes["first"] / "findings.json").write_text(json.dumps(candidates))
+    request_scan(daemon, repository="acme/repo", model="chosen-model")
+    daemon.config.limits.max_candidates_per_scan = 1
+    scan = run_next(daemon)
+    assert scan["state"] == "completed", scan["error"]
+    assert scan["admitted"] == 1
+    assert (
+        json.loads(daemon.store.one("SELECT data FROM findings")["data"])["title"]
+        == candidates[-1]["title"]
+    )
+    stats = json.loads(scan["selection"])
+    assert stats["collected"] == count and stats["selected"] == 1
+    assert stats["skipped"] == count - 1 and stats["publication_limit"] == count - 1
+    artifact = home.root / "artifacts" / scan["id"]
+    assert (artifact / "result.json").stat().st_size > 256 * 1024
+    assert (
+        json.loads((artifact / "schema.json").read_text())["properties"]["findings"]["maxItems"]
+        == limit
+    )
+    assert "Do not stop after finding 1 issues" in (artifact / "prompt.txt").read_text()
+    assert f"up to {limit}, using the supplied schema" in (artifact / "prompt.txt").read_text()
+    assert f"Skipped: **{count - 1}**" in scan_report(scan)
+    assert f"Collection is bounded at {limit} candidates" in scan_report(scan)
+    assert "Already known | 0" in scan_report(scan)
+
+
+@pytest.mark.parametrize("provider", ["first", "claude"])
+def test_provider_rejects_results_over_configured_candidate_limit(native_daemon, finding, provider):
+    daemon, homes = native_daemon
+    daemon.config.limits.max_candidates_per_scan = 1
+    (homes[provider] / "findings.json").write_text(json.dumps([finding, finding]))
+    request_scan(daemon, repository="acme/repo", provider=provider, model="chosen-model")
+    scan = run_next(daemon)
+    assert scan["state"] == "failed"
+    assert scan["admitted"] == 0 and scan["selection"] is None
+    assert "at most 1 item" in scan["error"]
 
 
 def test_codex_profile_resolves_model_and_gateway_and_is_passed_to_cli(
@@ -490,7 +543,7 @@ def test_native_failures_are_fenced_and_bounded(native_daemon, adapter, mode):
     assert scan["executed"] == 1
 
 
-def test_native_configuration_checks_dependencies_and_saved_routes(
+def test_native_configuration_checks_dependencies_without_repository_routes(
     home, native_daemon, monkeypatch
 ):
     daemon, homes = native_daemon
@@ -507,10 +560,11 @@ def test_native_configuration_checks_dependencies_and_saved_routes(
     assert report["valid"], report
     assert "gateway-secret" not in json.dumps(report)
     with daemon.store.db:
-        daemon.store.write_route(
-            "acme/repo", "discovery", {"provider": "missing", "model": "chosen"}
+        daemon.store.db.executescript(
+            "CREATE TABLE repository_stage_routes(repository TEXT,stage TEXT,provider TEXT,model TEXT);"
+            "INSERT INTO repository_stage_routes VALUES('acme/repo','discovery','missing','chosen');"
         )
-    assert not validate_config(home, online=False)["valid"]
+    assert validate_config(home, online=False)["valid"]
 
 
 def test_native_provider_definitions_do_not_mix_with_legacy_config():
@@ -563,23 +617,15 @@ def test_invalid_native_settings_fail_config_validation(home, native, content):
     assert not report["valid"]
 
 
-def test_online_check_probes_catalog_defaults_and_stage_models_once(
-    home, native, source, github, monkeypatch
-):
+def test_online_check_probes_catalog_and_defaults_once(home, native, source, github, monkeypatch):
     homes, config = native
     monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", "gateway-secret")
     data = yaml.safe_load(home.config.read_text())
     data["providers"]["first"].update(models=["model-a", "model-b"], env=["COMPANY_GATEWAY_TOKEN"])
+    data["providers"]["claude"]["models"] = ["native-default", "stage-model"]
     home.config.write_text(yaml.safe_dump(data))
     config = home.load()
-    add_repository(home, config, source, "--provider", "first", "--model", "model-a")
-    store = Store(home.db)
-    try:
-        with store.db:
-            store.write_route("acme/repo", "review", {"provider": "first", "model": "model-b"})
-            store.write_route("acme/repo", "fix", {"provider": "claude", "model": "stage-model"})
-    finally:
-        store.close()
+    add_repository(home, config, source)
     database_before = home.db.read_bytes()
     files_before = home.config.read_bytes()
     report = validate_config(home)
@@ -718,16 +764,17 @@ def test_online_check_needs_a_model_when_provider_has_no_default(home, native, g
 
 
 @pytest.mark.parametrize("provider", ["first", "claude"])
-def test_saved_stage_model_is_probed_without_a_native_default(home, native, source, provider):
+def test_configured_model_is_probed_without_a_native_default(home, native, source, provider):
     homes, _ = native
     data = yaml.safe_load(home.config.read_text())
     data["providers"] = {provider: data["providers"][provider]}
+    data["providers"][provider]["model"] = "stage-model"
     home.config.write_text(yaml.safe_dump(data))
     if provider == "first":
         (homes[provider] / "config.toml").write_text("")
     else:
         (homes[provider] / "settings.json").write_text("{}")
-    add_repository(home, home.load(), source, "--model", "stage-model")
+    add_repository(home, home.load(), source)
     report = validate_config(home)
     assert report["valid"], report
     calls = list(map(json.loads, (homes[provider] / "calls.jsonl").read_text().splitlines()))
@@ -853,7 +900,7 @@ def test_rejected_github_scan_does_not_block_later_explicit_request(home, native
         {"id": 12001, "body": "/maxwell scan", "user": {"login": "maintainer"}},
         {
             "id": 12002,
-            "body": "/maxwell scan --model chosen --effort high",
+            "body": "/maxwell scan --provider first --model chosen --effort high",
             "user": {"login": "maintainer"},
         },
     ]
@@ -870,7 +917,7 @@ def test_rejected_github_scan_does_not_block_later_explicit_request(home, native
         client.close()
 
 
-def test_missing_saved_provider_fails_run_without_fallback(native_daemon):
+def test_missing_execution_provider_fails_run_without_fallback(native_daemon):
     daemon, homes = native_daemon
     request_scan(daemon, repository="acme/repo", model="chosen")
     del daemon.config.providers["first"]
@@ -958,43 +1005,6 @@ def test_scan_effort_overrides_native_default_and_survives_config_changes(native
     )
 
 
-def test_stage_effort_changes_are_saved_and_reset(home, native, source, capsys):
-    _, config = native
-    add_repository(
-        home, config, source, "--provider", "first", "--model", "model-a", "--effort", "high"
-    )
-    prefix = ["--home", str(home.root), "repo", "change", "acme/repo", "--json"]
-    execute(parser().parse_args([*prefix, "--effort", "low"]))
-    record = json.loads(capsys.readouterr().out)
-    assert record["stages"]["discovery"] == {
-        "provider": "first",
-        "model": "model-a",
-        "effort": "low",
-    }
-    execute(
-        parser().parse_args(
-            [
-                *prefix,
-                "--stage",
-                "review",
-                "--provider",
-                "claude",
-                "--model",
-                "model-b",
-                "--effort",
-                "high",
-            ]
-        )
-    )
-    record = json.loads(capsys.readouterr().out)
-    assert record["stages"]["review"]["effort"] == "high"
-    assert record["stages"]["discovery"]["effort"] == "low"
-    execute(parser().parse_args([*prefix, "--effort", "default"]))
-    assert "effort" not in json.loads(capsys.readouterr().out)["stages"]["discovery"]
-    execute(parser().parse_args([*prefix, "--stage", "review", "--model", "model-c"]))
-    assert "effort" not in json.loads(capsys.readouterr().out)["stages"]["review"]
-
-
 def test_known_efforts_are_validated_before_queueing(native_daemon):
     daemon, _ = native_daemon
     daemon.config.providers["first"].models = {
@@ -1015,7 +1025,7 @@ def test_invalid_efforts_are_rejected(effort):
         config.route(model="model-a", effort=effort)
 
 
-def test_model_defaults_and_saved_efforts_have_explicit_precedence():
+def test_explicit_effort_and_provider_model_defaults_have_precedence():
     config = Config(
         providers={
             "only": ProviderSettings(
@@ -1029,20 +1039,21 @@ def test_model_defaults_and_saved_efforts_have_explicit_precedence():
     )
     route = config.route(model="a", effort="low")
     assert config.execution(route, {})["settings"]["effort"] == "low"
-    assert config.route(current=route)["effort"] == "low"
-    reset = config.route(current=route, effort="default")
+    assert "effort" not in config.route(model="a")
+    reset = config.route(model="a", effort="default")
     assert "effort" not in reset
     assert config.execution(reset, {})["settings"]["effort"] == "high"
-    changed = config.route(model="b", current=route)
+    changed = config.route(model="b")
     assert "effort" not in changed
     assert config.execution(changed, {})["settings"]["effort"] == "medium"
 
 
-def test_config_validation_probes_saved_effort(home, native, source):
+def test_config_validation_probes_configured_effort(home, native, source):
     homes, config = native
-    add_repository(
-        home, config, source, "--provider", "claude", "--model", "stage-model", "--effort", "high"
-    )
+    data = yaml.safe_load(home.config.read_text())
+    data["providers"]["claude"]["models"] = {"stage-model": {"effort": "high"}}
+    home.config.write_text(yaml.safe_dump(data))
+    add_repository(home, config, source)
     report = validate_config(home)
     assert report["valid"], report
     assert any(
@@ -1054,22 +1065,30 @@ def test_config_validation_probes_saved_effort(home, native, source):
     assert stage["args"][stage["args"].index("--effort") + 1] == "high"
 
 
-def test_version_four_routes_migrate_without_changing_selection(home, native, source):
-    _, config = native
-    add_repository(home, config, source, "--provider", "first", "--model", "native-default")
-    store = Store(home.db)
-    with store.db:
-        store.db.execute("ALTER TABLE repository_stage_routes DROP COLUMN effort")
-        store.db.execute("PRAGMA user_version=4")
-    store.close()
+@pytest.mark.parametrize("version", [4, 7, 8])
+def test_legacy_routes_are_removed_without_changing_execution_history(home, native_daemon, version):
+    daemon, _ = native_daemon
+    identifier = request_scan(daemon, repository="acme/repo", model="chosen")["scans"][0]
+    before = daemon.store.one("SELECT * FROM scans WHERE id=?", (identifier,))
+    repository = daemon.store.repository("acme/repo")
+    with daemon.store.db:
+        daemon.store.db.executescript(
+            "CREATE TABLE repository_stage_routes(repository TEXT,stage TEXT,provider TEXT,model TEXT);"
+            "INSERT INTO repository_stage_routes VALUES('acme/repo','discovery','missing','chosen');"
+        )
+        daemon.store.db.execute(f"PRAGMA user_version={version}")
     report = validate_config(home, online=False)
     assert report["valid"], report
-    store = Store(home.db)
+    migrated = Store(home.db)
     try:
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert store.saved_route("acme/repo") == {"provider": "first", "model": "native-default"}
+        assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert not migrated.one(
+            "SELECT name FROM sqlite_master WHERE name='repository_stage_routes'"
+        )
+        assert migrated.one("SELECT * FROM scans WHERE id=?", (identifier,)) == before
+        assert migrated.repository("acme/repo") == repository
     finally:
-        store.close()
+        migrated.close()
 
 
 def test_daemon_reloads_applied_config_without_changing_queued_execution(home, native_daemon):

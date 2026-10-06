@@ -42,7 +42,15 @@ def check_line(check):
 
 def scan_line(scan):
     name = scan["repository"]
-    if scan["state"] == "running":
+    if scan["state"] == "progress":
+        elapsed = scan["elapsed"]
+        minutes, seconds = divmod(elapsed, 60)
+        badge = "[WAIT]" if scan["heartbeat"] else "[STEP]"
+        print(
+            f"{color(badge, '36')} {name}: {scan['phase']} ({minutes}:{seconds:02d} elapsed)",
+            flush=True,
+        )
+    elif scan["state"] == "running":
         effort = f" / {scan['effort']}" if scan.get("effort") else ""
         print(
             f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}",
@@ -58,6 +66,8 @@ def scan_line(scan):
             if success
             else scan["error"] or "; ".join(scan["publication_errors"]) or scan["state"]
         )
+        if success and scan.get("selection"):
+            detail += f"; {scan['selection']['skipped']} candidates skipped"
         print(f"{badge} {name}: {detail}", flush=True)
 
 
@@ -160,9 +170,6 @@ def repository_lines(record):
             lines.append(f"  {label}: {record[key]}")
     if "directory" in record:
         lines.append(f"  Local directory: {record['directory'] or 'none'}")
-    for stage, route in record.get("stages", {}).items():
-        effort = f" / {route['effort']}" if route.get("effort") else ""
-        lines.append(f"  {stage.capitalize()}: {route['provider']} / {route['model']}{effort}")
     return lines
 
 
