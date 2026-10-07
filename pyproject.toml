@@ -7,7 +7,12 @@ name = "maxwell-maintainer"
 version = "0.1.0"
 description = "Manual repository discovery with durable GitHub issue reports"
 requires-python = ">=3.12"
-dependencies = ["httpx>=0.27,<1", "pydantic>=2.9,<3", "PyYAML>=6,<7"]
+dependencies = [
+    "argcomplete>=3.6,<4",
+    "httpx>=0.27,<1",
+    "pydantic>=2.9,<3",
+    "PyYAML>=6,<7",
+]
 
 [project.scripts]
 maxwell = "maxwell.cli:main"

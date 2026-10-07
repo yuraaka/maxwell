@@ -58,6 +58,147 @@ def assessment(sha, finding_id, run_id, **changes):
     return AssessmentRecord(**{**values, **changes})
 
 
+def reconcile_labels(reporter):
+    async def reconcile():
+        issues = await reporter.project_repository_records("acme/repo")
+        return await reporter.reconcile_assessment_labels("acme/repo", issues)
+
+    return asyncio.run(reconcile())
+
+
+def labels(github, issue):
+    return {label["name"] for label in github["issues"][issue]["labels"]}
+
+
+def test_assessment_labels_conflicts_supersession_and_idempotence(records, github, monkeypatch):
+    store, reporter, sha, finding_id, run_id = records
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    issue = store.one("SELECT issue FROM findings")["issue"]
+    github["issues"][issue]["labels"].append({"name": "custom"})
+    review = assessment(sha, finding_id, run_id)
+    reporter.github.create_comment("acme/repo", issue, record_report(review))
+    assert reconcile_labels(reporter) == [issue]
+    assert labels(github, issue) == {
+        "maxwell",
+        "custom",
+        "maxwell:priority:P1",
+        "maxwell:state:reviewed",
+        "maxwell:review:supported",
+    }
+    audit = assessment(
+        sha,
+        finding_id,
+        run_id,
+        id="b" * 32,
+        role="auditor",
+        agent=PublicAgent(adapter="claude", model="audit-model", role="auditor"),
+        references=[review.id],
+        verdict="rejected",
+    )
+    reporter.github.create_comment("acme/repo", issue, record_report(audit))
+    assert reconcile_labels(reporter) == [issue]
+    assert labels(github, issue) >= {
+        "maxwell:state:audited",
+        "maxwell:review:supported",
+        "maxwell:audit:rejected",
+    }
+    other = assessment(sha, finding_id, run_id, id="c" * 32, verdict="rejected")
+    reporter.github.create_comment("acme/repo", issue, record_report(other))
+    reconcile_labels(reporter)
+    assert labels(github, issue) == {
+        "maxwell",
+        "custom",
+        "maxwell:priority:P1",
+        "maxwell:state:reviewed",
+        "maxwell:review:inconclusive",
+    }
+    replacement = assessment(sha, finding_id, run_id, id="d" * 32, supersedes=other.id)
+    reporter.github.create_comment("acme/repo", issue, record_report(replacement))
+    reconcile_labels(reporter)
+    assert "maxwell:review:supported" in labels(github, issue)
+    original = reporter.github.request
+
+    def no_writes(method, *args, **kwargs):
+        assert method == "GET"
+        return original(method, *args, **kwargs)
+
+    monkeypatch.setattr(reporter.github, "request", no_writes)
+    monkeypatch.setattr(reporter.github, "ensure_labels", lambda _: pytest.fail("Redundant labels"))
+    assert reconcile_labels(reporter) == []
+    assert github["issues"][issue]["state"] == "open"
+
+
+@pytest.mark.parametrize("invalid", ["edited", "missing", "unauthorized", "wrong_sha"])
+def test_assessment_labels_ignore_invalid_or_stale_records(records, github, invalid):
+    store, reporter, sha, finding_id, run_id = records
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    issue = store.one("SELECT issue FROM findings")["issue"]
+    record = assessment(sha, finding_id, run_id)
+    comment = reporter.github.create_comment("acme/repo", issue, record_report(record))
+    reconcile_labels(reporter)
+    if invalid == "edited":
+        comment["body"] = record_report(record.model_copy(update={"verdict": "rejected"}))
+    elif invalid == "missing":
+        github["comments"][issue] = []
+    elif invalid == "unauthorized":
+        comment["user"] = {"login": "outsider"}
+    else:
+        github["comments"][issue] = []
+        reporter.github.create_comment(
+            "acme/repo",
+            issue,
+            record_report(assessment("f" * 40, finding_id, run_id, id="b" * 32)),
+        )
+    if invalid in ("edited", "unauthorized"):
+        github["comments"][issue][0] = comment
+    reconcile_labels(reporter)
+    assert "maxwell:state:suspected" in labels(github, issue)
+    assert not any(
+        label.startswith(("maxwell:review:", "maxwell:audit:")) for label in labels(github, issue)
+    )
+
+
+@pytest.mark.parametrize("human_state", ["human-confirmed", "rejected"])
+def test_assessment_labels_preserve_human_state_and_issue_closure(records, github, human_state):
+    store, reporter, sha, finding_id, run_id = records
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    issue = store.one("SELECT issue FROM findings")["issue"]
+    github["issues"][issue]["labels"].append({"name": f"maxwell:state:{human_state}"})
+    github["issues"][issue]["state"] = "closed"
+    reporter.github.create_comment(
+        "acme/repo", issue, record_report(assessment(sha, finding_id, run_id))
+    )
+    reconcile_labels(reporter)
+    assert labels(github, issue) >= {f"maxwell:state:{human_state}", "maxwell:review:supported"}
+    assert not labels(github, issue).intersection(
+        {"maxwell:state:suspected", "maxwell:state:reviewed"}
+    )
+    assert github["issues"][issue]["state"] == "closed"
+
+
+def test_assessment_label_failure_is_reported_and_recoverable(records, github, monkeypatch):
+    store, reporter, sha, finding_id, run_id = records
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    issue = store.one("SELECT issue FROM findings")["issue"]
+    reporter.github.create_comment(
+        "acme/repo", issue, record_report(assessment(sha, finding_id, run_id))
+    )
+    original = reporter.github.request
+
+    def fail_labels(method, *args, **kwargs):
+        if method == "PATCH" and "labels" in kwargs.get("json", {}):
+            raise RuntimeError("Label update failed")
+        return original(method, *args, **kwargs)
+
+    monkeypatch.setattr(reporter.github, "request", fail_labels)
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    assert store.one("SELECT error FROM dashboards")["error"] == "Label update failed"
+    monkeypatch.setattr(reporter.github, "request", original)
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    assert store.one("SELECT error FROM dashboards")["error"] is None
+    assert "maxwell:state:reviewed" in labels(github, issue)
+
+
 def test_record_contract_rejects_private_identity_fields():
     with pytest.raises(ValidationError):
         PublicAgent(adapter="claude", model="m", role="reviewer", provider="private-work")

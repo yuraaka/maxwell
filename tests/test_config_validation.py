@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from maxwell.cli import execute, parser
-from maxwell.config import Paths
+from maxwell.config import Limits, Paths
 from maxwell.config_validation import validate_config
 from maxwell.store import Store
 
@@ -116,6 +116,23 @@ def test_invalid_publication_limits_are_reported(home, limit):
     report = validate_config(home, online=False)
     assert not report["valid"]
     assert "limits.max_findings_per_scan" in json.dumps(report)
+
+
+@pytest.mark.parametrize("setting", ["max_reviews_per_scan", "max_audits_per_scan"])
+def test_stage_limit_defaults_and_config_validation(home, setting):
+    assert getattr(Limits(), setting) == 1
+    update_config(home, lambda data: data["limits"].update({setting: 50}))
+    assert validate_config(home, online=False)["valid"]
+    assert getattr(home.load().limits, setting) == 50
+
+
+@pytest.mark.parametrize("setting", ["max_reviews_per_scan", "max_audits_per_scan"])
+@pytest.mark.parametrize("limit", [0, -1, 1.5])
+def test_invalid_stage_limits_are_reported(home, setting, limit):
+    update_config(home, lambda data: data["limits"].update({setting: limit}))
+    report = validate_config(home, online=False)
+    assert not report["valid"]
+    assert f"limits.{setting}" in json.dumps(report)
 
 
 def test_missing_config_has_nonzero_exit_and_does_not_initialize(directory):

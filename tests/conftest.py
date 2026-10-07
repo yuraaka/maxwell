@@ -92,6 +92,13 @@ result = {'summary': 'Completed discovery. ' + os.environ.get('CODEX_API_KEY', '
           'findings': [] if mode == 'empty' else [FINDING]}
 if 'ok' in json.loads(Path(args[args.index('--output-schema') + 1]).read_text())['properties']:
     result = {'ok': True}
+elif 'verdict' in json.loads(Path(args[args.index('--output-schema') + 1]).read_text())['properties']:
+    result = {'summary': 'Source investigation complete.', 'verdict': 'supported',
+              'actionability': 'actionable', 'priority': 'P1',
+              'evidence': 'app.py:2 divides by len(values), which is zero for an empty list.'}
+    assessment_file = Path(__file__).parent / 'assessment.json'
+    if assessment_file.exists():
+        result.update(json.loads(assessment_file.read_text()))
 output.write_text('not json' if mode == 'malformed' else json.dumps(result))
 print(json.dumps({'type': 'diagnostic', 'text': os.environ.get('CODEX_API_KEY', '')}), flush=True)
 if mode != 'unknown':

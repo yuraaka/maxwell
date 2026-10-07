@@ -6,11 +6,14 @@ import logging
 import os
 import signal
 import time
+import uuid
 
+from maxwell.assessment import AssessmentTarget, assessment_prompt
 from maxwell.config import Limits, ProviderSettings
 from maxwell.contracts import Usage, estimate_cost, micros
 from maxwell.github import GitHub
 from maxwell.provider import create_provider, discovery_prompt
+from maxwell.records import AssessmentRecord, public_agent
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
 from maxwell.repositories import Repository, stop_orphan
 from maxwell.selection import select_candidates
@@ -156,6 +159,10 @@ class Daemon:
         state, summary, error, findings, cost = "failed", "Discovery failed.", None, [], None
         usage = Usage()
         selection = None
+        publications = []
+        stage_label = (
+            "Discovery" if job.get("stage", "discovery") == "discovery" else job["stage"].title()
+        )
         try:
             if not job.get("execution"):
                 record = self.store.one(
@@ -164,8 +171,16 @@ class Daemon:
                 route = self.config.route()
                 job = self.store.bind_execution(job["id"], self.config.execution(route, record))
             execution = json.loads(job["execution"])
-            if execution["stage"] != "discovery":
-                raise ValueError("Only discovery execution is implemented")
+            stage = execution["stage"]
+            if stage not in ("discovery", "review", "audit"):
+                raise ValueError("Only hunt, review, and audit execution are implemented")
+            target = (
+                AssessmentTarget.model_validate(execution["target"])
+                if stage != "discovery"
+                else None
+            )
+            if target and target.finding.repository != job["repository"]:
+                raise ValueError("Assessment input belongs to a different repository")
             record = execution["repository"]
             settings = ProviderSettings.model_validate(execution["settings"])
             name = self.config.provider_name(execution["provider"])
@@ -189,7 +204,13 @@ class Daemon:
                     f"Configure a token for GitHub account {record['github_account']!r}"
                 )
             progress("preparing repository")
-            sha, worktree = await asyncio.to_thread(repository.prepare, job["id"], token)
+            if target:
+                sha, worktree = await asyncio.to_thread(
+                    repository.prepare, job["id"], token, revision=target.finding.sha
+                )
+                target.finding.finding.validate_location(worktree)
+            else:
+                sha, worktree = await asyncio.to_thread(repository.prepare, job["id"], token)
             progress(f"source ready at {sha[:12]}")
             with self.store.db:
                 self.store.db.execute("UPDATE scans SET sha=? WHERE id=?", (sha, job["id"]))
@@ -201,21 +222,24 @@ class Daemon:
             if previous and not job["forced"]:
                 state, summary, cost = "skipped", "Revision already scanned; no model call.", 0
             else:
-                progress("loading existing issues from GitHub")
-                client = GitHub(access)
-                try:
-                    known, remote_identities = await Reporter(
-                        self.store, client, self.config, self.paths
-                    ).discovery_context(job["repository"])
-                finally:
-                    client.close()
-                prompt = discovery_prompt(
-                    job["repository"],
-                    sha,
-                    scan_config.limits.max_findings_per_scan,
-                    known,
-                    candidate_limit=scan_config.limits.max_candidates_per_scan,
-                )
+                if target:
+                    prompt = assessment_prompt(job["repository"], stage, target)
+                else:
+                    progress("loading existing issues from GitHub")
+                    client = GitHub(access)
+                    try:
+                        known, remote_identities = await Reporter(
+                            self.store, client, self.config, self.paths
+                        ).discovery_context(job["repository"])
+                    finally:
+                        client.close()
+                    prompt = discovery_prompt(
+                        job["repository"],
+                        sha,
+                        scan_config.limits.max_findings_per_scan,
+                        known,
+                        candidate_limit=scan_config.limits.max_candidates_per_scan,
+                    )
                 (artifact / "prompt.txt").write_text(self.config.redact(prompt))
                 policy = execution or self.config.model_dump(mode="json")
                 (artifact / "policy.json").write_text(
@@ -233,45 +257,79 @@ class Daemon:
                     progress("agent running")
 
                 progress("starting agent")
-                result = await provider.scan(worktree, artifact, prompt, started)
-                if len(result.findings) > scan_config.limits.max_candidates_per_scan:
+                run = provider.assess if target else provider.scan
+                result = await run(worktree, artifact, prompt, started)
+                if not target and len(result.findings) > scan_config.limits.max_candidates_per_scan:
                     raise ValueError("Provider exceeded limits.max_candidates_per_scan")
-                progress(f"validating {len(result.findings)} candidate findings")
+                progress(
+                    "validating assessment"
+                    if target
+                    else f"validating {len(result.findings)} candidate findings"
+                )
                 if not await asyncio.to_thread(repository.unchanged, worktree, sha):
-                    raise ValueError("Discovery modified its worktree; findings rejected")
-                slots = (
-                    scan_config.limits.human_queue_max
-                    - self.store.one(
-                        "SELECT COUNT(*) AS n FROM findings WHERE repository=? AND state NOT IN ('closed','confirmed','rejected')",
-                        (job["repository"],),
-                    )["n"]
-                )
-                progress(f"ranking {len(result.findings)} candidates")
-                selected, observations, selection = select_candidates(
-                    result.findings,
-                    job["repository"],
-                    worktree,
-                    publication_limit=scan_config.limits.max_findings_per_scan,
-                    slots=slots,
-                    minimum_confidence=scan_config.limits.minimum_confidence,
-                    local_ids={
-                        row["id"]
-                        for row in self.store.rows(
-                            "SELECT id FROM findings WHERE repository=?", (job["repository"],)
-                        )
-                    },
-                    remote_ids=remote_identities,
-                )
-                findings = selected + observations
-                progress(f"selected {selection.selected} candidates; skipped {selection.skipped}")
+                    raise ValueError(f"{stage_label} modified its worktree; results rejected")
+                if target:
+                    assessment = AssessmentRecord(
+                        id=uuid.uuid4().hex,
+                        repository=job["repository"],
+                        finding_id=target.finding.id,
+                        sha=sha,
+                        role="reviewer" if stage == "review" else "auditor",
+                        agent=public_agent(job),
+                        execution_id=job["id"],
+                        verdict=result.verdict,
+                        actionability=result.actionability,
+                        priority=result.priority,
+                        evidence=result.evidence,
+                        supersedes=target.previous.id if target.previous else None,
+                        references=[review.id for review in target.reviews],
+                    )
+                    publications = [(assessment, target.issue)]
+                else:
+                    slots = (
+                        scan_config.limits.human_queue_max
+                        - self.store.one(
+                            "SELECT COUNT(*) AS n FROM findings WHERE repository=? AND state NOT IN ('closed','confirmed','rejected')",
+                            (job["repository"],),
+                        )["n"]
+                    )
+                    progress(f"ranking {len(result.findings)} candidates")
+                    selected, observations, selection = select_candidates(
+                        result.findings,
+                        job["repository"],
+                        worktree,
+                        publication_limit=scan_config.limits.max_findings_per_scan,
+                        slots=slots,
+                        minimum_confidence=scan_config.limits.minimum_confidence,
+                        local_ids={
+                            row["id"]
+                            for row in self.store.rows(
+                                "SELECT id FROM findings WHERE repository=?", (job["repository"],)
+                            )
+                        },
+                        remote_ids=remote_identities,
+                    )
+                    findings = selected + observations
+                    progress(
+                        f"selected {selection.selected} candidates; skipped {selection.skipped}"
+                    )
                 state, summary = "completed", result.summary
+                if target:
+                    summary = (
+                        f"Verdict: **{result.verdict}**; actionability: {result.actionability}.\n\n"
+                        + result.summary
+                    )[:6000]
         except asyncio.CancelledError:
-            state, summary, error = "cancelled", "Discovery cancelled during shutdown.", "Cancelled"
+            state, summary, error = (
+                "cancelled",
+                f"{stage_label} cancelled during shutdown.",
+                "Cancelled",
+            )
             findings = []
         except Exception as exc:
             findings = []
             error = self.config.redact(str(exc))[:2000]
-            summary = f"Discovery failed: {error}"
+            summary = f"{stage_label} failed: {error}"
             self.log.warning("Scan %s failed: %s", job["id"], error)
         finally:
             if provider is not None and provider.started:
@@ -290,6 +348,7 @@ class Daemon:
                 findings,
                 error,
                 selection=selection if state == "completed" else None,
+                publications=publications if state == "completed" else (),
             )
             current = self.store.one("SELECT * FROM scans WHERE id=?", (job["id"],))
             (artifact / "summary.json").write_text(json.dumps(current, indent=2))

@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, ScanResult, Usage
+from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, AssessmentResult, ScanResult, Usage
 from maxwell.provider_runtime import codex_connection_overrides, redact, runtime_environment
 from maxwell.repositories import terminate
 
@@ -35,6 +35,9 @@ class CLIProvider:
 
     async def scan(self, workspace, artifact, prompt, on_start):
         return await self.run(workspace, artifact, prompt, on_start)
+
+    async def assess(self, workspace, artifact, prompt, on_start):
+        return await self.run(workspace, artifact, prompt, on_start, result_type=AssessmentResult)
 
     async def probe(self, workspace, artifact):
         try:

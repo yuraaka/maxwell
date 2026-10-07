@@ -75,6 +75,15 @@ class SelectionStats(BaseModel):
         return self
 
 
+class AssessmentResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    summary: str = Field(min_length=1, max_length=6000)
+    verdict: Literal["supported", "rejected", "inconclusive"]
+    actionability: Literal["actionable", "not_actionable", "unknown"]
+    priority: Literal["P0", "P1", "P2", "P3"] | None
+    evidence: str = Field(min_length=20, max_length=6000)
+
+
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     cached_input_tokens: int = Field(default=0, ge=0)

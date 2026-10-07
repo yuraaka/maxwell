@@ -66,9 +66,20 @@ class GitHub:
         labels = {
             "maxwell": "8250df",
             "maxwell:state:suspected": "fbca04",
+            "maxwell:state:reviewed": "1d76db",
+            "maxwell:state:audited": "5319e7",
             "maxwell:state:human-confirmed": "0e8a16",
             "maxwell:state:rejected": "eeeeee",
             **{f"maxwell:priority:P{i}": "d4c5f9" for i in range(4)},
+            **{
+                f"maxwell:{stage}:{verdict}": color
+                for stage in ("review", "audit")
+                for verdict, color in (
+                    ("supported", "0e8a16"),
+                    ("rejected", "eeeeee"),
+                    ("inconclusive", "fbca04"),
+                )
+            },
         }
         for name, color in labels.items():
             response = self.client.post(f"repos/{repo}/labels", json={"name": name, "color": color})

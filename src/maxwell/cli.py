@@ -1,16 +1,19 @@
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
+import argcomplete
 import httpx
 
 from maxwell import __version__
 from maxwell.cli_help import TreeParser
 from maxwell.cli_output import check_line, color, model_lines, output, scan_line
+from maxwell.completion import bash_completion, configure_completion
 from maxwell.config import Paths
 from maxwell.config_apply import apply_config
 from maxwell.github import GitHub
@@ -37,14 +40,23 @@ def add_command(commands, name, **options):
     return command
 
 
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("Use a positive integer")
+    return number
+
+
 def parser():
-    root = TreeParser(prog="maxwell", description="Manual repository discovery")
+    root = TreeParser(prog="maxwell", description="Manual repository hunting, review, and audit")
     root.add_argument("--version", action="version", version=f"maxwell {__version__}")
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     root.add_argument(
         "--json", action="store_true", help="Print JSON instead of human-readable output"
     )
     commands = root.add_subparsers(dest="command", required=True)
+    completion = add_command(commands, "completion", help="Generate shell completion")
+    completion.add_argument("shell", choices=["bash"], nargs="?", default="bash")
     config = add_command(commands, "config", help="Initialize or apply configuration")
     config_commands = config.add_subparsers(dest="config_command", required=True)
     add_command(config_commands, "init", help="Create private configuration and runtime files")
@@ -81,14 +93,23 @@ def parser():
     )
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
-    scan = add_command(commands, "scan", help="Run discovery now and publish findings")
+    scan = add_command(commands, "scan", help="Run hunting, review, or audit and publish results")
     scan.add_argument("repository", nargs="?")
+    scan.add_argument("--stage", choices=["hunt", "review", "audit"], default="hunt")
+    scan.add_argument("--issue", type=positive_int, help="Finding issue to review or audit")
+    scan.add_argument(
+        "--limit",
+        type=positive_int,
+        help="Override the stage's configured assessment limit per repository",
+    )
+    scan.add_argument("--force", action="store_true", help="Reassess an already assessed finding")
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
-    scan.add_argument("--model", required=True, help="Model to use for this manual discovery run")
+    scan.add_argument("--model", required=True, help="Model to use for this stage")
     scan.add_argument(
         "--effort", help="Reasoning effort for this run; 'default' uses the provider default"
     )
     scan.add_argument("--provider", help="Connection to use; required with multiple providers")
+    configure_completion(root)
     return root
 
 
@@ -170,6 +191,13 @@ def execute(args):
     def emit(value):
         output(value, args)
 
+    if args.command == "completion":
+        script = bash_completion()
+        if args.json:
+            print(json.dumps({"shell": args.shell, "script": script}))
+        else:
+            print(script, end="")
+        return
     paths = Paths(args.home)
     if args.command == "config" and args.config_command == "apply":
         if not args.json:
@@ -224,6 +252,10 @@ def execute(args):
                 provider=args.provider,
                 effort=args.effort,
                 priority=int(args.priority[1]),
+                stage=args.stage,
+                issue=args.issue,
+                limit=args.limit,
+                force=args.force,
                 on_progress=None if args.json else scan_line,
             )
         )
@@ -234,12 +266,18 @@ def execute(args):
 
 def main():
     cli = parser()
+    argcomplete.autocomplete(cli)
     if len(sys.argv) == 1:
         cli.print_help()
         return
     args = cli.parse_args()
     try:
         execute(args)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        raise SystemExit(1)
     except KeyboardInterrupt:
         raise SystemExit(130)
     except asyncio.CancelledError:

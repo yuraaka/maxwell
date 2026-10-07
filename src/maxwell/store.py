@@ -213,6 +213,10 @@ class Store:
                     )
 
     def queue_record(self, record, issue):
+        with self.db:
+            self._queue_record(record, issue)
+
+    def _queue_record(self, record, issue):
         record = RECORD_ADAPTER.validate_python(record)
         if record.type == "finding":
             raise ValueError("Findings are published as issues, not comments")
@@ -225,18 +229,17 @@ class Store:
             if not finding or finding["id"] != record.finding_id:
                 raise ValueError("Assessment must be published on its finding issue")
         data = record.model_dump_json()
-        with self.db:
-            existing = self.one(
-                "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",
-                (record.repository, record.type, record.id),
-            )
-            if existing and existing != {"issue": issue, "data": data}:
-                raise ValueError("Published records are immutable; use a new superseding record")
-            self.db.execute(
-                "INSERT OR IGNORE INTO record_publications(repository,type,id,issue,data) "
-                "VALUES(?,?,?,?,?)",
-                (record.repository, record.type, record.id, issue, data),
-            )
+        existing = self.one(
+            "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",
+            (record.repository, record.type, record.id),
+        )
+        if existing and existing != {"issue": issue, "data": data}:
+            raise ValueError("Published records are immutable; use a new superseding record")
+        self.db.execute(
+            "INSERT OR IGNORE INTO record_publications(repository,type,id,issue,data) "
+            "VALUES(?,?,?,?,?)",
+            (record.repository, record.type, record.id, issue, data),
+        )
 
     def save_stage_execution(self, execution):
         execution = StageExecution.model_validate(execution)
@@ -477,14 +480,14 @@ class Store:
         return scans + stages
 
     def admission_blockers(self, identifier, daily_limit, reservation, queue_max, daily_scan_limit):
-        job = self.one("SELECT repository,accounting FROM scans WHERE id=?", (identifier,))
+        job = self.one("SELECT repository,accounting,stage FROM scans WHERE id=?", (identifier,))
         pending = self.one(
             "SELECT COUNT(*) AS n FROM findings WHERE repository=? "
             "AND state NOT IN ('closed','confirmed','rejected')",
             (job["repository"],),
         )["n"]
         reasons = []
-        if pending >= queue_max:
+        if job["stage"] == "discovery" and pending >= queue_max:
             reasons.append(
                 f"Human review queue is full: {pending}/{queue_max} unresolved findings. "
                 "Close reviewed finding issues on GitHub, or increase limits.human_queue_max"
@@ -522,8 +525,8 @@ class Store:
                 SELECT s.* FROM scans s JOIN repositories r ON r.name=s.repository
                 WHERE s.state='queued' AND (? OR r.paused=0) AND
                   (? IS NULL OR s.id=?) AND
-                  (SELECT COUNT(*) FROM findings f WHERE f.repository=r.name
-                   AND f.state NOT IN ('closed','rejected','confirmed')) < ?
+                  (s.stage!='discovery' OR (SELECT COUNT(*) FROM findings f WHERE f.repository=r.name
+                   AND f.state NOT IN ('closed','rejected','confirmed')) < ?)
                 ORDER BY CASE WHEN priority=0 THEN -1000 ELSE
                     priority - MIN(3, (?-created)/86400.0) END, created
             """,
@@ -568,11 +571,25 @@ class Store:
             )
             self.event("scan_blocked", {"id": identifier, "error": error})
 
-    def finish(self, job, state, summary, usage, cost, findings=(), error=None, *, selection=None):
+    def finish(
+        self,
+        job,
+        state,
+        summary,
+        usage,
+        cost,
+        findings=(),
+        error=None,
+        *,
+        selection=None,
+        publications=(),
+    ):
         with self.db:
             current = self.one("SELECT state,lease FROM scans WHERE id=?", (job["id"],))
             if current != {"state": "running", "lease": job["lease"]}:
                 raise ValueError("Stale scan result")
+            for record, issue in publications:
+                self._queue_record(record, issue)
             admitted = []
             for finding in findings:
                 identity = finding.identity(job["repository"])
@@ -609,7 +626,7 @@ class Store:
                     job["id"],
                 ),
             )
-            if state == "completed":
+            if state == "completed" and job.get("stage", "discovery") == "discovery":
                 self.db.execute(
                     "UPDATE repositories SET last_sha=(SELECT sha FROM scans WHERE id=?) WHERE name=?",
                     (job["id"], job["repository"]),

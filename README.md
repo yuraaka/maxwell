@@ -1,8 +1,9 @@
 # Maxwell
 
-Maxwell runs repository discovery manually from your terminal. Milestone 1 runs a discovery agent
-against committed source snapshots, creates deduplicated **suspected** findings as
-GitHub issues, and reports token usage. It does not reproduce, fix, or merge changes yet.
+Maxwell runs hunting, review, and audit manually from your terminal. Hunting inspects
+committed source snapshots and creates deduplicated **suspected** findings as GitHub issues.
+Review and audit publish independent source assessments and report token usage per execution.
+Maxwell does not reproduce, fix, or merge changes yet.
 
 ## Install
 
@@ -22,6 +23,32 @@ For development, use `uv sync --group dev` and `uv run maxwell ...` instead.
 All application configuration and runtime data live under `~/.maxwell`.
 `--home /some/private/directory` overrides that root; put it before the command.
 The installed executable follows your Python tool manager's usual location.
+
+## Bash completion
+
+Enable completion in the current Bash session:
+
+```bash
+eval "$(maxwell completion bash)"
+```
+
+Add that line to `~/.bashrc` to enable it in future interactive sessions. Command
+substitution reads the complete script before evaluating it and also works with Bash 3.2.
+If upgrading
+an existing editable installation, refresh its dependencies first with
+`uv tool install --editable . --force` from the Maxwell checkout.
+
+Completion covers commands, subcommands, options, stages, priorities, registered
+repositories, GitHub account names, and local provider aliases. After selecting
+`--provider`, `--model` suggestions follow that provider's configured catalog and
+locally cached models. `--effort` suggestions follow the selected provider/model's
+configured or cached capabilities, including `default` to use the provider default.
+Without a selected provider, suggestions combine the configured connections.
+
+Completion honors `--home` and only reads local configuration and SQLite; pressing
+Tab never contacts GitHub or a model provider. Configured models work before the first
+apply; run `maxwell config apply` to refresh discovered model/effort suggestions.
+Missing or invalid configuration still allows command, option, and stage completion.
 
 ## Configure
 
@@ -290,10 +317,63 @@ refresh can work.
 Repository-level provider/model/effort routes have been removed. Existing databases
 migrate automatically, retaining repositories and historical execution snapshots.
 `repo add` and `repo change` no longer accept `--provider`, `--model`, `--effort`, or
-`--stage`. Review, reproduction, fix, and validation execution are later milestones;
-`scan` executes discovery only.
+`--stage`. Stage selection belongs to `scan`; reproduction, fix, and validation
+execution are later milestones.
 
-`scan` requests a fresh inspection even when the revision is unchanged. Each scan
+Use `scan --stage hunt|review|audit` to execute one stage at a time. `hunt` is the
+default, so existing scan commands retain their behavior:
+
+```bash
+maxwell scan owner/repo --stage hunt --provider codex-work --model your-hunter-model
+maxwell scan owner/repo --stage review --provider claude-work --model your-reviewer-model --effort high
+maxwell scan owner/repo --stage audit --provider codex-work --model your-auditor-model --effort high
+```
+
+Provider aliases select local connections; published identities use `codex` or `claude`.
+Each assessment uses a fresh agent execution with explicit model/provider/effort selection.
+The reviewer receives the finding evidence, without hunter confidence or agent identity.
+The auditor also receives the current review verdicts and evidence, without reviewer identity.
+Using different capable models is recommended, but Maxwell does not enforce different models.
+
+Review selects open structured finding issues without a current reviewer assessment;
+audit selects reviewed findings without an audit referencing their current reviews.
+Both fetch records from GitHub and prioritize findings by P0–P3, then issue number.
+Assessment counts per repository come from `limits.max_reviews_per_scan` and
+`limits.max_audits_per_scan`, both defaulting to 1. `--limit N` overrides the selected
+stage's setting for that run. Both settings accept any positive integer:
+
+```yaml
+limits:
+  max_reviews_per_scan: 10
+  max_audits_per_scan: 3
+```
+
+Each finding has a separate execution, token record, and assessment comment.
+Audit selection is explicit and deterministic; automatic audit sampling is not implemented.
+
+Use `--issue N` with a repository to target one finding, including a closed issue.
+Use `--force` to reassess and supersede a previous assessment while retaining its record.
+Inconclusive assessments also require `--force` to retry. A new review makes that finding
+eligible for another audit. `--issue`, `--limit`, and `--force` apply only to review/audit;
+hunting uses `limits.max_findings_per_scan` for its publication limit.
+When no findings are eligible, the command succeeds without starting an agent.
+
+Review and audit inspect the finding's original pinned SHA, even if the branch has moved.
+They do not update maintained checkouts, execute tests, or reproduce failures. Verdicts are
+`supported`, `rejected`, or `inconclusive`; actionability and priority are reported separately.
+Supported means source evidence supports the suspected defect, not that it was reproduced.
+These stages do not close issues or turn reviewer agreement into a reputation score.
+Labels follow current GitHub assessments: `maxwell:state:reviewed` with
+`maxwell:review:supported|rejected|inconclusive`, then `maxwell:state:audited` with
+the corresponding `maxwell:audit:*` verdict. Conflicting current verdicts are inconclusive.
+Superseded, edited, missing, unauthorized, and wrong-revision assessments do not drive labels;
+an audit becomes stale when its referenced reviews change. Synchronization and repeat
+review/audit commands reconcile labels even when no agent is needed. Human state labels
+and unrelated labels are preserved.
+The human review queue limit applies only to hunting; daily budget/execution limits still
+apply to every stage. Reports, terminal progress, and `--json` identify the selected stage.
+
+`scan --stage hunt` requests a fresh inspection even when the revision is unchanged. Each hunt
 currently inspects a whole pinned revision rather than only a diff. Discovery asks the agent to
 map components, sweep correctness, configuration, recovery, resource handling, security,
 and maintenance defects, then review interactions. It collects up to
@@ -340,7 +420,7 @@ with recorded scan results, discovery token usage, and hunter assessments. You c
 this issue in GitHub. Cancelled or blocked runs are included in the next publication pass.
 
 Each finding includes its scanned SHA, location, source evidence, expected behavior,
-confidence, priority, and the originating execution ID. Findings are explicitly suspected;
+confidence, priority, and the originating execution ID. New findings start as suspected;
 an LLM's confidence is not independent verification.
 
 New finding issues and completed scan comments also include versioned machine-readable
@@ -368,12 +448,14 @@ assessments. Execution status and GitHub issue closure remain separate from vali
 Assessment publication is append-only: conflicting records are not overwritten, and
 ambiguous comment creation is reconciled before any further write.
 
-These contracts and projections are the foundation for later reviewer and auditor
-stages. Scans still execute discovery only; structured assessments do not yet change
-ratings, queue eligibility, or trigger repairs. Measurement records can describe pinned
+These contracts and projections support the reviewer and auditor stages. Structured
+assessments determine review/audit eligibility, but do not yet change ratings or trigger
+repairs. Measurement records can describe pinned
 factors, coverage, exclusions, and analyzer/policy versions, but measurement adapters
 and entropy calculation are not implemented yet. Existing issue bodies and scan reports
 without structured records remain compatible and are not retroactively assigned evidence.
+Review and audit require a current structured finding record; legacy issues without one
+are skipped in bulk runs and produce an explanatory error when targeted explicitly.
 
 GitHub comment commands are not processed during manual runs. Closing an issue
 directly removes it from the review queue on the next manual scan, but
@@ -488,11 +570,11 @@ created. Focused tests own edge cases; the end-to-end test exercises the integra
 
 ## Next milestones
 
-1. Manual discovery and issue publication — this release.
+1. Manual hunting, source review, audit, and issue/assessment publication — this release.
 2. Independent tester/reproducer consuming discovery issues.
 3. Fixer consuming confirmed issues and producing patches.
 4. Independent validator, integration checks, and GitHub-based merge approval.
 
 The durable issue/artifact handoffs remain the boundary between agents. Add measured
-Entropy, richer stage ratings, further provider adapters, and optional GitHub Pages
+Entropy, sampled audits and evidence-based stage ratings, further provider adapters, and optional GitHub Pages
 reporting as the necessary evidence and capabilities become available.

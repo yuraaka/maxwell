@@ -5,6 +5,7 @@ import re
 import shlex
 import time
 
+from maxwell.assessment import current_assessments
 from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, SelectionStats
 from maxwell.github import PublicationUncertain
 from maxwell.records import (
@@ -37,8 +38,15 @@ def scan_report(scan, finding_ids=()):
     tokens = token_summary(usage)
     agent = public_agent(scan)
     identity = agent.display() if agent else "Unknown legacy agent"
+    stage = scan.get("stage", "discovery")
+    label = "Discovery" if stage == "discovery" else stage.title()
+    result = (
+        f"{scan['admitted']} new candidates"
+        if stage == "discovery"
+        else "Source assessment; not reproduced"
+    )
     body = f"""<!-- maxwell:scan:{scan["id"]} -->
-### Discovery scan `{scan["id"][:12]}` — {scan["state"]}
+### {label} scan `{scan["id"][:12]}` — {scan["state"]}
 
 {scan["summary"] or ""}
 
@@ -47,7 +55,7 @@ Agent: `{identity}`
 
 | Stage | Token usage | Result |
 | --- | --- | --- |
-| Discovery | {tokens} | {scan["admitted"]} new candidates |
+| {label} | {tokens} | {result} |
 | Reproduction | Not run | Later milestone |
 | Fixing | Not run | Later milestone |
 | Validation / integration | Not run | Later milestone |
@@ -57,6 +65,15 @@ Usage complete: {usage.get("complete", False)}.
 Cached input and cache writes are included in input; total is input plus output.
 Missing usage is unknown, not zero. Tokens are recorded once per execution, not per finding.
 """
+    execution = json.loads(scan.get("execution") or "{}")
+    if target := execution.get("target"):
+        body += f"\nFinding issue: #{target['issue']}; finding: `{target['finding']['id']}`.\n"
+        if target.get("reviews"):
+            body += (
+                "Referenced reviews: "
+                + ", ".join(f"`{item['id']}`" for item in target["reviews"])
+                + ".\n"
+            )
     if scan.get("selection"):
         selection = SelectionStats.model_validate_json(scan["selection"])
         execution = json.loads(scan.get("execution") or "{}")
@@ -244,6 +261,71 @@ class Reporter:
             if row["issue"] not in seen:
                 self.store.reconcile_records(repo, row["issue"], set())
         return issues
+
+    async def reconcile_assessment_labels(self, repo, issues):
+        remote = {issue["number"]: issue for issue in issues if "pull_request" not in issue}
+        managed_states = {
+            "maxwell:state:suspected",
+            "maxwell:state:reviewed",
+            "maxwell:state:audited",
+        }
+        updated = []
+        for row in self.store.rows(
+            "SELECT issue,data FROM github_records WHERE repository=? "
+            "AND type='finding' AND status='current'",
+            (repo,),
+        ):
+            issue = remote.get(row["issue"])
+            finding = RECORD_ADAPTER.validate_json(row["data"])
+            if not issue or finding.finding.identity(repo) != finding.id:
+                continue
+            reviews, audits = current_assessments(self.store, repo, row["issue"], finding)
+            assessment_labels = set()
+            for stage, records in (("review", reviews), ("audit", audits)):
+                if records:
+                    verdicts = {record.verdict for record in records}
+                    verdict = next(iter(verdicts)) if len(verdicts) == 1 else "inconclusive"
+                    assessment_labels.add(f"maxwell:{stage}:{verdict}")
+            state = "audited" if audits else "reviewed" if reviews else "suspected"
+
+            def desired_labels(source):
+                labels = {label["name"] for label in source.get("labels", [])}
+                retained = {
+                    label
+                    for label in labels
+                    if label not in managed_states
+                    and not label.startswith(("maxwell:review:", "maxwell:audit:"))
+                }
+                if not retained.intersection(
+                    {"maxwell:state:human-confirmed", "maxwell:state:rejected"}
+                ):
+                    retained.add(f"maxwell:state:{state}")
+                return labels, retained | assessment_labels
+
+            before, desired = desired_labels(issue)
+            if before == desired:
+                continue
+            current = await self.call(
+                self.github.request, "GET", f"repos/{repo}/issues/{row['issue']}"
+            )
+            if current.get("body") != issue.get("body"):
+                raise ValueError(
+                    "Finding changed during label reconciliation; retry synchronization"
+                )
+            before, desired = desired_labels(current)
+            if before == desired:
+                continue
+            if repo not in self.labels_ready:
+                await self.call(self.github.ensure_labels, repo)
+                self.labels_ready.add(repo)
+            await self.call(
+                self.github.request,
+                "PATCH",
+                f"repos/{repo}/issues/{row['issue']}",
+                json={"labels": sorted(desired)},
+            )
+            updated.append(row["issue"])
+        return updated
 
     async def discovery_context(self, repo):
         issues = await self.project_repository_records(repo)
@@ -533,7 +615,7 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         body = f"""{marker}
 # Maxwell status
 
-Milestone 1: discovery only. Findings remain suspected until human assessment or future reproduction.
+Hunting, review, and audit use separate executions. Source assessments do not imply reproduction.
 
 | Metric | Value |
 | --- | --- |
@@ -766,12 +848,14 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
         ):
             name = repo["name"]
             try:
+                await self.publish_records(name)
+                await self.project_repository_records(name)
                 issue = await self.dashboard(name)
                 if issue and process_commands:
                     await self.commands(name, issue)
                 await self.refresh_findings(name, process_commands=process_commands)
-                await self.publish_records(name)
-                await self.project_repository_records(name)
+                issues = await self.project_repository_records(name)
+                await self.reconcile_assessment_labels(name, issues)
                 with self.store.db:
                     self.store.db.execute(
                         "UPDATE dashboards SET error=NULL WHERE repository=?", (name,)

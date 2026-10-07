@@ -52,8 +52,9 @@ def scan_line(scan):
         )
     elif scan["state"] == "running":
         effort = f" / {scan['effort']}" if scan.get("effort") else ""
+        stage = f" / {scan['stage']}" if scan.get("stage") in ("review", "audit") else ""
         print(
-            f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}",
+            f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}{stage}",
             flush=True,
         )
     elif scan["state"] == "publishing":
@@ -68,6 +69,9 @@ def scan_line(scan):
         )
         if success and scan.get("selection"):
             detail += f"; {scan['selection']['skipped']} candidates skipped"
+        if success and scan.get("stage") in ("review", "audit"):
+            verdicts = ", ".join(item["verdict"] for item in scan.get("assessments", []))
+            detail = f"{scan['stage']}: {verdicts or 'no assessment'}"
         print(f"{badge} {name}: {detail}", flush=True)
 
 
@@ -203,15 +207,23 @@ def human_lines(value, command, repo_command=None):
         lines[0] = f"{verb} {lines[0]}"
         return lines
     if command == "scan":
-        if not value["scans"]:
+        skipped = [
+            f"{item['repository']}: no eligible findings for {item['stage']}."
+            for item in value.get("skipped", [])
+        ]
+        if not value["scans"] and not skipped:
             return ["No repositories to scan."]
-        lines = []
+        lines = skipped
         for scan in value["scans"]:
             if scan["report"]:
                 lines.append(f"Report: {scan['report']}")
             for finding in scan["findings"]:
                 if finding["url"]:
                     lines.append(f"Finding: {finding['url']}")
+            for assessment in scan.get("assessments", []):
+                lines.append(
+                    f"Assessment: https://github.com/{scan['repository']}/issues/{assessment['issue']}"
+                )
         return lines
     return []
 

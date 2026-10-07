@@ -98,6 +98,10 @@ result = {'summary': 'Native discovery ' + os.environ.get('COMPANY_GATEWAY_TOKEN
               if (home / 'findings.json').exists() else [FINDING]}
 if probe:
     result = {'ok': mode != 'invalid-probe'}
+elif 'verdict' in schema['properties']:
+    result = {'summary': 'Source investigation complete.', 'verdict': 'supported',
+              'actionability': 'actionable', 'priority': 'P1',
+              'evidence': 'app.py:2 divides by len(values), which is zero for an empty list.'}
 if mode == 'probe-error':
     message = 'Model access denied ' + os.environ.get('COMPANY_GATEWAY_TOKEN', '')
     if codex:
@@ -431,6 +435,43 @@ def test_provider_rejects_results_over_configured_candidate_limit(native_daemon,
     assert scan["state"] == "failed"
     assert scan["admitted"] == 0 and scan["selection"] is None
     assert "at most 1 item" in scan["error"]
+
+
+@pytest.mark.parametrize("provider", ["first", "claude"])
+def test_review_and_audit_use_both_provider_adapters(native_daemon, home, capsys, provider):
+    daemon, _ = native_daemon
+    for stage in ("hunt", "review", "audit"):
+        execute(
+            parser().parse_args(
+                [
+                    "--home",
+                    str(home.root),
+                    "scan",
+                    "acme/repo",
+                    "--stage",
+                    stage,
+                    "--provider",
+                    provider,
+                    "--model",
+                    "chosen-model",
+                    "--effort",
+                    "high",
+                    "--json",
+                ]
+            )
+        )
+        result = json.loads(capsys.readouterr().out)
+        assert result["valid"], result
+        scan = result["scans"][0]
+        assert scan["stage"] == stage and scan["effort"] == "high"
+        if stage != "hunt":
+            assert scan["assessments"][0]["agent"]["adapter"] == (
+                "codex" if provider == "first" else "claude"
+            )
+            assert scan["assessments"][0]["verdict"] == "supported"
+            assert scan["usage"]["cache_write_tokens"] == (0 if provider == "first" else 100)
+            assert scan["accounting"] == "tokens"
+    assert daemon.store.one("SELECT COUNT(*) AS n FROM scans")["n"] == 3
 
 
 def test_codex_profile_resolves_model_and_gateway_and_is_passed_to_cli(

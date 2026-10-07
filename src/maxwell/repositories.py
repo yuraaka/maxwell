@@ -143,7 +143,7 @@ class Repository:
             git("switch", "--no-track", "--no-overwrite-ignore", "-c", ref, sha, cwd=directory)
         return directory
 
-    def prepare(self, scan_id, token=None):
+    def prepare(self, scan_id, token=None, *, revision=None):
         self.worktrees.mkdir(parents=True, exist_ok=True)
         if not self.mirror.exists():
             git("init", "--bare", str(self.mirror))
@@ -151,8 +151,10 @@ class Repository:
         source = self.record["source"]
         if remote and source != f"https://github.com/{github_name(self.record['name'])}.git":
             raise ValueError("Remote source does not match the registered GitHub repository")
-        ref = self.record["ref"]
-        if self.record.get("directory") is not None:
+        ref = revision or self.record["ref"]
+        if revision is not None and not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", revision):
+            raise ValueError("Assessment requires a pinned commit SHA")
+        if revision is None and self.record.get("directory") is not None:
             source = self.update_checkout(token)
             ref, remote = f"refs/heads/{ref}", False
         git(
@@ -166,6 +168,8 @@ class Repository:
             token=token if remote else None,
         )
         sha = git("-C", str(self.mirror), "rev-parse", "FETCH_HEAD^{commit}")
+        if revision is not None and sha != revision:
+            raise ValueError("Fetched revision does not match the assessment input")
         worktree = self.worktrees / scan_id
         git("-C", str(self.mirror), "worktree", "add", "--detach", str(worktree), sha)
         return sha, worktree

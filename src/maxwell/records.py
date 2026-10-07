@@ -196,6 +196,9 @@ def public_agent(scan):
 
 
 def execution_record(scan, finding_ids=()):
+    execution = json.loads(scan.get("execution") or "{}")
+    if not finding_ids and execution.get("target"):
+        finding_ids = [execution["target"]["finding"]["id"]]
     return ExecutionRecord(
         id=scan["id"],
         repository=scan["repository"],

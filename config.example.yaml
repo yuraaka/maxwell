@@ -35,6 +35,8 @@ limits:
   scan_interval_seconds: 1800
   max_findings_per_scan: 3
   max_candidates_per_scan: 100
+  max_reviews_per_scan: 1
+  max_audits_per_scan: 1
   human_queue_max: 6
   minimum_confidence: 0.8
   shutdown_grace_seconds: 10
