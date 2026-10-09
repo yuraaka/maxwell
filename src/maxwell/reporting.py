@@ -19,6 +19,7 @@ from maxwell.records import (
     public_agent,
     record_digest,
 )
+from maxwell.reputation import agent_reputation, reputation_report
 
 
 def token_summary(usage):
@@ -528,6 +529,33 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         except Exception as exc:
             self.error("findings", "id", identity, exc)
 
+    async def publish_scan_reports(self, repo, issue, scans):
+        published = False
+        for scan in scans:
+            if scan["finished"] and not scan["report_sent"]:
+                published = True
+                finding_ids = [
+                    row["finding_id"]
+                    for row in self.store.rows(
+                        "SELECT finding_id FROM finding_observations WHERE scan_id=? ORDER BY finding_id",
+                        (scan["id"],),
+                    )
+                ]
+                report = self.config.redact(scan_report(scan, finding_ids))
+                (self.paths.root / "reports" / f"{scan['id']}.md").write_text(report)
+                await self.call(
+                    self.github.upsert_comment,
+                    repo,
+                    issue,
+                    f"<!-- maxwell:scan:{scan['id']} -->",
+                    report,
+                )
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE scans SET report_sent=1 WHERE id=?", (scan["id"],)
+                    )
+        return published
+
     async def dashboard(self, repo):
         with self.store.db:
             self.store.db.execute("INSERT OR IGNORE INTO dashboards(repository) VALUES(?)", (repo,))
@@ -564,6 +592,11 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         scans = self.store.rows(
             "SELECT * FROM scans WHERE repository=? ORDER BY created DESC", (repo,)
         )
+        if await self.publish_scan_reports(repo, record["issue"], scans):
+            remote = await self.call(
+                self.github.request, "GET", f"repos/{repo}/issues/{record['issue']}"
+            )
+            await self.project_issue_records(repo, remote)
         findings = self.store.rows("SELECT * FROM findings WHERE repository=?", (repo,))
         scan_history = {}
         finding_ids = {finding["id"] for finding in findings}
@@ -605,13 +638,7 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
             bool(scan["executed"]) and not usage.get("complete")
             for scan, usage in zip(history, usages, strict=True)
         )
-        ratings = hunter_ratings(self.store, repo)
-        for rating in ratings:
-            scan = self.store.one(
-                "SELECT * FROM scans WHERE profile IS ? LIMIT 1", (rating["profile"],)
-            )
-            agent = public_agent(scan) if scan else None
-            rating["profile"] = agent.display() if agent else "Unknown legacy agent"
+        reputation = reputation_report(agent_reputation(self.store, repo))
         body = f"""{marker}
 # Maxwell status
 
@@ -633,8 +660,7 @@ Hunting, review, and audit use separate executions. Source assessments do not im
 Token totals include reported usage from failed attempts. Missing usage is unknown,
 not zero; totals may be partial when execution usage is unavailable or incomplete.
 
-### Hunter ratings
-{json.dumps(ratings) if ratings else "Unrated: no independent assessments yet."}
+{reputation}
 
 ### Recent scans
 """
@@ -661,28 +687,6 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
                 f"repos/{repo}/issues/{record['issue']}",
                 json={"body": body},
             )
-        for scan in scans:
-            if scan["finished"] and not scan["report_sent"]:
-                finding_ids = [
-                    row["finding_id"]
-                    for row in self.store.rows(
-                        "SELECT finding_id FROM finding_observations WHERE scan_id=? ORDER BY finding_id",
-                        (scan["id"],),
-                    )
-                ]
-                report = self.config.redact(scan_report(scan, finding_ids))
-                (self.paths.root / "reports" / f"{scan['id']}.md").write_text(report)
-                await self.call(
-                    self.github.upsert_comment,
-                    repo,
-                    record["issue"],
-                    f"<!-- maxwell:scan:{scan['id']} -->",
-                    report,
-                )
-                with self.store.db:
-                    self.store.db.execute(
-                        "UPDATE scans SET report_sent=1 WHERE id=?", (scan["id"],)
-                    )
         return record["issue"]
 
     async def commands(self, repo, issue, finding=None):

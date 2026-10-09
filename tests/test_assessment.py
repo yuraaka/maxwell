@@ -8,6 +8,7 @@ from maxwell.cli import execute, parser
 from maxwell.config import Paths
 from maxwell.records import AssessmentRecord, FindingRecord, decode_record, encode_record
 from maxwell.repositories import git
+from maxwell.reputation import agent_reputation, reputation_report
 from maxwell.store import Store
 
 
@@ -120,6 +121,24 @@ def test_review_reports_each_verdict_without_closing_issue(home, hunted, github,
         f"maxwell:review:{verdict}",
     }
     assert github["issues"][issue]["state"] == "open"
+
+
+def test_noop_review_refreshes_reputation_without_running_an_agent(home, hunted, github, capsys):
+    store, issue, _ = hunted
+    run(home, capsys, "--stage", "review")
+    record = assessments(github, issue)[0]
+    comments = github["comments"][issue]
+    comments[:] = [item for item in comments if decode_record(item["body"]) != record]
+    before = store.one("SELECT COUNT(*) AS n FROM scans")["n"]
+    result = run(home, capsys, "--stage", "audit")
+    assert result["scans"] == [] and store.one("SELECT COUNT(*) AS n FROM scans")["n"] == before
+    dashboard = next(
+        item for item in github["issues"].values() if item["title"] == "Maxwell status"
+    )
+    assert reputation_report(agent_reputation(store, "acme/repo")) in dashboard["body"]
+    assert "reviewer" not in {
+        item["role"] for item in agent_reputation(store, "acme/repo") if item["assessments"]
+    }
 
 
 def test_review_uses_pinned_revision_after_branch_moves_and_queue_is_full(

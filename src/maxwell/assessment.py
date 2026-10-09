@@ -30,6 +30,10 @@ def current_assessments(store, repository, issue, finding):
             (repository, issue),
         )
     ]
+    return finding_assessments(records, finding)
+
+
+def finding_assessments(records, finding):
     records = [
         record
         for record in records
@@ -59,6 +63,7 @@ async def collect_targets(reporter, repository, stage, *, issue=None, force=Fals
             raise ValueError(dashboard["error"])
     issues = await reporter.project_repository_records(repository)
     await reporter.reconcile_assessment_labels(repository, issues)
+    await reporter.dashboard(repository)
     remote = {item["number"]: item for item in issues if "pull_request" not in item}
     targets = []
     for row in reporter.store.rows(

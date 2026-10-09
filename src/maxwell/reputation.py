@@ -1,0 +1,189 @@
+from collections import defaultdict
+
+from maxwell.assessment import finding_assessments
+from maxwell.records import RECORD_ADAPTER, AssessmentRecord, ExecutionRecord, FindingRecord
+
+
+def consensus(records):
+    verdicts = {record.verdict for record in records}
+    if not verdicts:
+        return "unassessed"
+    if len(verdicts) == 1 and "inconclusive" not in verdicts:
+        return next(iter(verdicts))
+    return "unresolved"
+
+
+def agent_reputation(store, repository):
+    records = [
+        (row["issue"], RECORD_ADAPTER.validate_json(row["data"]))
+        for row in store.rows(
+            "SELECT issue,data FROM github_records WHERE repository=? AND status='current' "
+            "AND type IN ('finding','assessment','execution')",
+            (repository,),
+        )
+    ]
+    assessments = defaultdict(list)
+    for issue, record in records:
+        if isinstance(record, AssessmentRecord):
+            assessments[issue].append(record)
+    agents = {}
+
+    def tally(agent, role):
+        key = (
+            (role, agent.adapter, agent.model, agent.effort) if agent else (role, None, None, None)
+        )
+        if key not in agents:
+            agents[key] = {
+                "agent": agent.model_dump(include={"adapter", "model", "effort", "role"})
+                if agent
+                else None,
+                "role": role,
+                "findings": 0,
+                "review_supported": 0,
+                "review_rejected": 0,
+                "review_unresolved": 0,
+                "review_unassessed": 0,
+                "audit_supported": 0,
+                "audit_rejected": 0,
+                "audit_unresolved": 0,
+                "audit_unassessed": 0,
+                "assessments": 0,
+                "agreement": 0,
+                "disagreement": 0,
+                "unresolved": 0,
+                "executions": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "unknown_usage": 0,
+                "incomplete_usage": 0,
+            }
+        return key, agents[key]
+
+    observations = set()
+    for issue, finding in records:
+        if not isinstance(finding, FindingRecord):
+            continue
+        if finding.finding.identity(repository) != finding.id:
+            continue
+        reviews, audits = finding_assessments(assessments[issue], finding)
+        key, hunter = tally(finding.agent, "hunter")
+        observation = (finding.id, finding.sha, key)
+        if observation not in observations:
+            observations.add(observation)
+            hunter["findings"] += 1
+            hunter[f"review_{consensus(reviews)}"] += 1
+            hunter[f"audit_{consensus(audits)}"] += 1
+        for role, current in (("reviewer", reviews), ("auditor", audits)):
+            grouped = defaultdict(list)
+            for assessment in current:
+                key, _ = tally(assessment.agent, role)
+                grouped[key].append(assessment)
+            for key, group in grouped.items():
+                observation = (finding.id, finding.sha, key)
+                if observation in observations:
+                    continue
+                observations.add(observation)
+                result = agents[key]
+                result["assessments"] += 1
+                if role == "reviewer":
+                    review_verdict, audit_verdict = consensus(group), consensus(audits)
+                    if review_verdict not in ("supported", "rejected") or audit_verdict not in (
+                        "supported",
+                        "rejected",
+                    ):
+                        outcome = "unresolved"
+                    else:
+                        outcome = "agreement" if review_verdict == audit_verdict else "disagreement"
+                    result[outcome] += 1
+
+    executions = set()
+    for _, record in records:
+        if not isinstance(record, ExecutionRecord) or record.id in executions:
+            continue
+        executions.add(record.id)
+        _, result = tally(record.agent, record.agent.role if record.agent else "unattributed")
+        result["executions"] += 1
+        if record.usage.reported:
+            result["input_tokens"] += record.usage.input_tokens
+            result["output_tokens"] += record.usage.output_tokens
+        if record.state != "skipped":
+            result["unknown_usage"] += not record.usage.reported
+            result["incomplete_usage"] += not record.usage.complete
+    return [
+        agents[key] for key in sorted(agents, key=lambda key: tuple(part or "" for part in key))
+    ]
+
+
+def reputation_report(rows):
+    def identity(row):
+        agent = row["agent"]
+        if not agent:
+            return f"Unattributed ({row['role']})"
+        value = f"{agent['adapter']} / {agent['model']} / {agent['effort'] or 'default'}"
+        return value.replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+
+    def table(role, headers, fields):
+        selected = [row for row in rows if row["role"] == role]
+        if not selected:
+            return "No current records.\n"
+        lines = [
+            "| Agent | " + " | ".join(headers) + " |",
+            "| --- | " + " | ".join("---" for _ in headers) + " |",
+        ]
+        for row in selected:
+            values = [f"{row[field]:,}" for field in fields]
+            lines.append("| " + identity(row) + " | " + " | ".join(values) + " |")
+        return "\n".join(lines) + "\n"
+
+    body = "### Agent reputation\n\nProvisional counts from current GitHub records; no numerical score.\n"
+    for stage in ("review", "audit"):
+        body += f"\n#### Hunters: {stage} source support\n\n"
+        body += table(
+            "hunter",
+            ["Findings", "Supported", "Rejected", "Unresolved", "Unassessed"],
+            [
+                "findings",
+                *(
+                    f"{stage}_{outcome}"
+                    for outcome in ("supported", "rejected", "unresolved", "unassessed")
+                ),
+            ],
+        )
+    body += "\n#### Reviewers: agreement with auditors\n\n"
+    body += table(
+        "reviewer",
+        ["Assessments", "Agreement", "Disagreement", "Unresolved"],
+        ["assessments", "agreement", "disagreement", "unresolved"],
+    )
+    body += "\n#### Auditors\n\nQuality: unrated until independent validation.\n\n"
+    body += table("auditor", ["Current assessments"], ["assessments"])
+    body += "\n#### Investigation tokens\n\n"
+    body += "| Agent | Role | Executions | Input | Output | Total | Unknown usage | Incomplete usage |\n"
+    body += "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+    for row in rows:
+        values = [row[field] for field in ("executions", "input_tokens", "output_tokens")]
+        values += [
+            row["input_tokens"] + row["output_tokens"],
+            row["unknown_usage"],
+            row["incomplete_usage"],
+        ]
+        body += (
+            "| "
+            + identity(row)
+            + " | "
+            + row["role"]
+            + " | "
+            + " | ".join(f"{value:,}" for value in values)
+            + " |\n"
+        )
+    body += (
+        "\nCounts describe source support and reviewer–auditor agreement, not proven accuracy. "
+        "Audits are selectively chosen and can share agent biases. Inconclusive or conflicting "
+        "verdicts remain unresolved. Missing audits are unresolved for reviewers. "
+        "Each finding/revision/agent contributes at most one current observation; "
+        "superseded or invalid evidence is excluded.\n\n"
+        "Tokens include historical and failed executions, counted once per execution; "
+        "cached tokens are included in input. Unknown usage is not zero. "
+        "Tokens do not change quality counts.\n"
+    )
+    return body

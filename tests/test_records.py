@@ -18,6 +18,7 @@ from maxwell.records import (
 )
 from maxwell.reporting import Reporter, record_report
 from maxwell.repositories import git
+from maxwell.reputation import agent_reputation, reputation_report
 from maxwell.store import Store
 
 
@@ -153,6 +154,8 @@ def test_assessment_labels_ignore_invalid_or_stale_records(records, github, inva
         github["comments"][issue][0] = comment
     reconcile_labels(reporter)
     assert "maxwell:state:suspected" in labels(github, issue)
+    hunter = next(item for item in agent_reputation(store, "acme/repo") if item["role"] == "hunter")
+    assert hunter["review_unassessed"] == 1
     assert not any(
         label.startswith(("maxwell:review:", "maxwell:audit:")) for label in labels(github, issue)
     )
@@ -197,6 +200,49 @@ def test_assessment_label_failure_is_reported_and_recoverable(records, github, m
     asyncio.run(reporter.sync("acme/repo", process_commands=False))
     assert store.one("SELECT error FROM dashboards")["error"] is None
     assert "maxwell:state:reviewed" in labels(github, issue)
+
+
+def test_reputation_reconstructs_from_github_without_local_scans_or_findings(records, home, github):
+    store, reporter, sha, finding_id, execution_id = records
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    issue = store.one("SELECT issue FROM findings")["issue"]
+    review = assessment(sha, finding_id, execution_id)
+    audit = assessment(
+        sha,
+        finding_id,
+        execution_id,
+        id="b" * 32,
+        role="auditor",
+        agent=PublicAgent(adapter="claude", model="audit-model", role="auditor", effort="high"),
+        references=[review.id],
+    )
+    store.queue_record(review, issue)
+    store.queue_record(audit, issue)
+    asyncio.run(reporter.sync("acme/repo", process_commands=False))
+    expected = agent_reputation(store, "acme/repo")
+    body = next(
+        item["body"] for item in github["issues"].values() if item["title"] == "Maxwell status"
+    )
+    assert reputation_report(expected) in body
+    assert "private-work-alias" not in body and "Beta(2,2)" not in body
+    with store.db:
+        store.db.execute("UPDATE findings SET state='rejected'")
+    assert agent_reputation(store, "acme/repo") == expected
+    github["issues"][issue]["state"] = "closed"
+    fresh = Store(home.root / "fresh.sqlite")
+    try:
+        fresh.register("acme/repo", "unused", "main")
+        fresh_reporter = Reporter(fresh, reporter.github, reporter.config, home)
+        asyncio.run(fresh_reporter.project_repository_records("acme/repo"))
+        assert not fresh.rows("SELECT * FROM scans") and not fresh.rows("SELECT * FROM findings")
+        assert agent_reputation(fresh, "acme/repo") == expected
+        asyncio.run(fresh_reporter.dashboard("acme/repo"))
+        actual_body = next(
+            item["body"] for item in github["issues"].values() if item["title"] == "Maxwell status"
+        )
+        assert reputation_report(expected) in actual_body
+    finally:
+        fresh.close()
 
 
 def test_record_contract_rejects_private_identity_fields():

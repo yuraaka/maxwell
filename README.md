@@ -449,8 +449,8 @@ Assessment publication is append-only: conflicting records are not overwritten, 
 ambiguous comment creation is reconciled before any further write.
 
 These contracts and projections support the reviewer and auditor stages. Structured
-assessments determine review/audit eligibility, but do not yet change ratings or trigger
-repairs. Measurement records can describe pinned
+assessments determine review/audit eligibility and provisional reputation counts;
+they do not trigger repairs. Measurement records can describe pinned
 factors, coverage, exclusions, and analyzer/policy versions, but measurement adapters
 and entropy calculation are not implemented yet. Existing issue bodies and scan reports
 without structured records remain compatible and are not retroactively assigned evidence.
@@ -523,11 +523,29 @@ The next manual scan of that repository retries or reconciles pending publicatio
 
 ## Ratings and Entropy
 
-Hunter ratings begin as **unrated**. Explicit authorized human confirmations/rejections
-provide independent assessments. The provisional quality estimate per execution profile
-is `100 × (confirmations + 2) / (assessments + 4)` with sample count and a provisional
-confidence label. Scans that discover nothing are not automatically quality failures.
-Model routing remains configured rather than adaptive.
+The status issue shows **provisional counts**, without a numerical score. Agents are
+grouped by public adapter, model, effort, and role; provider aliases are never used.
+Hunter tables show source support from reviews and audits separately: supported,
+rejected, unresolved, and unassessed. Reviewer tables show agreement, disagreement,
+and unresolved comparisons with the current audits. Auditor quality remains unrated
+until independent validation. These counts describe source judgments and agreement,
+not proven correctness or representative accuracy: audits are selectively chosen and
+agents can share biases.
+
+Inconclusive or conflicting verdicts remain unresolved. An absent audit makes a
+reviewer comparison unresolved. Each finding/pinned revision/agent contributes at
+most one current observation, including closed issues. Superseded, edited, missing,
+unauthorized, wrong-revision, and stale-reference assessments do not contribute.
+Closure and legacy human commands are not substituted for structured evidence.
+Counts are reconstructed from authorized GitHub records in a fresh SQLite database.
+Publication and review/audit commands refresh the tables, including runs with no
+eligible findings; these updates do not require another agent execution.
+
+Investigation tokens are shown separately, once per execution, including failures
+and historical reassessments. Cached tokens are included in input; unknown and
+incomplete usage are explicit. Tokens do not alter quality counts. Missing agent
+identity is shown as unattributed. Scans that discover nothing are not automatically
+quality failures. Model routing remains configured rather than adaptive.
 
 **Entropy is unavailable in M1**: there is no complete, reproducible baseline for the
 agreed defect, complexity, duplication, dependency, and test-health measurements yet.
@@ -576,5 +594,5 @@ created. Focused tests own edge cases; the end-to-end test exercises the integra
 4. Independent validator, integration checks, and GitHub-based merge approval.
 
 The durable issue/artifact handoffs remain the boundary between agents. Add measured
-Entropy, sampled audits and evidence-based stage ratings, further provider adapters, and optional GitHub Pages
+Entropy, sampled audits and independently validated stage ratings, further provider adapters, and optional GitHub Pages
 reporting as the necessary evidence and capabilities become available.
