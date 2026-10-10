@@ -139,6 +139,7 @@ def configure_completion(parser):
         "directory": DirectoriesCompleter(),
         "issue": SuppressCompleter(),
         "limit": SuppressCompleter(),
+        "revision": SuppressCompleter(),
     }
     for action in parser._actions:
         if action.dest in completers:

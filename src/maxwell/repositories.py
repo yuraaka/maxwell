@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 
-def git(*args, cwd=None, token=None):
+def git(*args, cwd=None, token=None, strip=True):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment["GIT_TERMINAL_PROMPT"] = "0"
     encoded = None
@@ -49,7 +49,7 @@ def git(*args, cwd=None, token=None):
         if token:
             error = error.replace(token, "[REDACTED]").replace(encoded, "[REDACTED]")
         raise ValueError(f"Git operation failed: {error[:1000]}")
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
 
 
 def github_name(value):

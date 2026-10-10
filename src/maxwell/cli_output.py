@@ -75,6 +75,14 @@ def scan_line(scan):
         print(f"{badge} {name}: {detail}", flush=True)
 
 
+def measurement_line(item):
+    badge = "[WAIT]" if item["heartbeat"] else "[STEP]"
+    print(
+        f"{color(badge, '36')} {item['repository']}: {item['phase']} ({item['elapsed']}s elapsed)",
+        flush=True,
+    )
+
+
 def table(headers, rows, *, bordered=False, cell_style=None):
     if not rows:
         return []

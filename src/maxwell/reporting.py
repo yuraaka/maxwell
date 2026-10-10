@@ -8,6 +8,7 @@ import time
 from maxwell.assessment import current_assessments
 from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, SelectionStats
 from maxwell.github import PublicationUncertain
+from maxwell.measurement import measurement_report, measurement_score, projected_measurements
 from maxwell.records import (
     RECORD_ADAPTER,
     AssessmentRecord,
@@ -139,11 +140,7 @@ def record_report(record):
             f"Usage complete: {record.usage.complete}.\n"
         )
     else:
-        body = (
-            f"{marker}\n### Measurement `{record.id[:12]}`\n\n"
-            f"Revision: `{record.sha}`; policy: `{record.policy_version}`; "
-            f"analyzer: `{record.analyzer_version}`; coverage: {record.coverage:.0%}.\n"
-        )
+        body = marker + measurement_report(record)
     return body + "\n" + encode_record(record) + "\n"
 
 
@@ -639,6 +636,21 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
             for scan, usage in zip(history, usages, strict=True)
         )
         reputation = reputation_report(agent_reputation(self.store, repo))
+        measurements = projected_measurements(self.store, repo)
+        measurement = measurements[-1] if measurements else None
+        entropy = "Unavailable — run `maxwell measure` to establish a baseline"
+        measurement_body = ""
+        if measurement:
+            score = measurement_score(measurement)
+            entropy = (
+                f"{score:.2f}/100 (lower is better)"
+                if score is not None
+                else "Unknown — required measurements unavailable"
+            )
+            baseline = next(
+                (item for item in measurements if item.id == measurement.baseline_id), None
+            )
+            measurement_body = measurement_report(measurement, baseline)
         body = f"""{marker}
 # Maxwell status
 
@@ -646,7 +658,7 @@ Hunting, review, and audit use separate executions. Source assessments do not im
 
 | Metric | Value |
 | --- | --- |
-| Entropy | Not implemented — measurement adapters and scoring policy pending |
+| Entropy | {entropy} |
 | Recorded input tokens | {totals["input_tokens"]:,} |
 | Cached input tokens (included in input) | {totals["cached_input_tokens"]:,} |
 | Cache write tokens (included in input) | {totals["cache_write_tokens"]:,} |
@@ -659,6 +671,8 @@ Hunting, review, and audit use separate executions. Source assessments do not im
 
 Token totals include reported usage from failed attempts. Missing usage is unknown,
 not zero; totals may be partial when execution usage is unavailable or incomplete.
+
+{measurement_body}
 
 {reputation}
 

@@ -12,12 +12,13 @@ import httpx
 
 from maxwell import __version__
 from maxwell.cli_help import TreeParser
-from maxwell.cli_output import check_line, color, model_lines, output, scan_line
+from maxwell.cli_output import check_line, color, measurement_line, model_lines, output, scan_line
 from maxwell.completion import bash_completion, configure_completion
 from maxwell.config import Paths
 from maxwell.config_apply import apply_config
 from maxwell.github import GitHub
 from maxwell.manual import run_scans
+from maxwell.measurement_runner import run_measurements
 from maxwell.repositories import (
     git,
     github_name,
@@ -55,6 +56,17 @@ def parser():
         "--json", action="store_true", help="Print JSON instead of human-readable output"
     )
     commands = root.add_subparsers(dest="command", required=True)
+    measure = add_command(commands, "measure", help="Measure source and test maintenance factors")
+    measure.add_argument("repository", nargs="?")
+    measure.add_argument("--revision", help="Pinned commit SHA (default: registered branch)")
+    measure.add_argument(
+        "--skip-stage",
+        action="append",
+        choices=["source", "tests"],
+        default=[],
+        help="Skip a stage and reuse its latest compatible GitHub measurement (repeatable)",
+    )
+    measure.add_argument("--tests", action="store_true", help=argparse.SUPPRESS)
     completion = add_command(commands, "completion", help="Generate shell completion")
     completion.add_argument("shell", choices=["bash"], nargs="?", default="bash")
     config = add_command(commands, "config", help="Initialize or apply configuration")
@@ -242,6 +254,40 @@ def execute(args):
                 emit(change_repository(args, store, config))
         finally:
             store.close()
+    elif args.command == "measure":
+        report = asyncio.run(
+            run_measurements(
+                paths,
+                config,
+                args.repository,
+                revision=args.revision,
+                run_tests="tests" not in args.skip_stage,
+                skip_source="source" in args.skip_stage,
+                on_progress=None if args.json else measurement_line,
+            )
+        )
+        if args.json:
+            emit(report)
+        else:
+            for item in report["measurements"]:
+                if item["state"] == "completed":
+                    score = (
+                        f"{item['score']:.2f}/100"
+                        if item["score"] is not None
+                        else "unknown (incomplete evidence)"
+                    )
+                    print(
+                        f"[OK] {item['repository']}: entropy {score}; factor weight {item['coverage']:.0%}",
+                        flush=True,
+                    )
+                    print(f"Report: {item['report']}", flush=True)
+                    print(f"Status: {item['url']}", flush=True)
+                    if item["publication_error"]:
+                        print(f"[FAIL] publication: {item['publication_error']}", flush=True)
+                else:
+                    print(f"[FAIL] {item['repository']}: {item['error']}", flush=True)
+        if not report["valid"]:
+            raise SystemExit(1)
     elif args.command == "scan":
         report = asyncio.run(
             run_scans(

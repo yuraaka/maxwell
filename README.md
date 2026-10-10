@@ -451,8 +451,8 @@ ambiguous comment creation is reconciled before any further write.
 These contracts and projections support the reviewer and auditor stages. Structured
 assessments determine review/audit eligibility and provisional reputation counts;
 they do not trigger repairs. Measurement records can describe pinned
-factors, coverage, exclusions, and analyzer/policy versions, but measurement adapters
-and entropy calculation are not implemented yet. Existing issue bodies and scan reports
+factors, coverage, exclusions, and analyzer/policy versions. `maxwell measure` implements
+the first Python structural adapter and repeated pytest measurements. Existing issue bodies and scan reports
 without structured records remain compatible and are not retroactively assigned evidence.
 Review and audit require a current structured finding record; legacy issues without one
 are skipped in bulk runs and produce an explanatory error when targeted explicitly.
@@ -547,10 +547,105 @@ incomplete usage are explicit. Tokens do not alter quality counts. Missing agent
 identity is shown as unattributed. Scans that discover nothing are not automatically
 quality failures. Model routing remains configured rather than adaptive.
 
-**Entropy is unavailable in M1**: there is no complete, reproducible baseline for the
-agreed defect, complexity, duplication, dependency, and test-health measurements yet.
-Suspected findings are not substituted for confirmed defects. Later stages will provide
-the measurement adapters and calibrated scoring policy. No fabricated score is shown.
+## Measuring maintenance entropy
+
+```bash
+maxwell measure owner/repo
+maxwell measure owner/repo --skip-stage tests
+maxwell measure owner/repo --skip-stage source --skip-stage tests
+maxwell measure owner/repo --revision FULL_COMMIT_SHA --json
+```
+
+Measurement requires a registered repository and its GitHub credentials, with no
+provider or model selection. It analyzes a pinned committed snapshot without changing
+your checkout. By default it runs both stages: source analysis and the configured pytest
+command in separate disposable snapshots. Structural analysis never imports source modules. Use a trusted
+local test environment: a disposable worktree is not an operating-system sandbox.
+Maxwell does not install dependencies or inherit provider/GitHub credentials into tests.
+
+Use repeatable `--skip-stage source` or `--skip-stage tests` arguments to disable stages.
+Source covers complexity, duplication, and coupling; tests covers runtime and flakiness.
+Skipped stages reuse the latest compatible usable GitHub measurement, including across
+revisions. Reports mark reused factors and retain the original measurement ID, revision,
+timestamp, and test environment fingerprint. This allows a score combining current and
+historical evidence; it does not claim all factors were measured at the current commit.
+Without compatible history, a skipped stage remains unknown. Only explicitly skipped
+stages reuse history; failed or incomplete active stages retain their actual outcomes.
+
+Configure the test profile by repository in `config.yaml`:
+
+```yaml
+measurement:
+  tests:
+    owner/repo:
+      command: [/absolute/path/to/venv/bin/python, -m, pytest, -q]
+      runs: 5
+      warmups: 1
+      timeout_seconds: 600
+      runtime_budget_seconds: 300
+      environment: {}
+```
+
+The argv command must run pytest and accept appended pytest options. Environment
+variables are explicit. Plugin autoload is disabled by default; load required plugins
+with explicit `-p` options or configure `PYTEST_DISABLE_PLUGIN_AUTOLOAD` in the profile.
+Configured source roots from the pinned snapshot precede external Python paths, so
+an editable project installation does not substitute your working checkout for the commit.
+The initial collector supports serial pytest runs; parallel worker reports are not
+supported. Each warmup and measured run starts from the same commit in a fresh snapshot.
+Warmups are excluded from timing and flakiness observations. Command and configured
+environment fingerprints are published; their values are not copied into public records.
+Complete local pytest reports and output logs remain under the measurement artifact.
+
+The versioned `maintenance-v1` policy has five factors, weighted **20% each** by default:
+
+| Factor | Raw ratio and normalization |
+| --- | --- |
+| Complexity | Sum of excess function complexity above threshold 10 / total function complexity |
+| Duplication | Tokens covered by repeated exact token windows / analyzed tokens |
+| Cyclic dependency coupling | Modules in internal import cycles / analyzed modules |
+| Test running time | Median complete-suite wall duration / configured runtime budget |
+| Observed test flakiness | Tests exhibiting both pass and fail / consistently executed pass/fail tests |
+
+Each ratio is capped at 1. The score is `100 × sum(weight × normalized factor)`,
+from 0 to 100, with lower values indicating less measured maintenance burden. Runtime
+scores saturate at the budget; raw duration and duration deltas remain visible so
+improvements above the budget are not lost. This is a transparent maintenance policy,
+separate from agent reputation and source-assessed defects, without empirical calibration.
+
+The Python adapter includes tracked `.py`/`.pyi` files and reports its scope and exclusions.
+Complexity starts at 1 per function, adding conditional branches, loops, exception
+handlers, Boolean alternatives, comprehension loops/filters, and non-default match
+cases/guards; nested function bodies are measured separately. Clones use exact token
+strings, ignoring comments and layout, with windows of at least 50 tokens spanning
+five token-bearing lines; overlapping coverage is counted once. Dependency graphs
+resolve static internal imports, including relative imports and configured source roots.
+Cycles determine the initial coupling score; module fan-out is supporting evidence.
+Dynamic imports, parse failures, ambiguous module names, empty populations, and configured
+resource limits are reported as unavailable evidence rather than healthy zero values.
+
+All thresholds, exclusions, source roots, weights, and resource limits are configurable
+under `measurement`; see `config.example.yaml`. All five positive weights must sum to 1.
+The full aggregate is unknown until every factor has usable evidence. Missing test
+profiles, absent runtime budgets, and incomplete runs never redistribute factor weights.
+The report shows measured factor weight and Python file coverage separately. This first
+adapter does not claim to analyze non-Python source.
+
+Test outcomes include setup, call, and teardown. Skips/expected failures are excluded
+from the observed pass/fail denominator. Persistent failures appear separately.
+Timeouts, collection errors, changed collection, source modifications, and runner errors
+make affected factors unknown. Zero observed flakes does not prove zero flakiness;
+observation depends on the repeat count and environment.
+
+Measurements are append-only GitHub comments on the status issue, with SQLite retaining
+operational runs and publication intents. Their records contain enough evidence to
+reconstruct the score in a fresh database. Existing measurement records remain readable,
+but older Maxwell installations need an upgrade to read the new evidence fields.
+The earliest compatible current GitHub measurement is the baseline. Comparisons require
+matching analyzer, policy/protocol, command/settings, dependencies, runtime environment,
+and host fingerprints. Changed or missing records cannot serve as baselines. Reports show
+score, raw duration, and test-count deltas when comparable. Failures retain local evidence;
+the next measurement retries pending publication. Measurements do not consume agent budgets.
 
 ## Execution boundary
 
@@ -593,6 +688,6 @@ created. Focused tests own edge cases; the end-to-end test exercises the integra
 3. Fixer consuming confirmed issues and producing patches.
 4. Independent validator, integration checks, and GitHub-based merge approval.
 
-The durable issue/artifact handoffs remain the boundary between agents. Add measured
-Entropy, sampled audits and independently validated stage ratings, further provider adapters, and optional GitHub Pages
-reporting as the necessary evidence and capabilities become available.
+The durable issue/artifact handoffs remain the boundary between agents. Extend measurement
+adapters, add sampled audits and independently validated stage ratings, and consider
+further providers and optional GitHub Pages reporting as evidence and capabilities grow.

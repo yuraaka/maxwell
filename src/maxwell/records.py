@@ -98,6 +98,14 @@ class MeasurementFactor(BaseModel):
     unit: str = Field(min_length=1, max_length=100)
 
 
+class ReusedMeasurement(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    id: Identifier
+    sha: Revision
+    measured_at: float | None = Field(default=None, ge=0, le=253402300799)
+    environment_fingerprint: str | None = None
+
+
 class MeasurementRecord(Record):
     type: Literal["measurement"] = "measurement"
     sha: Revision
@@ -106,6 +114,57 @@ class MeasurementRecord(Record):
     coverage: float = Field(ge=0, le=1)
     factors: dict[str, MeasurementFactor]
     exclusions: list[str] = Field(default_factory=list, max_length=1000)
+    measured_at: float | None = Field(default=None, ge=0)
+    protocol: str | None = None
+    policy: dict = Field(default_factory=dict)
+    factor_status: dict[str, str] = Field(default_factory=dict)
+    evidence: dict = Field(default_factory=dict)
+    environment_fingerprint: str | None = None
+    baseline_id: Identifier | None = None
+
+    @model_validator(mode="after")
+    def check_evidence(self):
+        try:
+            json.dumps([self.policy, self.evidence], allow_nan=False)
+        except (ValueError, TypeError):
+            raise ValueError("Measurement metadata must contain finite JSON values") from None
+        tests = self.evidence.get("tests", {})
+        source = self.evidence.get("source", {})
+        if not isinstance(source, dict) or not isinstance(source.get("excluded_files", []), list):
+            raise ValueError("Source evidence must be an object with an exclusion list")
+        if not isinstance(tests, dict):
+            raise ValueError("Test evidence must be an object")
+        reused = self.evidence.get("reused", {})
+        if not isinstance(reused, dict) or set(reused) - {"source", "tests"}:
+            raise ValueError("Reused evidence must identify source or tests stages")
+        for origin in reused.values():
+            ReusedMeasurement.model_validate(origin)
+        for key in (
+            "requested_runs",
+            "valid_runs",
+            "warmups",
+            "collected_tests",
+            "observed_tests",
+            "skipped_tests",
+            "observed_flaky_count",
+            "persistent_failure_count",
+        ):
+            if key in tests and (not isinstance(tests[key], int) or tests[key] < 0):
+                raise ValueError("Test evidence counts must be nonnegative integers")
+        if "median_seconds" in tests and (
+            not isinstance(tests["median_seconds"], (int, float)) or tests["median_seconds"] < 0
+        ):
+            raise ValueError("Test duration must be a nonnegative number")
+        slow = tests.get("slow_tests", [])
+        if not isinstance(slow, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("test"), str)
+            or not isinstance(item.get("median_seconds"), (int, float))
+            or item["median_seconds"] < 0
+            for item in slow
+        ):
+            raise ValueError("Slow-test evidence needs test IDs and nonnegative durations")
+        return self
 
 
 class StageExecution(BaseModel):
@@ -169,7 +228,20 @@ def decode_record(body):
 
 
 def record_digest(record):
-    payload = json.dumps(record.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    values = record.model_dump(mode="json")
+    if isinstance(record, MeasurementRecord):
+        for key in (
+            "measured_at",
+            "protocol",
+            "policy",
+            "factor_status",
+            "evidence",
+            "environment_fingerprint",
+            "baseline_id",
+        ):
+            if values[key] is None or values[key] == {}:
+                del values[key]
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

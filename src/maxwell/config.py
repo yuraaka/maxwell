@@ -196,12 +196,74 @@ class Limits(Settings):
     daily_scan_limit: int = Field(default=20, ge=1)
 
 
+class MeasurementTests(Settings):
+    command: list[str] = Field(min_length=1, max_length=100)
+    cwd: str = "."
+    runs: int = Field(default=5, ge=2)
+    warmups: int = Field(default=1, ge=0)
+    timeout_seconds: float = Field(default=600, gt=0)
+    runtime_budget_seconds: float | None = Field(default=None, gt=0)
+    environment: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("cwd")
+    @classmethod
+    def relative_cwd(cls, value):
+        if Path(value).is_absolute() or ".." in Path(value).parts:
+            raise ValueError("Test cwd must stay inside the snapshot")
+        return value
+
+    @field_validator("command")
+    @classmethod
+    def command_arguments(cls, value):
+        if any(not item or "\0" in item for item in value):
+            raise ValueError("Test command arguments must be nonempty and contain no NUL")
+        return value
+
+
+class MeasurementSettings(Settings):
+    complexity_threshold: int = Field(default=10, ge=1)
+    clone_tokens: int = Field(default=50, ge=5, le=1000)
+    clone_lines: int = Field(default=5, ge=1)
+    max_tokens: int = Field(default=200_000, ge=1)
+    max_file_bytes: int = Field(default=1_000_000, ge=1)
+    exclude: list[str] = Field(default_factory=lambda: ["vendor/**", "generated/**", "**/*_pb2.py"])
+    source_roots: list[str] = Field(default_factory=lambda: ["src", "."])
+    weights: dict[str, float] = Field(
+        default_factory=lambda: dict.fromkeys(
+            ("complexity", "duplication", "coupling", "test_runtime", "test_flakiness"), 0.2
+        )
+    )
+    tests: dict[str, MeasurementTests] = Field(default_factory=dict)
+
+    @field_validator("weights")
+    @classmethod
+    def complete_weights(cls, value):
+        import math
+
+        expected = {"complexity", "duplication", "coupling", "test_runtime", "test_flakiness"}
+        if (
+            set(value) != expected
+            or any(not math.isfinite(item) or item <= 0 for item in value.values())
+            or not math.isclose(sum(value.values()), 1)
+        ):
+            raise ValueError("Specify all five positive factor weights, summing to 1")
+        return value
+
+    @field_validator("source_roots")
+    @classmethod
+    def relative_roots(cls, value):
+        if not value or any(Path(item).is_absolute() or ".." in Path(item).parts for item in value):
+            raise ValueError("Source roots must be nonempty relative snapshot paths")
+        return value
+
+
 class Config(Settings):
     version: Literal[1] = 1
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     providers: dict[str, ProviderSettings] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
+    measurement: MeasurementSettings = Field(default_factory=MeasurementSettings)
 
     @model_validator(mode="before")
     @classmethod
@@ -354,6 +416,8 @@ class Paths:
                     ProviderSettings,
                     ModelSettings,
                     Limits,
+                    MeasurementSettings,
+                    MeasurementTests,
                 )
                 fields = {name for model in models for name in model.model_fields}
                 errors = []

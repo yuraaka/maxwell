@@ -111,7 +111,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
         assert "| Executions with incomplete token usage | 2 |" in dashboard
         assert "#### Investigation tokens" in dashboard
         assert "| hunter | 3 | 1,200 | 120 | 1,320 | 1 | 2 |" in dashboard
-        assert "Not implemented — measurement adapters and scoring policy pending" in dashboard
+        assert "run `maxwell measure` to establish a baseline" in dashboard
         bodies = [issue["body"] for issue in github["issues"].values()] + [
             comment["body"] for comments in github["comments"].values() for comment in comments
         ]

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from maxwell.records import RECORD_ADAPTER, AssessmentRecord, StageExecution, record_digest
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class Store:
@@ -83,6 +83,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS stage_executions (
                 id TEXT PRIMARY KEY, repository TEXT NOT NULL REFERENCES repositories(name),
                 state TEXT NOT NULL, data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS measurements (
+                id TEXT PRIMARY KEY, repository TEXT NOT NULL REFERENCES repositories(name),
+                state TEXT NOT NULL, created REAL NOT NULL, finished REAL, sha TEXT,
+                artifact TEXT, data TEXT, error TEXT
             );
         """)
         with self.db:
