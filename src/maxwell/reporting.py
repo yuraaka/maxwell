@@ -22,6 +22,7 @@ from maxwell.records import (
     AssessmentRecord,
     ExecutionRecord,
     FindingRecord,
+    MeasurementRecord,
     decode_record,
     encode_record,
     execution_record,
@@ -218,7 +219,16 @@ def component_dashboard(repository, measurement, baseline=None):
         value = f"{contributions[factor]:.2f} points" if factor in contributions else "Unknown"
         query = f'repo:{repository} is:issue is:open label:"maxwell:factor:{factor}" -label:"maxwell:state:rejected"'
         url = "https://github.com/issues?" + urlencode({"q": query})
-        body += f"| {factor.replace('_', ' ').capitalize()} | [{value}]({url}) |\n"
+        reason = ""
+        if factor not in contributions and measurement:
+            status = measurement.factor_status.get(factor, "Unavailable evidence")
+            if status == "measured":
+                status = "Incompatible analyzer or policy; remeasure"
+            reason = " — " + status.replace("|", " ").replace("\n", " ")
+        label = (
+            "Coupling / cohesion" if factor == "coupling" else factor.replace("_", " ").capitalize()
+        )
+        body += f"| {label} | [{value}]({url}){reason} |\n"
     body += "\nContributions use policy weights; missing weights are not redistributed. Values are rounded to two decimals. Links show associated findings, not guaranteed reductions.\n"
     if measurement:
         body += (
@@ -484,6 +494,25 @@ class Reporter:
                 record = decode_record(body)
                 marker = f"<!-- maxwell:{record.type}:{record.id} -->"
                 comment = await self.record_comment(repo, row["issue"], marker, record, authors)
+                if (
+                    comment is None
+                    and row["state"] != "uncertain"
+                    and isinstance(record, (ExecutionRecord, MeasurementRecord))
+                ):
+                    dashboard = self.store.one(
+                        "SELECT issue FROM dashboards WHERE repository=?", (repo,)
+                    )
+                    if dashboard and row["issue"] == dashboard["issue"]:
+                        destination = await self.history(repo)
+                        with self.store.db:
+                            self.store.db.execute(
+                                "UPDATE record_publications SET issue=? WHERE repository=? AND type=? AND id=?",
+                                (destination, repo, record.type, record.id),
+                            )
+                        row = {**row, "issue": destination}
+                        comment = await self.record_comment(
+                            repo, destination, marker, record, authors
+                        )
                 if comment is None:
                     if row["state"] == "uncertain":
                         continue
@@ -735,6 +764,53 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         )
         return record["issue"]
 
+    async def clear_status_reports(self, repo, issue):
+        authors = await self.authorized_authors()
+        comments = await self.call(self.github.comments, repo, issue)
+        removed = set()
+        for comment in comments:
+            if comment.get("user", {}).get("login") in authors and re.match(
+                r"<!-- maxwell:(?:scan|execution|measurement):[a-f0-9]{32} -->",
+                comment.get("body") or "",
+            ):
+                try:
+                    record = decode_record(comment.get("body") or "")
+                except ValueError:
+                    record = None
+                if (
+                    isinstance(record, (ExecutionRecord, MeasurementRecord))
+                    and record.repository == repo
+                ):
+                    publication = self.store.one(
+                        "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",
+                        (repo, record.type, record.id),
+                    )
+                    if not publication or (
+                        publication["issue"] == issue
+                        and record_digest(RECORD_ADAPTER.validate_json(publication["data"]))
+                        == record_digest(record)
+                    ):
+                        self.store.queue_record(record, issue)
+                        with self.store.db:
+                            self.store.db.execute(
+                                "UPDATE record_publications SET state='published',error=NULL WHERE repository=? AND type=? AND id=?",
+                                (repo, record.type, record.id),
+                            )
+                            if isinstance(record, ExecutionRecord):
+                                self.store.db.execute(
+                                    "UPDATE scans SET report_sent=1 WHERE id=? AND repository=?",
+                                    (record.id, repo),
+                                )
+                await self.call(
+                    self.github.request, "DELETE", f"repos/{repo}/issues/comments/{comment['id']}"
+                )
+                removed.add(comment["id"])
+        if removed:
+            self.store.reconcile_records(
+                repo, issue, {comment["id"] for comment in comments} - removed
+            )
+        return len(removed)
+
     async def dashboard(self, repo):
         marker = "<!-- maxwell:dashboard:v1 -->"
         record = await self.channel(repo, "dashboards", marker, "Maxwell status")
@@ -800,12 +876,12 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
             baseline = next(
                 (item for item in measurements if item.id == measurement.baseline_id), None
             )
-        measurement_body = component_dashboard(repo, measurement, baseline)
         source_supported = human_confirmed = 0
         issues = await self.call(
             lambda: list(self.github.paginate(f"repos/{repo}/issues", {"state": "all"}))
         )
         remote = {item["number"]: item for item in issues if "pull_request" not in item}
+        measurement_body = component_dashboard(repo, measurement, baseline)
         for row in self.store.rows(
             "SELECT issue,data FROM github_records WHERE repository=? AND type='finding' AND status='current'",
             (repo,),
@@ -876,7 +952,6 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
                 counts = f", {selection.collected} collected, {selection.skipped} skipped"
             body += f"- `{scan['id'][:12]}`: {scan['state']}, {tokens}, {identity}{counts}\n"
         body += "\n</details>\n"
-        body += "\nAuthorized commands: `/maxwell scan --model MODEL [--provider PROVIDER] [--effort EFFORT]`, `/maxwell pause`, `/maxwell resume`.\n"
         body = self.config.redact(body)
         snapshot = self.paths.root / "reports" / (repo.replace("/", "--") + ".md")
         snapshot.write_text(body)
@@ -890,6 +965,7 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
                 f"repos/{repo}/issues/{record['issue']}",
                 json={"body": body},
             )
+        await self.clear_status_reports(repo, record["issue"])
         return record["issue"]
 
     async def commands(self, repo, issue, finding=None):

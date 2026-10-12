@@ -299,3 +299,38 @@ def test_hunt_context_reconstructs_from_github_in_a_fresh_home(
     assert "Empty input causes division by zero" in prompt
     assert "average" in prompt and record.id in prompt
     assert "fake-github-secret" not in prompt and "fake-provider-secret" not in prompt
+
+
+def test_auto_test_policy_and_architecture_hotspots_reach_hunters(store, source):
+    import sys
+
+    from maxwell.config import MeasurementTests
+
+    settings = MeasurementSettings(
+        tests={
+            "acme/repo": MeasurementTests(
+                command=[sys.executable, "-m", "pytest", "-q"],
+                runs=2,
+                warmups=0,
+                runtime_budget_seconds=60,
+            )
+        }
+    )
+    sha = git("rev-parse", "HEAD", cwd=source)
+    record = measurement(
+        sha,
+        settings=settings,
+        evidence={
+            "source": {
+                "architecture": {
+                    "coupling_hotspots": [{"module": "app", "reachable_dependencies": 3}],
+                    "cohesion_hotspots": [{"symbol": "Mixed", "lack_of_cohesion": 1}],
+                }
+            }
+        },
+    )
+    project(store, record)
+    context = measurement_context(store, "acme/repo", sha, MeasurementSettings())
+    assert context["available"]
+    assert context["hotspots"]["coupling_hotspots"][0]["reachable_dependencies"] == 3
+    assert context["hotspots"]["cohesion_hotspots"][0]["symbol"] == "Mixed"

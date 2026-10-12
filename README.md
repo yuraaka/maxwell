@@ -333,7 +333,7 @@ maxwell scan owner/repository --provider codex-work --model model-a
 maxwell scan owner/repository --provider claude-work --model model-b --effort high
 ```
 
-With no stage or model arguments, `maxwell scan` runs hunt → review → audit sequentially
+With no stage or model arguments, `maxwell scan` runs measurement → hunt → review → audit sequentially
 for each registered repository. Run `maxwell config apply` after changing configuration
 so automatic selection has current verified model metadata. It does not discover models
 or probe provider access during scanning.
@@ -652,12 +652,19 @@ maxwell measure owner/repo --revision FULL_COMMIT_SHA --json
 
 Measurement requires a registered repository and its GitHub credentials, with no
 provider or model selection. It analyzes a pinned committed snapshot without changing
-your checkout. By default it runs both stages: source analysis and the configured pytest
-command in separate disposable snapshots. Structural analysis never imports source modules. Use a trusted
+your checkout. A full `maxwell scan` measures first, then runs hunt, review, and audit.
+By default measurement runs source analysis and tests in separate disposable snapshots.
+When no test profile is configured, a detected pytest suite uses the repository's existing
+`.venv` when available (registered checkout or matching current checkout), then Maxwell's Python
+if it has pytest. It performs two measured runs, with no warmup and a 60-second runtime budget. Pytest must already be
+installed. Set `measurement.auto_test_runtime_budget_seconds` to change that budget; configure
+a repository test profile to select another interpreter, environment, run count, or budget. Structural analysis never imports source modules. Use a trusted
 local test environment: a disposable worktree is not an operating-system sandbox.
 Maxwell does not install dependencies or inherit provider/GitHub credentials into tests.
 
-Use repeatable `--skip-stage source` or `--skip-stage tests` arguments to disable stages.
+Use repeatable `--skip-stage source` or `--skip-stage tests` arguments on `measure` or `scan`
+to disable measurement stages. A full scan also accepts `--skip-stage hunt`, `review`, or `audit`;
+`--stage hunt|review|audit` still runs just that agent stage using published measurement context.
 Source covers complexity, duplication, and coupling; tests covers runtime and flakiness.
 Skipped stages reuse the latest compatible usable GitHub measurement, including across
 revisions. Reports mark reused factors and retain the original measurement ID, revision,
@@ -691,13 +698,13 @@ Warmups are excluded from timing and flakiness observations. Command and configu
 environment fingerprints are published; their values are not copied into public records.
 Complete local pytest reports and output logs remain under the measurement artifact.
 
-The versioned `maintenance-v1` policy has five factors, weighted **20% each** by default:
+The versioned `maintenance-v2` policy has five factors, weighted **20% each** by default:
 
 | Factor | Raw ratio and normalization |
 | --- | --- |
 | Complexity | Sum of excess function complexity above threshold 10 / total function complexity |
 | Duplication | Tokens covered by repeated exact token windows / analyzed tokens |
-| Cyclic dependency coupling | Modules in internal import cycles / analyzed modules |
+| Architecture coupling / cohesion | Equal mean of dependency propagation cost and lack of module/class cohesion |
 | Test running time | Median complete-suite wall duration / configured runtime budget |
 | Observed test flakiness | Tests exhibiting both pass and fail / consistently executed pass/fail tests |
 
@@ -714,7 +721,20 @@ cases/guards; nested function bodies are measured separately. Clones use exact t
 strings, ignoring comments and layout, with windows of at least 50 tokens spanning
 five token-bearing lines; overlapping coverage is counted once. Dependency graphs
 resolve static internal imports, including relative imports and configured source roots.
-Cycles determine the initial coupling score; module fan-out is supporting evidence.
+Architecture analysis excludes test modules using `architecture_exclude`. Dependency propagation
+cost is the fraction of ordered pairs of distinct production modules connected by an import path.
+It detects broad change exposure even in acyclic graphs; cycles receive no separate penalty.
+For each module and class, members form an undirected graph connected by direct calls or shared
+module state / instance attributes. Imported utilities alone do not connect module members.
+Class constructors are excluded so initialization cannot make unrelated methods appear cohesive.
+Lack of cohesion is the fraction of member pairs in different connected components, aggregated
+across eligible modules and classes. Units with fewer than two members contribute no pairs;
+empty pair populations contribute zero by policy. The architecture factor is the equal mean
+of these two ratios. Fan-in, fan-out, propagation and responsibility clusters are reported as
+hotspots. They are static maintenance signals, not proof of an architectural violation; legitimate
+facades and collections of pure functions need source review before a finding is produced.
+The new analyzer/policy starts a new baseline; the old cycle-only values are not comparable.
+Module and cohesion-member limits bound analysis and report unknown rather than truncate scores.
 Dynamic imports, parse failures, ambiguous module names, empty populations, and configured
 resource limits are reported as unavailable evidence rather than healthy zero values.
 
@@ -753,7 +773,8 @@ are counted separately from structural entropy.
 
 Hunters can associate findings with `complexity`, `duplication`, `coupling`, `test_runtime`,
 and `test_flakiness`. The evidence must explain why the proposed repair would reduce that
-factor's burden. An empty list means no established structural association; ordinary bugs
+factor's burden.
+An empty list means no established structural association; ordinary bugs
 need no association. Reviewers and auditors independently confirm or correct this list.
 The latest applicable assessment stage controls labels; conflicting decisions conservatively
 remove disputed associations. Rejected findings lose their factor labels. Legacy assessments
@@ -761,9 +782,9 @@ without a factor decision retain earlier associations. Finding identity does not
 These associations are qualitative; numerical impact estimates and ranking are a later step.
 
 Future execution and measurement records go to a separate **Maxwell history** issue marked
-`<!-- maxwell:history:v1 -->`. Assessments remain on their finding issues. Existing status-issue
-comments are preserved and still imported, and queued publications retain their original
-issue. GitHub records reconstruct the dashboard and agent reputation in a fresh SQLite database.
+`<!-- maxwell:history:v1 -->`. Assessments remain on their finding issues. Legacy generated execution and measurement comments on the status issue are removed; they are not migrated. Pending
+unpublished execution/measurement records targeting the status issue are redirected to history.
+Uncertain creations must first be reconciled before changing their destination. GitHub records reconstruct the dashboard and agent reputation in a fresh SQLite database.
 
 ## Execution boundary
 

@@ -741,7 +741,7 @@ def test_dashboard_links_contributions_and_keeps_reports_in_history(records, git
         fresh.close()
 
 
-def test_legacy_execution_stays_on_dashboard_without_duplicate_history(records, github):
+def test_legacy_execution_is_removed_without_duplicate_history(records, github):
     from maxwell.reporting import scan_report
 
     store, reporter, _, _, run_id = records
@@ -755,9 +755,8 @@ def test_legacy_execution_stays_on_dashboard_without_duplicate_history(records, 
         channel["issue"],
         scan_report(store.one("SELECT * FROM scans WHERE id=?", (run_id,))),
     )
-    original = list(github["comments"][channel["issue"]])
     asyncio.run(reporter.sync("acme/repo", process_commands=False))
-    assert github["comments"][channel["issue"]] == original
+    assert github["comments"][channel["issue"]] == []
     history = store.one("SELECT issue FROM histories")["issue"]
     assert not github["comments"].get(history)
     assert store.one("SELECT report_sent FROM scans")["report_sent"] == 1

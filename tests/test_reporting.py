@@ -190,3 +190,62 @@ def test_dashboard_without_measurement_links_unknown_components():
     assert body.count("[Unknown](") == len(FACTORS)
     assert "0.00 points" not in body
     assert "Measurement evidence" not in body
+
+
+def test_dashboard_removes_legacy_generated_comments(home, source, github):
+    store = Store(home.db)
+    store.register("acme/repo", str(source), "main")
+    client = GitHub(home.load().github)
+    try:
+        reporter = Reporter(store, client, home.load(), home)
+        issue = asyncio.run(reporter.dashboard("acme/repo"))
+        client.create_comment(
+            "acme/repo", issue, "<!-- maxwell:scan:" + "a" * 32 + " -->\nOld report"
+        )
+        client.create_comment(
+            "acme/repo", issue, "<!-- maxwell:measurement:" + "b" * 32 + " -->\nOld measurement"
+        )
+        asyncio.run(reporter.dashboard("acme/repo"))
+        assert github["comments"][issue] == []
+        asyncio.run(reporter.dashboard("acme/repo"))
+        assert github["comments"][issue] == []
+    finally:
+        client.close()
+        store.close()
+
+
+def test_unknown_component_explains_missing_evidence():
+    from maxwell.records import MeasurementRecord
+    from maxwell.reporting import component_dashboard
+
+    record = MeasurementRecord(
+        id="a" * 32,
+        repository="acme/repo",
+        sha="f" * 40,
+        analyzer_version="legacy",
+        policy_version="legacy",
+        coverage=0,
+        factors={},
+        factor_status={"test_runtime": "Pytest unavailable"},
+    )
+    body = component_dashboard("acme/repo", record)
+    assert ") — Pytest unavailable" in body
+
+
+def test_status_cleanup_preserves_human_comment_quoting_report(home, source, github):
+    store = Store(home.db)
+    store.register("acme/repo", str(source), "main")
+    client = GitHub(home.load().github)
+    try:
+        reporter = Reporter(store, client, home.load(), home)
+        issue = asyncio.run(reporter.dashboard("acme/repo"))
+        client.create_comment(
+            "acme/repo",
+            issue,
+            "Question about this report:\n<!-- maxwell:scan:" + "a" * 32 + " -->",
+        )
+        asyncio.run(reporter.dashboard("acme/repo"))
+        assert len(github["comments"][issue]) == 1
+    finally:
+        client.close()
+        store.close()

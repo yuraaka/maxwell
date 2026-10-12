@@ -235,6 +235,19 @@ class MeasurementSettings(Settings):
             ("complexity", "duplication", "coupling", "test_runtime", "test_flakiness"), 0.2
         )
     )
+    architecture_exclude: list[str] = Field(
+        default_factory=lambda: [
+            "tests/**",
+            "**/tests/**",
+            "test_*.py",
+            "**/test_*.py",
+            "conftest.py",
+            "**/conftest.py",
+        ]
+    )
+    max_architecture_modules: int = Field(default=1000, ge=1)
+    max_cohesion_members: int = Field(default=500, ge=2)
+    auto_test_runtime_budget_seconds: float = Field(default=60, gt=0)
     tests: dict[str, MeasurementTests] = Field(default_factory=dict)
 
     @field_validator("weights")

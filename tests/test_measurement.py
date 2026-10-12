@@ -554,39 +554,86 @@ def test_partial_contributions_preserve_weights_and_unknown_total():
     assert measurement_contributions(partial.model_copy(update={"protocol": "wrong"})) is None
 
 
-def test_existing_measurement_publication_stays_on_status_issue(home, source, github, monkeypatch):
-    from maxwell.reporting import Reporter
+def test_pending_legacy_measurement_is_redirected_to_history(home, source, github):
+    config = configure(home, source)
+    client = GitHub(config.github)
+    with StoreContext(home) as store:
+        reporter = Reporter(store, client, config, home)
+        try:
+            issue = asyncio.run(reporter.dashboard("acme/repo"))
+            record = measured()
+            store.queue_record(record, issue)
+            asyncio.run(reporter.publish_records("acme/repo"))
+            asyncio.run(reporter.dashboard("acme/repo"))
+            assert not github["comments"].get(issue)
+            history = store.one("SELECT issue FROM histories")["issue"]
+            publication = store.one(
+                "SELECT issue,state FROM record_publications WHERE id=?", (record.id,)
+            )
+            assert publication == {"issue": history, "state": "published"}
+            assert len(github["comments"][history]) == 1
+        finally:
+            client.close()
+
+
+def test_auto_detected_pytest_profile_runs_without_configuration(home, source, github):
+    (source / "test_app.py").write_text("def test_ok():\n    assert True\n")
+    commit(source)
+    with StoreContext(home) as store:
+        store.register("acme/repo", str(source), "main")
+    config = home.load()
+    assert not config.measurement.tests
+    result = asyncio.run(run_measurements(home, config, "acme/repo"))
+    assert result["valid"]
+    assert result["measurements"][0]["score"] is not None
+    with StoreContext(home) as store:
+        record = projected_measurements(store, "acme/repo")[-1]
+        assert record.evidence["tests"]["valid_runs"] == 2
+        assert record.evidence["tests"]["profile_origin"].startswith("auto-detected")
+        assert record.policy["tests"]["runtime_budget_seconds"] == 60
+
+
+def test_old_cycle_only_policy_is_not_reinterpreted():
+    old = measured(analyzer_version="python-ast-tokens-v1", policy_version="maintenance-v1")
+    assert measurement_contributions(old) is None
+    assert not compatible(old, measured())
+
+
+def test_auto_detection_uses_existing_checkout_venv_without_installing(source, monkeypatch):
+    from maxwell.measurement_runner import test_profile
+
+    (source / "test_app.py").write_text("def test_ok(): pass\n")
+    git("add", ".", cwd=source)
+    interpreter = source / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(
+        f"#!{sys.executable}\nimport os, sys\nos.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    interpreter.chmod(0o755)
+    monkeypatch.setattr("maxwell.measurement_runner.importlib.util.find_spec", lambda name: None)
+    profile, reason = test_profile(source, MeasurementSettings(), "acme/repo", source)
+    assert profile.command[0] == str(interpreter)
+    assert profile.runs == 2 and "auto-detected" in reason
+
+
+def test_cleanup_retires_uncertain_legacy_measurement_publication(home, source, github):
+    from maxwell.reporting import record_report
 
     config = configure(home, source)
-
-    async def legacy_history(reporter, repo):
-        channel = await reporter.channel(
-            repo, "dashboards", "<!-- maxwell:dashboard:v1 -->", "Maxwell status"
-        )
-        return channel["issue"]
-
-    with monkeypatch.context() as patch:
-        patch.setattr(Reporter, "history", legacy_history)
-        first = asyncio.run(run_measurements(home, config, "acme/repo"))
-    assert first["valid"]
-    dashboard = next(
-        item for item in github["issues"].values() if item["title"] == "Maxwell status"
-    )
-    original = list(github["comments"][dashboard["number"]])
+    client = GitHub(config.github)
     with StoreContext(home) as store:
-        with store.db:
-            store.db.execute("DELETE FROM record_publications WHERE type='measurement'")
-    second = asyncio.run(run_measurements(home, config, "acme/repo"))
-    assert second["valid"]
-    assert github["comments"][dashboard["number"]] == original
-    history = next(item for item in github["issues"].values() if item["title"] == "Maxwell history")
-    assert len(github["comments"][history["number"]]) == 1
-    with StoreContext(home) as store:
-        assert len(projected_measurements(store, "acme/repo")) == 2
-        assert (
-            store.one(
-                "SELECT issue FROM record_publications WHERE id=?",
-                (first["measurements"][0]["id"],),
-            )["issue"]
-            == dashboard["number"]
-        )
+        reporter = Reporter(store, client, config, home)
+        try:
+            issue = asyncio.run(reporter.dashboard("acme/repo"))
+            record = measured()
+            store.queue_record(record, issue)
+            with store.db:
+                store.db.execute("UPDATE record_publications SET state='uncertain'")
+            client.create_comment("acme/repo", issue, record_report(record))
+            asyncio.run(reporter.dashboard("acme/repo"))
+            assert store.one("SELECT state FROM record_publications")["state"] == "published"
+            asyncio.run(reporter.publish_records("acme/repo"))
+            assert not github["comments"].get(issue)
+            assert not github["comments"].get(store.one("SELECT issue FROM histories")["issue"])
+        finally:
+            client.close()

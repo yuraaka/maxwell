@@ -358,7 +358,12 @@ Maxwell ranks and selects the top {limit} new findings after confidence filterin
 Do not invent findings to fill the candidate limit. This heuristic does not prove exhaustive coverage.
 Use repository-relative paths and real source line numbers. Cite concrete source evidence.
 Distinguish expected behavior from the suspected defect; never claim reproduction.
-Prefer correctness issues. Avoid speculative rewrites and generic style preferences.
+Inspect both correctness bugs and measured maintenance hotspots. Include concrete
+structural maintenance findings where source evidence establishes a repair: complex
+responsibilities, duplicated behavior, broad dependency propagation, unrelated module/class
+responsibilities, avoidable test runtime, or observed flakes. Do not omit structural
+investigation just because correctness findings exist. Avoid speculative rewrites and
+generic style preferences; a measurement alone does not establish an architectural defect.
 For each finding, list factors whose measured burden its repair would reduce: complexity,
 duplication, coupling, test_runtime, test_flakiness. Explain the association in evidence.
 Use [] when no structural association is established. Bugs need no structural association;

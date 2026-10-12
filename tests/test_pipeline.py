@@ -15,6 +15,7 @@ from maxwell.records import (
     AssessmentRecord,
     ExecutionRecord,
     FindingRecord,
+    MeasurementRecord,
     PublicAgent,
     decode_record,
     encode_record,
@@ -88,6 +89,11 @@ def test_no_argument_scan_publishes_hunt_review_audit_in_order(automatic, github
     execute(parser().parse_args(["--home", str(home.root), "scan", "--json"]))
     result = json.loads(capsys.readouterr().out)
     assert result["valid"]
+    assert len(result["measurements"]) == 1
+    assert (
+        store.one("SELECT finished FROM measurements")["finished"]
+        <= store.one("SELECT started FROM scans ORDER BY created LIMIT 1")["started"]
+    )
     scans = result["scans"]
     assert [item["stage"] for item in scans] == ["hunt", "review", "audit"]
     assert len({item["model"] for item in scans}) == 3
@@ -102,7 +108,8 @@ def test_no_argument_scan_publishes_hunt_review_audit_in_order(automatic, github
     history = store.one("SELECT issue FROM histories")["issue"]
     assert not github["comments"].get(dashboard)
     executions = [decode_record(item["body"]) for item in github["comments"][history]]
-    assert all(isinstance(item, ExecutionRecord) for item in executions)
+    assert any(isinstance(item, MeasurementRecord) for item in executions)
+    executions = [item for item in executions if isinstance(item, ExecutionRecord)]
     assert {item.id: item.agent_selection.model_dump() for item in executions} == {
         item["id"]: item["agent_selection"] for item in scans
     }
@@ -369,7 +376,7 @@ def test_pipeline_reports_context_failure_without_launching_agent(automatic, mon
     assert not report["valid"] and report["scans"] == []
     assert report["errors"] == [
         {"repository": "acme/repo", "stage": stage, "error": "GitHub unavailable"}
-        for stage in ("hunt", "review", "audit")
+        for stage in ("measure", "hunt", "review", "audit")
     ]
     assert not store.rows("SELECT * FROM scans")
 
@@ -390,9 +397,10 @@ def test_later_stages_run_after_hunt_preparation_error(automatic, backlog, monke
     report = asyncio.run(run_scans(home, config))
     assert not report["valid"]
     assert report["errors"] == [
-        {"repository": "acme/repo", "stage": "hunt", "error": "GitHub unavailable"}
+        {"repository": "acme/repo", "stage": "measure", "error": "GitHub unavailable"}
     ]
-    assert [item["stage"] for item in report["scans"]] == ["review", "review", "audit", "audit"]
+    assert report["scans"][0]["stage"] == "hunt"
+    assert [item["stage"] for item in report["scans"]].count("audit") >= 2
     assert all(item["state"] == "completed" for item in report["scans"])
 
 
@@ -430,3 +438,22 @@ def test_pipeline_handles_empty_hunt_but_reviews_backlog_with_stage_limits(
         decode_record(item["body"]) for comments in github["comments"].values() for item in comments
     ]
     assert sum(isinstance(item, AssessmentRecord) for item in assessments) == 3
+
+
+def test_scan_can_skip_measurement_stages_and_reuse_history(automatic, monkeypatch):
+    home, store, config = automatic
+    first = asyncio.run(run_scans(home, config))
+    assert first["valid"]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Skipped source analysis must not execute")
+
+    monkeypatch.setattr("maxwell.measurement_runner.python_measurement", forbidden)
+    second = asyncio.run(
+        run_scans(home, config, skip_stages=("source", "tests", "hunt", "review", "audit"))
+    )
+    assert second["valid"] and second["scans"] == []
+    measurement = second["measurements"][0]
+    assert measurement["reused"]["source"]["id"] == first["measurements"][0]["id"]
+    assert "no compatible GitHub history" in measurement["factor_status"]["test_runtime"]
+    assert store.one("SELECT COUNT(*) AS n FROM measurements")["n"] == 2

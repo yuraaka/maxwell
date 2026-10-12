@@ -1,14 +1,18 @@
 import asyncio
 import contextlib
 import fcntl
+import importlib.util
 import json
 import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
+from pathlib import Path
 
+from maxwell.config import MeasurementTests
 from maxwell.github import GitHub
 from maxwell.measurement import (
     ANALYZER,
@@ -26,8 +30,62 @@ from maxwell.measurement_python import python_measurement
 from maxwell.measurement_tests import prepare_snapshot, run_test_measurement
 from maxwell.records import RECORD_ADAPTER, MeasurementRecord
 from maxwell.reporting import Reporter
-from maxwell.repositories import Repository
+from maxwell.repositories import Repository, git, github_name
 from maxwell.store import Store
+
+
+def pytest_interpreter(repository, checkout=None):
+    if checkout is None:
+        try:
+            root = Path(git("rev-parse", "--show-toplevel", cwd=Path.cwd()))
+            if (
+                github_name(git("remote", "get-url", "origin", cwd=root)).casefold()
+                == repository.casefold()
+            ):
+                checkout = root
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            pass
+    if checkout:
+        candidate = Path(checkout) / ".venv" / "bin" / "python"
+        if candidate.is_file():
+            try:
+                probe = subprocess.run(
+                    [str(candidate), "-I", "-c", "import pytest"],
+                    cwd="/",
+                    capture_output=True,
+                    timeout=10,
+                )
+                if probe.returncode == 0:
+                    return str(candidate.absolute())
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    return sys.executable if importlib.util.find_spec("pytest") is not None else None
+
+
+def test_profile(worktree, settings, repository, checkout=None):
+    configured = settings.tests.get(repository)
+    if configured:
+        return configured, "configured"
+    paths = git("ls-files", "-z", cwd=worktree, strip=False).split("\0")
+    suite = any(
+        path.endswith(".py")
+        and (Path(path).name.startswith("test_") or Path(path).name.endswith("_test.py"))
+        for path in paths
+    )
+    if not suite:
+        return None, "No configured test profile or detected pytest suite"
+    interpreter = pytest_interpreter(repository, checkout)
+    if interpreter is None:
+        return (
+            None,
+            "Pytest suite detected but no pytest runner is available; configure measurement.tests",
+        )
+    return MeasurementTests(
+        command=[interpreter, "-m", "pytest", "-q"],
+        runs=2,
+        warmups=0,
+        runtime_budget_seconds=settings.auto_test_runtime_budget_seconds,
+    ), "auto-detected pytest (2 runs; no warmup)"
 
 
 def recover_measurements(store, paths):
@@ -90,8 +148,35 @@ async def measure_one(
         with store.db:
             store.db.execute("UPDATE measurements SET sha=? WHERE id=?", (sha, identity))
         factors, status, evidence, fingerprint = {}, {}, {}, None
-        profile = config.measurement.tests.get(repository_record["name"])
-        policy = measurement_policy(config.measurement, repository_record["name"])
+        profiling = asyncio.create_task(
+            asyncio.to_thread(
+                test_profile,
+                worktree,
+                config.measurement,
+                repository_record["name"],
+                repository_record.get("directory")
+                or (
+                    repository_record["source"]
+                    if repository_record.get("source_kind", "local") == "local"
+                    else None
+                ),
+            )
+        )
+        try:
+            profile, profile_reason = await asyncio.shield(profiling)
+        except asyncio.CancelledError:
+            await profiling
+            raise
+        effective_settings = config.measurement.model_copy(
+            update={
+                "tests": {
+                    **config.measurement.tests,
+                    **({repository_record["name"]: profile} if profile else {}),
+                }
+            }
+        )
+        policy = measurement_policy(effective_settings, repository_record["name"])
+        progress(f"test profile: {profile_reason}")
         if skip_source or not run_tests:
             progress("loading historical stage results from GitHub")
             await reporter.project_repository_records(repository_record["name"])
@@ -158,12 +243,12 @@ async def measure_one(
             )
             factors.update(added)
             status.update(reasons)
-            evidence["tests"] = tests
+            evidence["tests"] = {**tests, "profile_origin": profile_reason}
         elif run_tests:
             status.update(
                 dict.fromkeys(
                     ("test_runtime", "test_flakiness"),
-                    "No configured test profile",
+                    profile_reason,
                 )
             )
         record = MeasurementRecord(
@@ -280,8 +365,10 @@ async def measure_one(
             "artifact": str(artifact),
         }
     finally:
-        await asyncio.to_thread(repository.cleanup, worktree)
-        client.close()
+        try:
+            await asyncio.to_thread(repository.cleanup, worktree)
+        finally:
+            client.close()
 
 
 async def run_measurements(

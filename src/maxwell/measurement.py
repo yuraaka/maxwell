@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 from maxwell.contracts import FACTORS
 from maxwell.records import RECORD_ADAPTER
 
-ANALYZER = "python-ast-tokens-v1"
-POLICY = "maintenance-v1"
+ANALYZER = "python-ast-architecture-v2"
+POLICY = "maintenance-v2"
 
 
 def digest(value):
@@ -18,6 +18,9 @@ def digest(value):
 
 def measurement_policy(settings, repository):
     policy = settings.model_dump(exclude={"tests"})
+    policy["architecture_normalization"] = (
+        "mean(reachable_module_pairs/possible_module_pairs,disconnected_member_pairs/possible_member_pairs)"
+    )
     policy["runtime_normalization"] = "min(median_seconds/budget_seconds,1)"
     profile = settings.tests.get(repository)
     if profile:
@@ -172,6 +175,12 @@ def measurement_report(record, baseline=None):
     source = record.evidence.get("source", {})
     if source:
         body += f"\nPython source coverage: {source.get('analyzed_files', 0)}/{source.get('eligible_files', 0)} eligible files; excluded files: {source.get('excluded_file_count', len(source.get('excluded_files', [])))}. Other source files not analyzed: {source.get('other_source_files', 0)}.\n"
+    architecture = source.get("architecture", {})
+    if architecture and "propagation_cost" in architecture:
+        body += f"\nArchitecture (production modules): propagation cost **{architecture['propagation_cost']:.4f}** ({architecture['reachable_pairs']}/{architecture['possible_dependency_pairs']} reachable module pairs); lack of cohesion **{architecture['lack_of_cohesion']:.4f}** ({architecture['disconnected_pairs']}/{architecture['possible_cohesion_pairs']} disconnected member pairs). Coupling combines these equally. Import cycles have no separate penalty.\n"
+        for item in architecture.get("cohesion_hotspots", [])[:5]:
+            name = str(item["symbol"]).replace("`", "").replace("\n", " ")
+            body += f"- `{name}`: {len(item['components'])} responsibility clusters; lack of cohesion {item['lack_of_cohesion']:.4f}.\n"
     if tests:
         body += f"\nMeasured test runs: {tests.get('valid_runs', 0)}/{tests.get('requested_runs', 0)}; warmups: {tests.get('warmups', 0)}.\n"
         if "median_seconds" in tests:

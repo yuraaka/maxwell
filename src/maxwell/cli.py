@@ -116,12 +116,21 @@ def parser():
     )
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
-    scan = add_command(commands, "scan", help="Run hunt → review → audit, or select one stage")
+    scan = add_command(
+        commands, "scan", help="Run measure → hunt → review → audit, or select one agent stage"
+    )
     scan.add_argument("repository", nargs="?")
     scan.add_argument(
         "--stage",
         choices=["hunt", "review", "audit"],
-        help="Run only this stage (default: all three sequentially)",
+        help="Run only this agent stage (default: measure, hunt, review, audit)",
+    )
+    scan.add_argument(
+        "--skip-stage",
+        action="append",
+        default=[],
+        choices=["source", "tests", "hunt", "review", "audit"],
+        help="Disable a stage; source/tests reuse compatible GitHub history (repeatable)",
     )
     scan.add_argument("--issue", type=positive_int, help="Finding issue to review or audit")
     scan.add_argument(
@@ -322,6 +331,7 @@ def execute(args):
                 issue=args.issue,
                 limit=args.limit,
                 force=args.force,
+                skip_stages=args.skip_stage,
                 on_progress=None if args.json else scan_line,
             )
         )

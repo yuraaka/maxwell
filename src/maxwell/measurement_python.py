@@ -6,6 +6,7 @@ import tokenize
 from collections import defaultdict
 from pathlib import Path
 
+from maxwell.measurement_architecture import architecture_measurement
 from maxwell.records import MeasurementFactor
 from maxwell.repositories import git
 
@@ -242,10 +243,15 @@ def python_measurement(worktree, settings):
                         graph[module].add(target)
                         break
     cycles = cyclic_components(graph)
+    architecture = {}
     if complete and modules and not collisions and not dynamic:
-        factors["coupling"] = MeasurementFactor(
-            numerator=sum(map(len, cycles)), denominator=len(modules), unit="cyclic_modules/modules"
-        )
+        value, reason, architecture = architecture_measurement(graph, modules, trees, settings)
+        if value is not None:
+            factors["coupling"] = MeasurementFactor(
+                numerator=value, denominator=1, unit="mean(propagation_cost,lack_of_cohesion)"
+            )
+        else:
+            status["coupling"] = reason
     else:
         status["coupling"] = reason if not complete else "Ambiguous modules or dynamic imports"
     details = {
@@ -284,6 +290,7 @@ def python_measurement(worktree, settings):
         )[:20],
         "clone_examples": examples,
         "cycles": cycles[:20],
+        "architecture": architecture,
         "module_fanout": sorted(
             ({"module": module, "fanout": len(targets)} for module, targets in graph.items()),
             key=lambda item: (-item["fanout"], item["module"]),

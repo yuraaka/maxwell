@@ -240,12 +240,25 @@ def human_lines(value, command, repo_command=None):
             )
             for item in value.get("skipped", [])
         ]
-        if not value["scans"] and not skipped and not value.get("errors"):
+        if (
+            not value["scans"]
+            and not value.get("measurements")
+            and not skipped
+            and not value.get("errors")
+        ):
             return ["No repositories to scan."]
         lines = [
             f"[FAIL] {item['repository']} / {item['stage']}: {item['error']}"
             for item in value.get("errors", [])
         ] + skipped
+        for item in value.get("measurements", []):
+            score = f"{item['score']:.2f}/100" if item.get("score") is not None else "unknown"
+            lines.append(f"[MEASURE] {item['repository']}: entropy {score}")
+            for factor, status in item.get("factor_status", {}).items():
+                if status != "measured":
+                    lines.append(f"[UNKNOWN] {factor}: {status}")
+            if item.get("report"):
+                lines.append(f"Measurement: {item['report']}")
         for scan in value["scans"]:
             if scan["report"]:
                 lines.append(f"Report: {scan['report']}")

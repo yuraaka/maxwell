@@ -40,8 +40,10 @@ def measurement_context(store, repository, sha, settings):
             for record in reversed(history)
             if record.analyzer_version == ANALYZER
             and record.policy_version == POLICY
-            and record.policy == policy
-            and record.protocol == digest(policy)
+            and {k: v for k, v in record.policy.items() if k != "tests"}
+            == {k: v for k, v in policy.items() if k != "tests"}
+            and ("tests" not in policy or record.policy.get("tests") == policy["tests"])
+            and record.protocol == digest(record.policy)
         ),
         None,
     )
@@ -50,11 +52,15 @@ def measurement_context(store, repository, sha, settings):
     now = time.time()
     source, tests = current.evidence.get("source", {}), current.evidence.get("tests", {})
     baseline = next((record for record in history if compatible(record, current)), None)
+    architecture = source.get("architecture", {})
+    architecture = architecture if isinstance(architecture, dict) else {}
     hotspot_sources = {
         "complex_functions": (source, "complex_functions", 20),
         "clone_examples": (source, "clone_examples", 20),
         "import_cycles": (source, "cycles", 20),
         "module_fanout": (source, "module_fanout", 20),
+        "coupling_hotspots": (architecture, "coupling_hotspots", 20),
+        "cohesion_hotspots": (architecture, "cohesion_hotspots", 20),
         "slow_tests": (tests, "slow_tests", 20),
         "observed_flaky_tests": (tests, "observed_flaky_tests", 50),
         "persistent_failures": (tests, "persistent_failures", 50),

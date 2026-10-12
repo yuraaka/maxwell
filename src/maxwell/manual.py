@@ -8,6 +8,7 @@ from maxwell.assessment import collect_targets
 from maxwell.contracts import Usage, micros
 from maxwell.daemon import Daemon
 from maxwell.github import GitHub
+from maxwell.measurement_runner import measure_one, recover_measurements
 from maxwell.progress import ScanProgress
 from maxwell.reporting import Reporter
 from maxwell.store import Store
@@ -183,6 +184,7 @@ async def run_scans(
     limit=None,
     force=False,
     on_progress=None,
+    skip_stages=(),
 ):
     if stage not in (None, "hunt", "review", "audit"):
         raise ValueError("Stage must be hunt, review, or audit")
@@ -192,6 +194,10 @@ async def run_scans(
         raise ValueError("--issue requires a repository")
     if (issue is not None and issue < 1) or (limit is not None and limit < 1):
         raise ValueError("--issue and --limit must be positive integers")
+    if set(skip_stages) - {"source", "tests", "hunt", "review", "audit"}:
+        raise ValueError("Unknown skipped stage")
+    if stage is not None and skip_stages:
+        raise ValueError("--skip-stage applies to the full scan; use --stage for one agent stage")
     config.ready()
     with paths.lock.open("a+") as lock:
         try:
@@ -221,7 +227,8 @@ async def run_scans(
                         f"Configure a token for GitHub account {record['github_account']!r}"
                     )
             engine.recover()
-            results, skipped, errors = [], [], []
+            recover_measurements(store, paths)
+            results, skipped, errors, measurements = [], [], [], []
             stages = (stage,) if stage else ("hunt", "review", "audit")
             for record in records:
                 client = GitHub(
@@ -230,7 +237,50 @@ async def run_scans(
                 )
                 reporter = Reporter(store, client, config, paths)
                 try:
+                    if stage is None:
+                        progress = ScanProgress({"repository": record["name"]}, on_progress)
+                        try:
+                            async with progress.watch():
+                                measured = await measure_one(
+                                    paths,
+                                    config,
+                                    store,
+                                    record,
+                                    None,
+                                    "tests" not in skip_stages,
+                                    "source" in skip_stages,
+                                    progress.update,
+                                )
+                            measurements.append(measured)
+                            if measured["state"] != "completed" or measured.get(
+                                "publication_error"
+                            ):
+                                errors.append(
+                                    {
+                                        "repository": record["name"],
+                                        "stage": "measure",
+                                        "error": measured.get("error")
+                                        or measured["publication_error"],
+                                    }
+                                )
+                        except Exception as exc:
+                            errors.append(
+                                {
+                                    "repository": record["name"],
+                                    "stage": "measure",
+                                    "error": config.redact(str(exc)),
+                                }
+                            )
                     for current_stage in stages:
+                        if current_stage in skip_stages:
+                            skipped.append(
+                                {
+                                    "repository": record["name"],
+                                    "stage": current_stage,
+                                    "reason": "Explicitly skipped",
+                                }
+                            )
+                            continue
                         if on_progress and stage is None:
                             on_progress(
                                 {
@@ -323,6 +373,7 @@ async def run_scans(
                     client.close()
             return {
                 "scans": results,
+                "measurements": measurements,
                 "skipped": skipped,
                 "errors": errors,
                 "valid": not errors

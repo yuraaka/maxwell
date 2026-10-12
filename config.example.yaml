@@ -51,6 +51,10 @@ measurement:
   max_file_bytes: 1000000
   exclude: ["vendor/**", "generated/**", "**/*_pb2.py"]
   source_roots: [src, "."]
+  architecture_exclude: ["tests/**", "**/tests/**", "test_*.py", "**/test_*.py", "conftest.py", "**/conftest.py"]
+  max_architecture_modules: 1000
+  max_cohesion_members: 500
+  auto_test_runtime_budget_seconds: 60
   weights:
     complexity: 0.2
     duplication: 0.2
@@ -58,7 +62,7 @@ measurement:
     test_runtime: 0.2
     test_flakiness: 0.2
   tests: {}
-  # Configure a trusted pytest runner per repository; measure runs tests by default.
+  # Configure a pytest runner or use automatic detection with two measured runs.
   # tests:
   #   owner/repo:
   #     command: [/absolute/path/to/venv/bin/python, -m, pytest, -q]

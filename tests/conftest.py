@@ -229,6 +229,19 @@ def github():
                 else:
                     self.respond(404, {})
 
+        def do_DELETE(self):
+            if not self.authorized():
+                return
+            parts = urlparse(self.path).path.strip("/").split("/")
+            if parts[-2] != "comments":
+                return self.respond(404, {})
+            with lock:
+                for comments in state["comments"].values():
+                    comments[:] = [
+                        comment for comment in comments if comment["id"] != int(parts[-1])
+                    ]
+            self.respond(200, {})
+
         def do_PATCH(self):
             if not self.authorized():
                 return
