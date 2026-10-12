@@ -4,13 +4,21 @@ import json
 import re
 import shlex
 import time
+from urllib.parse import urlencode
 
-from maxwell.assessment import current_assessments
-from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, SelectionStats
+from maxwell.assessment import current_assessments, finding_factors
+from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, FACTORS, SelectionStats
 from maxwell.github import PublicationUncertain
-from maxwell.measurement import measurement_report, measurement_score, projected_measurements
+from maxwell.measurement import (
+    compatible,
+    measurement_contributions,
+    measurement_report,
+    measurement_score,
+    projected_measurements,
+)
 from maxwell.records import (
     RECORD_ADAPTER,
+    AgentSelection,
     AssessmentRecord,
     ExecutionRecord,
     FindingRecord,
@@ -35,7 +43,22 @@ def token_summary(usage):
     )
 
 
-def scan_report(scan, finding_ids=()):
+def agent_selection_report(value):
+    if not value:
+        return ""
+    decision = AgentSelection.model_validate(value)
+    basis = {
+        "explicit": "explicit model override",
+        "thompson-source-v1": "Thompson sampling from provisional source support or reviewer–auditor agreement",
+        "uniform-unrated-v1": "uniform sampling; auditor quality is unrated",
+    }[decision.method]
+    body = f"\nAgent selection: {basis}; {decision.candidates} eligible public identities. Independence: {decision.independence}.\n"
+    if decision.method == "thompson-source-v1":
+        body += f"Provisional observations: {decision.successes} positive, {decision.failures} negative. Beta prior: (2, 2); selected draw: {decision.draw:.6f}. These are source proxies, not validated accuracy.\n"
+    return body
+
+
+def scan_report(scan, finding_ids=(), *, record=None):
     usage = json.loads(scan["usage"] or "{}")
     tokens = token_summary(usage)
     agent = public_agent(scan)
@@ -68,6 +91,7 @@ Cached input and cache writes are included in input; total is input plus output.
 Missing usage is unknown, not zero. Tokens are recorded once per execution, not per finding.
 """
     execution = json.loads(scan.get("execution") or "{}")
+    body += agent_selection_report(execution.get("agent_selection"))
     if target := execution.get("target"):
         body += f"\nFinding issue: #{target['issue']}; finding: `{target['finding']['id']}`.\n"
         if target.get("reviews"):
@@ -110,7 +134,7 @@ for automatic publication on a later scan. Collection is bounded at {candidate_l
         "interrupted",
         "skipped",
     ):
-        body += "\n" + encode_record(execution_record(scan, finding_ids)) + "\n"
+        body += "\n" + encode_record(record or execution_record(scan, finding_ids)) + "\n"
     return body
 
 
@@ -124,6 +148,11 @@ def record_report(record):
             f"Agent / actor: `{identity}`\n\n"
             f"Verdict: **{record.verdict}**; actionability: {record.actionability}\n\n"
             f"{record.evidence}\n"
+            + (
+                f"\nAssessed factors: {', '.join(record.factors) or 'none established'}.\n"
+                if record.factors is not None
+                else ""
+            )
         )
         if record.execution_id:
             body += f"\nExecution: `{record.execution_id}`.\n"
@@ -139,6 +168,7 @@ def record_report(record):
             f"{record.summary}\n\n{token_summary(record.usage.model_dump())}.\n"
             f"Usage complete: {record.usage.complete}.\n"
         )
+        body += agent_selection_report(record.agent_selection)
     else:
         body = marker + measurement_report(record)
     return body + "\n" + encode_record(record) + "\n"
@@ -170,6 +200,35 @@ def hunter_ratings(store, repo=None):
     ]
 
 
+def component_dashboard(repository, measurement, baseline=None):
+    contributions = (measurement_contributions(measurement) or {}) if measurement else {}
+    body = f"Revision: `{measurement.sha}`.\n\n" if measurement else ""
+    score = measurement_score(measurement) if measurement else None
+    baseline_score = measurement_score(baseline) if baseline else None
+    if (
+        measurement
+        and baseline
+        and compatible(baseline, measurement)
+        and score is not None
+        and baseline_score is not None
+    ):
+        body += f"Change from baseline: **{score - baseline_score:+.2f} points**.\n\n"
+    body += "| Component | Entropy contribution |\n| --- | --- |\n"
+    for factor in FACTORS:
+        value = f"{contributions[factor]:.2f} points" if factor in contributions else "Unknown"
+        query = f'repo:{repository} is:issue is:open label:"maxwell:factor:{factor}" -label:"maxwell:state:rejected"'
+        url = "https://github.com/issues?" + urlencode({"q": query})
+        body += f"| {factor.replace('_', ' ').capitalize()} | [{value}]({url}) |\n"
+    body += "\nContributions use policy weights; missing weights are not redistributed. Values are rounded to two decimals. Links show associated findings, not guaranteed reductions.\n"
+    if measurement:
+        body += (
+            "\n<details>\n<summary>Measurement evidence and calculation</summary>\n\n"
+            + measurement_report(measurement, baseline)
+            + "\n</details>\n"
+        )
+    return body
+
+
 class Reporter:
     def __init__(self, store, github, config, paths):
         self.store, self.github, self.config, self.paths = store, github, config, paths
@@ -192,7 +251,11 @@ class Reporter:
 
     async def project_issue_records(self, repo, issue):
         authors = await self.authorized_authors()
-        comments = await self.call(self.github.comments, repo, issue["number"])
+        comments = (
+            []
+            if issue.get("comments") == 0
+            else await self.call(self.github.comments, repo, issue["number"])
+        )
         sources = [(0, issue), *((comment["id"], comment) for comment in comments)]
         seen = set()
         finding_id = None
@@ -250,6 +313,7 @@ class Reporter:
             if "pull_request" not in issue and (
                 "<!-- maxwell:finding:" in (issue.get("body") or "")
                 or "<!-- maxwell:dashboard:v1 -->" in (issue.get("body") or "")
+                or "<!-- maxwell:history:v1 -->" in (issue.get("body") or "")
             ):
                 await self.project_issue_records(repo, issue)
                 seen.add(issue["number"])
@@ -292,13 +356,20 @@ class Reporter:
                     label
                     for label in labels
                     if label not in managed_states
-                    and not label.startswith(("maxwell:review:", "maxwell:audit:"))
+                    and not label.startswith(
+                        ("maxwell:review:", "maxwell:audit:", "maxwell:factor:")
+                    )
                 }
                 if not retained.intersection(
                     {"maxwell:state:human-confirmed", "maxwell:state:rejected"}
                 ):
                     retained.add(f"maxwell:state:{state}")
-                return labels, retained | assessment_labels
+                factors = finding_factors(finding, reviews, audits)
+                if "maxwell:state:rejected" in retained:
+                    factors = []
+                return labels, retained | assessment_labels | {
+                    f"maxwell:factor:{factor}" for factor in factors
+                }
 
             before, desired = desired_labels(issue)
             if before == desired:
@@ -330,7 +401,10 @@ class Reporter:
         authors = await self.authorized_authors()
         context, identities = [], set()
         for issue in issues:
-            if "pull_request" in issue:
+            if "pull_request" in issue or any(
+                marker in (issue.get("body") or "")
+                for marker in ("<!-- maxwell:dashboard:v1 -->", "<!-- maxwell:history:v1 -->")
+            ):
                 continue
             entry = {
                 "issue": issue["number"],
@@ -368,6 +442,23 @@ class Reporter:
             "shown_issues": min(len(context), 100),
         }, identities
 
+    async def record_comment(self, repo, issue, marker, record, authors):
+        comments = await self.call(self.github.comments, repo, issue)
+        existing = [item for item in comments if marker in (item.get("body") or "")]
+        if len(existing) > 1:
+            raise ValueError("Duplicate record markers require reconciliation")
+        if not existing:
+            return None
+        comment = existing[0]
+        remote = decode_record(comment["body"])
+        if (
+            comment.get("user", {}).get("login") not in authors
+            or remote is None
+            or record_digest(remote) != record_digest(record)
+        ):
+            raise ValueError("Existing record conflicts; publish a superseding record")
+        return comment
+
     async def publish_records(self, repo):
         authors = await self.authorized_authors()
         for row in self.store.rows(
@@ -378,25 +469,24 @@ class Reporter:
                 record = RECORD_ADAPTER.validate_json(row["data"])
                 if isinstance(record, AssessmentRecord) and record.role == "human":
                     raise ValueError("Human assessments must be authored directly on GitHub")
-                body = self.config.redact(record_report(record))
+                scan = (
+                    self.store.one("SELECT * FROM scans WHERE id=?", (record.id,))
+                    if isinstance(record, ExecutionRecord)
+                    else None
+                )
+                rendered = (
+                    f"<!-- maxwell:execution:{record.id} -->\n"
+                    + scan_report(scan, record.finding_ids, record=record)
+                    if scan
+                    else record_report(record)
+                )
+                body = self.config.redact(rendered)
                 record = decode_record(body)
                 marker = f"<!-- maxwell:{record.type}:{record.id} -->"
-                comments = await self.call(self.github.comments, repo, row["issue"])
-                existing = [item for item in comments if marker in (item.get("body") or "")]
-                if len(existing) > 1:
-                    raise ValueError("Duplicate record markers require reconciliation")
-                if existing:
-                    comment = existing[0]
-                    remote = decode_record(comment["body"])
-                    if (
-                        comment.get("user", {}).get("login") not in authors
-                        or remote is None
-                        or record_digest(remote) != record_digest(record)
-                    ):
-                        raise ValueError("Existing record conflicts; publish a superseding record")
-                elif row["state"] == "uncertain":
-                    continue
-                else:
+                comment = await self.record_comment(repo, row["issue"], marker, record, authors)
+                if comment is None:
+                    if row["state"] == "uncertain":
+                        continue
                     with self.store.db:
                         self.store.db.execute(
                             "UPDATE record_publications SET state='uncertain' "
@@ -408,7 +498,11 @@ class Reporter:
                             self.github.create_comment, repo, row["issue"], body
                         )
                     except PublicationUncertain:
-                        raise
+                        comment = await self.record_comment(
+                            repo, row["issue"], marker, record, authors
+                        )
+                        if comment is None:
+                            raise
                     except Exception:
                         with self.store.db:
                             self.store.db.execute(
@@ -459,6 +553,7 @@ Scanned revision: `{scan["sha"]}`
 Location: `{data["path"]}:{data["line"]}` (`{data["symbol"]}`)  
 Suggested priority: {data["priority"]}; hunter confidence: {data["confidence"]:.0%}
 Agent: `{agent.display() if agent else "Unknown legacy agent"}`
+Proposed factors: {", ".join(data.get("factors", [])) or "none established"}.
 
 ### Evidence
 {data["evidence"]}
@@ -502,16 +597,21 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
                             "maxwell",
                             "maxwell:state:suspected",
                             f"maxwell:priority:{data['priority']}",
+                            *[f"maxwell:factor:{factor}" for factor in data.get("factors", [])],
                         ],
                     )
                 except PublicationUncertain:
-                    raise
+                    issue = await self.call(self.github.find_issue, repo, marker)
+                    if issue is None:
+                        raise
                 except Exception:
                     with self.store.db:
                         self.store.db.execute(
                             "UPDATE findings SET state='pending' WHERE id=?", (identity,)
                         )
                     raise
+            if issue.get("user", {}).get("login") not in await self.authorized_authors():
+                raise ValueError("Finding marker belongs to an unauthorized author")
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE findings SET state=?,issue=?,url=?,error=NULL WHERE id=?",
@@ -528,9 +628,10 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
 
     async def publish_scan_reports(self, repo, issue, scans):
         published = False
+        if any(scan["finished"] and not scan["report_sent"] for scan in scans):
+            await self.project_repository_records(repo)
         for scan in scans:
             if scan["finished"] and not scan["report_sent"]:
-                published = True
                 finding_ids = [
                     row["finding_id"]
                     for row in self.store.rows(
@@ -540,60 +641,109 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
                 ]
                 report = self.config.redact(scan_report(scan, finding_ids))
                 (self.paths.root / "reports" / f"{scan['id']}.md").write_text(report)
-                await self.call(
-                    self.github.upsert_comment,
-                    repo,
-                    issue,
-                    f"<!-- maxwell:scan:{scan['id']} -->",
-                    report,
+                existing = self.store.one(
+                    "SELECT status FROM github_records WHERE repository=? AND type='execution' AND id=?",
+                    (repo, scan["id"]),
                 )
+                if existing and existing["status"] != "current":
+                    raise ValueError("Existing execution record requires reconciliation")
+                if not existing:
+                    publication = self.store.one(
+                        "SELECT id FROM record_publications WHERE repository=? AND type='execution' AND id=?",
+                        (repo, scan["id"]),
+                    )
+                    if not publication:
+                        self.store.queue_record(execution_record(scan, finding_ids), issue)
+                    await self.publish_records(repo)
+                    publication = self.store.one(
+                        "SELECT state FROM record_publications WHERE repository=? AND type='execution' AND id=?",
+                        (repo, scan["id"]),
+                    )
+                    if publication["state"] != "published":
+                        raise ValueError("Execution publication requires reconciliation")
                 with self.store.db:
                     self.store.db.execute(
                         "UPDATE scans SET report_sent=1 WHERE id=?", (scan["id"],)
                     )
+                published = True
         return published
 
-    async def dashboard(self, repo):
+    async def channel_issue(self, repo, marker):
+        matches = await self.call(
+            lambda: [
+                item
+                for item in self.github.paginate(f"repos/{repo}/issues", {"state": "all"})
+                if "pull_request" not in item and marker in (item.get("body") or "")
+            ]
+        )
+        if len(matches) > 1:
+            raise ValueError("Duplicate channel markers require reconciliation")
+        issue = matches[0] if matches else None
+        if issue and issue.get("user", {}).get("login") not in await self.authorized_authors():
+            raise ValueError("Channel marker belongs to an unauthorized author")
+        return issue
+
+    async def channel(self, repo, table, marker, title):
         with self.store.db:
-            self.store.db.execute("INSERT OR IGNORE INTO dashboards(repository) VALUES(?)", (repo,))
-        record = self.store.one("SELECT * FROM dashboards WHERE repository=?", (repo,))
-        marker = "<!-- maxwell:dashboard:v1 -->"
+            self.store.db.execute(f"INSERT OR IGNORE INTO {table}(repository) VALUES(?)", (repo,))
+        record = self.store.one(f"SELECT * FROM {table} WHERE repository=?", (repo,))
         if not record["issue"]:
-            issue = await self.call(self.github.find_issue, repo, marker)
+            issue = await self.channel_issue(repo, marker)
             if not issue and record["state"] == "uncertain":
-                return None
+                raise ValueError("Issue creation is uncertain; reconciliation required")
             if not issue:
                 with self.store.db:
                     self.store.db.execute(
-                        "UPDATE dashboards SET state='uncertain' WHERE repository=?", (repo,)
+                        f"UPDATE {table} SET state='uncertain' WHERE repository=?", (repo,)
                     )
                 try:
-                    issue = await self.call(
-                        self.github.create_issue, repo, "Maxwell status", marker
-                    )
-                except PublicationUncertain:
-                    raise
+                    body = marker
+                    if table == "histories":
+                        body += "\n\nAppend-only execution and measurement records. Current entropy and component links are shown on the Maxwell status issue. Assessments remain on their finding issues.\n"
+                    issue = await self.call(self.github.create_issue, repo, title, body)
+                except PublicationUncertain as exc:
+                    issue = await self.channel_issue(repo, marker)
+                    if issue is None:
+                        self.error(table, "repository", repo, exc)
+                        raise
                 except Exception:
                     with self.store.db:
                         self.store.db.execute(
-                            "UPDATE dashboards SET state='pending' WHERE repository=?", (repo,)
+                            f"UPDATE {table} SET state='pending' WHERE repository=?", (repo,)
                         )
                     raise
             with self.store.db:
                 self.store.db.execute(
-                    "UPDATE dashboards SET issue=?,url=?,state='published',error=NULL "
-                    "WHERE repository=?",
+                    f"UPDATE {table} SET issue=?,url=?,state='published',error=NULL WHERE repository=?",
                     (issue["number"], issue["html_url"], repo),
                 )
-            record["issue"] = issue["number"]
+            record = self.store.one(f"SELECT * FROM {table} WHERE repository=?", (repo,))
+        else:
+            issue = await self.call(
+                self.github.request, "GET", f"repos/{repo}/issues/{record['issue']}"
+            )
+            if (
+                marker not in (issue.get("body") or "")
+                or issue.get("user", {}).get("login") not in await self.authorized_authors()
+            ):
+                raise ValueError("Channel identity changed; reconciliation required")
+        return record
+
+    async def history(self, repo):
+        record = await self.channel(
+            repo, "histories", "<!-- maxwell:history:v1 -->", "Maxwell history"
+        )
+        return record["issue"]
+
+    async def dashboard(self, repo):
+        marker = "<!-- maxwell:dashboard:v1 -->"
+        record = await self.channel(repo, "dashboards", marker, "Maxwell status")
+        history_issue = await self.history(repo)
         scans = self.store.rows(
             "SELECT * FROM scans WHERE repository=? ORDER BY created DESC", (repo,)
         )
-        if await self.publish_scan_reports(repo, record["issue"], scans):
-            remote = await self.call(
-                self.github.request, "GET", f"repos/{repo}/issues/{record['issue']}"
-            )
-            await self.project_issue_records(repo, remote)
+        if await self.publish_scan_reports(repo, history_issue, scans):
+            await self.project_repository_records(repo)
         findings = self.store.rows("SELECT * FROM findings WHERE repository=?", (repo,))
         scan_history = {}
         finding_ids = {finding["id"] for finding in findings}
@@ -639,7 +789,7 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         measurements = projected_measurements(self.store, repo)
         measurement = measurements[-1] if measurements else None
         entropy = "Unavailable — run `maxwell measure` to establish a baseline"
-        measurement_body = ""
+        baseline = None
         if measurement:
             score = measurement_score(measurement)
             entropy = (
@@ -650,9 +800,49 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
             baseline = next(
                 (item for item in measurements if item.id == measurement.baseline_id), None
             )
-            measurement_body = measurement_report(measurement, baseline)
+        measurement_body = component_dashboard(repo, measurement, baseline)
+        source_supported = human_confirmed = 0
+        issues = await self.call(
+            lambda: list(self.github.paginate(f"repos/{repo}/issues", {"state": "all"}))
+        )
+        remote = {item["number"]: item for item in issues if "pull_request" not in item}
+        for row in self.store.rows(
+            "SELECT issue,data FROM github_records WHERE repository=? AND type='finding' AND status='current'",
+            (repo,),
+        ):
+            finding = RECORD_ADAPTER.validate_json(row["data"])
+            issue = remote.get(row["issue"])
+            if (
+                not issue
+                or issue["state"] != "open"
+                or finding.finding.kind != "bug"
+                or finding.finding.identity(repo) != finding.id
+            ):
+                continue
+            labels = {label["name"] for label in issue.get("labels", [])}
+            if "maxwell:state:rejected" in labels:
+                continue
+            if "maxwell:state:human-confirmed" in labels:
+                human_confirmed += 1
+            else:
+                reviews, audits = current_assessments(self.store, repo, row["issue"], finding)
+                decisions = audits or reviews
+                if decisions and all(record.verdict == "supported" for record in decisions):
+                    source_supported += 1
         body = f"""{marker}
 # Maxwell status
+
+**Repository entropy: {entropy}.**
+
+Open bug burden: **{source_supported} source-supported**, **{human_confirmed} human-confirmed**.
+Reported separately from structural entropy; source support does not imply reproduction.
+
+{measurement_body}
+
+[Execution and measurement history](https://github.com/{repo}/issues/{history_issue}).
+
+<details>
+<summary>Activity, tokens, and agent reputation</summary>
 
 Hunting, review, and audit use separate executions. Source assessments do not imply reproduction.
 
@@ -672,8 +862,6 @@ Hunting, review, and audit use separate executions. Source assessments do not im
 Token totals include reported usage from failed attempts. Missing usage is unknown,
 not zero; totals may be partial when execution usage is unavailable or incomplete.
 
-{measurement_body}
-
 {reputation}
 
 ### Recent scans
@@ -687,6 +875,7 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
                 selection = SelectionStats.model_validate_json(scan["selection"])
                 counts = f", {selection.collected} collected, {selection.skipped} skipped"
             body += f"- `{scan['id'][:12]}`: {scan['state']}, {tokens}, {identity}{counts}\n"
+        body += "\n</details>\n"
         body += "\nAuthorized commands: `/maxwell scan --model MODEL [--provider PROVIDER] [--effort EFFORT]`, `/maxwell pause`, `/maxwell resume`.\n"
         body = self.config.redact(body)
         snapshot = self.paths.root / "reports" / (repo.replace("/", "--") + ".md")
@@ -835,15 +1024,18 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
                         "publication_retry_authorized", {"finding": argument, "actor": actor}
                     )
 
-    async def refresh_findings(self, repository, *, process_commands=True):
+    async def refresh_findings(self, repository, *, process_commands=True, issues=None):
+        remote_issues = {issue["number"]: issue for issue in issues or []}
         for finding in self.store.rows(
             "SELECT * FROM findings WHERE repository=? AND issue IS NOT NULL", (repository,)
         ):
             if process_commands:
                 await self.commands(repository, finding["issue"], finding)
-            remote = await self.call(
-                self.github.request, "GET", f"repos/{repository}/issues/{finding['issue']}"
-            )
+            remote = remote_issues.get(finding["issue"]) if not process_commands else None
+            if remote is None:
+                remote = await self.call(
+                    self.github.request, "GET", f"repos/{repository}/issues/{finding['issue']}"
+                )
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE findings SET state='closed' WHERE id=? "
@@ -867,13 +1059,14 @@ not zero; totals may be partial when execution usage is unavailable or incomplet
             name = repo["name"]
             try:
                 await self.publish_records(name)
-                await self.project_repository_records(name)
+                issues = await self.project_repository_records(name)
                 issue = await self.dashboard(name)
                 if issue and process_commands:
                     await self.commands(name, issue)
-                await self.refresh_findings(name, process_commands=process_commands)
+                await self.refresh_findings(name, process_commands=process_commands, issues=issues)
                 issues = await self.project_repository_records(name)
                 await self.reconcile_assessment_labels(name, issues)
+                await self.dashboard(name)
                 with self.store.db:
                     self.store.db.execute(
                         "UPDATE dashboards SET error=NULL WHERE repository=?", (name,)

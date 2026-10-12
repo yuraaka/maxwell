@@ -19,7 +19,7 @@ from maxwell.store import Store
 
 def scan_args(home, *arguments):
     return parser().parse_args(
-        ["--home", str(home.root), "scan", *arguments, "--model", "fake-model"]
+        ["--home", str(home.root), "scan", *arguments, "--stage", "hunt", "--model", "fake-model"]
     )
 
 
@@ -132,7 +132,7 @@ def test_fresh_home_uses_github_findings_for_context_and_deduplication(
         prompt = fresh.root / "artifacts" / second["scans"][0]["id"] / "prompt.txt"
         assert issue["title"] in prompt.read_text()
         assert f'"state": "{state}"' in prompt.read_text()
-        assert github["creates"] == 2
+        assert github["creates"] == 3
         if not legacy:
             assert store.one("SELECT id FROM github_records WHERE type='finding'")
             dashboard = next(
@@ -274,6 +274,17 @@ def test_silent_provider_reports_waiting_until_timeout(
     text = capsys.readouterr().out
     assert "[WAIT] acme/repo: agent running" in text
     assert "[FAIL] acme/repo" in text
+    detail = "codex agent timed out after 1s (limits.scan_timeout_seconds)"
+    assert detail in text
+    completed = Store(home.db)
+    try:
+        scan = completed.one("SELECT * FROM scans")
+        assert detail in scan["error"]
+        assert detail in scan["summary"]
+        report = home.root / "reports" / f"{scan['id']}.md"
+        assert detail in report.read_text()
+    finally:
+        completed.close()
     assert "[WAIT]" not in text[text.index("[FAIL]") :]
     assert "validating" not in text
     assert not list((home.root / "repos").glob("*/worktrees/*"))
@@ -347,6 +358,8 @@ def test_manual_scan_interrupt_terminates_provider_and_records_cancellation(
             str(home.root),
             "scan",
             "acme/repo",
+            "--stage",
+            "hunt",
             "--model",
             "fake-model",
         ],

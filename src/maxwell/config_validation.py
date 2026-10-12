@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 
 from maxwell.config import Paths
-from maxwell.github import GitHub
+from maxwell.github import GitHub, rate_limit_message
 from maxwell.model_discovery import discover_models, redact_metadata
 from maxwell.provider import create_provider
 from maxwell.provider_runtime import native_errors
@@ -27,7 +27,9 @@ def registered_repositories(paths):
         connection.close()
 
 
-def validate_config(paths, online=True, on_check=None, discover=False):
+def validate_config(
+    paths, online=True, on_check=None, discover=False, check_models=True, cached_catalogs=None
+):
     checks = []
     catalogs = []
     config = None
@@ -96,6 +98,22 @@ def validate_config(paths, online=True, on_check=None, discover=False):
             if errors
             else "Provider configuration and dependencies are available",
         )
+        if discover and cached_catalogs and name in cached_catalogs:
+            catalogs.append(cached_catalogs[name])
+            add(
+                f"models:{name}",
+                "skipped",
+                "Reusing saved model metadata and access checks; use --force to refresh",
+            )
+            continue
+        if not check_models:
+            if discover:
+                add(
+                    f"models:{name}",
+                    "error",
+                    "No saved model catalog; run `maxwell config apply` without --skip-model-checks",
+                )
+            continue
         catalog = None
         if discover:
             catalog = asyncio.run(discover_models(config, name))["providers"][0]
@@ -183,7 +201,17 @@ def validate_config(paths, online=True, on_check=None, discover=False):
             add(label, "skipped", "Token is configured; authentication was not checked offline")
             continue
         try:
-            client = GitHub(settings)
+            client = GitHub(
+                settings,
+                account=name,
+                on_status=(
+                    lambda message: on_check(
+                        {"name": label, "status": "waiting", "message": config.redact(message)}
+                    )
+                )
+                if on_check
+                else None,
+            )
         except (httpx.InvalidURL, ValueError):
             add(label, "error", "Cannot create the GitHub client; check github.api_url")
             continue
@@ -248,7 +276,11 @@ def github_check(client, path, label, add):
             403: "GitHub denied access; check permissions, organization authorization, or rate limits",
             404: "Repository does not exist or this account cannot access it",
         }
-        add(label, "error", messages.get(code, f"GitHub returned HTTP {code}"))
+        add(
+            label,
+            "error",
+            rate_limit_message(exc.response) or messages.get(code, f"GitHub returned HTTP {code}"),
+        )
         return None
     except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         add(label, "error", "Could not complete the GitHub check; check the API URL and connection")

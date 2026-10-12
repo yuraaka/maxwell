@@ -117,7 +117,9 @@ async def collect_targets(reporter, repository, stage, *, issue=None, force=Fals
 def assessment_prompt(repository, stage, target):
     finding = target.finding.finding.model_dump(exclude={"confidence", "priority"})
     reviews = [
-        item.model_dump(include={"id", "verdict", "actionability", "priority", "evidence"})
+        item.model_dump(
+            include={"id", "verdict", "actionability", "priority", "evidence", "factors"}
+        )
         for item in target.reviews
     ]
     task = (
@@ -135,6 +137,10 @@ Use a fresh investigation; neither the hunter's claim nor reviewer agreement pro
 Return the supplied structured schema. Verdicts: supported, rejected, or inconclusive.
 Supported means concrete source evidence supports the defect; it does not mean reproduced.
 Reject only with concrete counterevidence. Missing evidence or uncertain requirements mean inconclusive.
+Return factors whose measured burden the proposed repair would reduce: complexity,
+duplication, coupling, test_runtime, test_flakiness. Cite the connection in evidence.
+Use [] when no such connection is established; do not associate ordinary correctness bugs
+with structural factors without evidence. Assess the hunter's associations independently.
 Report actionability separately: actionable, not_actionable, or unknown.
 Suggest P0 (active emergency), P1 (important), P2 (normal), P3 (optional), or null if unclear.
 Cite repository-relative paths and line numbers, explain the relevant behavior and assumptions,
@@ -145,3 +151,15 @@ Finding:
 Referenced reviews (empty for independent review):
 {json.dumps(reviews)}
 """
+
+
+def finding_factors(finding, reviews=(), audits=()):
+    decisions = audits or reviews
+    if any(record.verdict != "supported" for record in decisions):
+        return []
+    associations = [set(record.factors) for record in decisions if record.factors is not None]
+    if associations:
+        return sorted(set.intersection(*associations))
+    if audits:
+        return finding_factors(finding, reviews)
+    return finding.finding.factors

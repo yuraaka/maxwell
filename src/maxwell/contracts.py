@@ -3,11 +3,22 @@ import json
 import re
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, create_model, model_validator
 
 DEFAULT_SCAN_CANDIDATES = 100
+Factor = Literal["complexity", "duplication", "coupling", "test_runtime", "test_flakiness"]
+FACTORS = get_args(Factor)
+
+
+def unique_factors(values):
+    if len(values) != len(set(values)):
+        raise ValueError("Factor associations must be unique")
+    return sorted(values)
+
+
+FactorAssociations = Annotated[list[Factor], Field(max_length=5), AfterValidator(unique_factors)]
 
 
 class Finding(BaseModel):
@@ -21,6 +32,7 @@ class Finding(BaseModel):
     evidence: str = Field(min_length=20, max_length=6000)
     expected: str = Field(min_length=10, max_length=3000)
     confidence: float = Field(ge=0, le=1)
+    factors: FactorAssociations = Field(default_factory=list)
 
     def validate_location(self, workspace: Path):
         relative = PurePosixPath(self.path)
@@ -78,6 +90,7 @@ class SelectionStats(BaseModel):
 class AssessmentResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     summary: str = Field(min_length=1, max_length=6000)
+    factors: FactorAssociations | None = None
     verdict: Literal["supported", "rejected", "inconclusive"]
     actionability: Literal["actionable", "not_actionable", "unknown"]
     priority: Literal["P0", "P1", "P2", "P3"] | None

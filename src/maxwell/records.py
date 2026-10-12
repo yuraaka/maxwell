@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from maxwell.contracts import Finding, Usage
+from maxwell.contracts import FactorAssociations, Finding, Usage
 
 Identifier = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 Revision = Annotated[str, Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")]
@@ -62,6 +62,7 @@ class AssessmentRecord(Record):
     actionability: Literal["actionable", "not_actionable", "unknown"] = "unknown"
     priority: Literal["P0", "P1", "P2", "P3"] | None = None
     evidence: str = Field(min_length=20, max_length=6000)
+    factors: FactorAssociations | None = None
     supersedes: Identifier | None = None
     references: list[Identifier] = Field(default_factory=list, max_length=20)
 
@@ -77,6 +78,22 @@ class AssessmentRecord(Record):
         return self
 
 
+class AgentSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    method: Literal["explicit", "thompson-source-v1", "uniform-unrated-v1"]
+    successes: int = Field(ge=0)
+    failures: int = Field(ge=0)
+    draw: float | None = Field(default=None, ge=0, le=1)
+    candidates: int = Field(ge=1)
+    independence: Literal["not_applicable", "different_model", "constrained", "overridden"]
+
+    @model_validator(mode="after")
+    def check_draw(self):
+        if (self.method == "thompson-source-v1") != (self.draw is not None):
+            raise ValueError("Only Thompson sampling requires a selection draw")
+        return self
+
+
 class ExecutionRecord(Record):
     type: Literal["execution"] = "execution"
     sha: Revision | None = None
@@ -89,6 +106,7 @@ class ExecutionRecord(Record):
     cost_micros: int | None = Field(default=None, ge=0)
     usage: Usage = Field(default_factory=Usage)
     finding_ids: list[Identifier] = Field(default_factory=list)
+    agent_selection: AgentSelection | None = None
 
 
 class MeasurementFactor(BaseModel):
@@ -229,6 +247,12 @@ def decode_record(body):
 
 def record_digest(record):
     values = record.model_dump(mode="json")
+    if isinstance(record, ExecutionRecord) and values["agent_selection"] is None:
+        del values["agent_selection"]
+    if isinstance(record, FindingRecord) and not values["finding"]["factors"]:
+        del values["finding"]["factors"]
+    if isinstance(record, AssessmentRecord) and values["factors"] is None:
+        del values["factors"]
     if isinstance(record, MeasurementRecord):
         for key in (
             "measured_at",
@@ -283,4 +307,5 @@ def execution_record(scan, finding_ids=()):
         accounting="tokens",
         usage=Usage.model_validate_json(scan.get("usage") or "{}"),
         finding_ids=list(finding_ids),
+        agent_selection=execution.get("agent_selection"),
     )

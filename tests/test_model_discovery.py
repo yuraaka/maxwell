@@ -7,6 +7,7 @@ import sys
 import pytest
 import yaml
 
+from maxwell.agent_selection import AgentSelector
 from maxwell.cli import execute, parser
 from maxwell.config import ModelSettings
 from maxwell.config_apply import apply_config, config_digest
@@ -248,7 +249,7 @@ def test_models_command_human_and_json(home, discovery, capsys):
     execute(parser().parse_args(prefix))
     human = capsys.readouterr().out
     assert "claude-work" in human and "low, high" in human and "Unverified" in human
-    assert "legacy" not in human and "no-effort" not in human
+    assert "legacy" in human and "no-effort" in human
     execute(parser().parse_args([*prefix, "--json"]))
     report = json.loads(capsys.readouterr().out)
     assert len(report["providers"]) == 1
@@ -289,7 +290,7 @@ def test_apply_probes_all_models_and_persists_models_with_efforts(home, discover
             model["model"] for model in discovered["models"]
         }
         assert len(calls) == len(discovered["models"])
-        assert all(model["efforts"] or model["default_effort"] for model in catalog["models"])
+        assert all(model.get("selectable", True) for model in catalog["models"])
         assert catalog["checked_at"] == stored["checked_at"]
     assert "native-secret" not in json.dumps(stored)
     store = Store(home.db)
@@ -299,6 +300,116 @@ def test_apply_probes_all_models_and_persists_models_with_efforts(home, discover
         store.close()
 
 
+@pytest.mark.parametrize("options", [[], ["--skip-model-checks"]])
+def test_fast_apply_reuses_model_checks_and_allows_automatic_selection(
+    home, discovery, monkeypatch, capsys, options
+):
+    homes, _ = discovery
+    assert apply_config(home)["valid"]
+    before = Store.cached_models(home.db)
+    calls = {name: (path / "probes.jsonl").read_bytes() for name, path in homes.items()}
+    data = yaml.safe_load(home.config.read_text())
+    data["limits"]["scan_timeout_seconds"] = 1800
+    del data["providers"]["codex-personal"]
+    home.config.write_text(yaml.safe_dump(data))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Fast apply called model discovery or an access probe")
+
+    monkeypatch.setattr("maxwell.config_validation.discover_models", unexpected)
+    monkeypatch.setattr("maxwell.config_validation.provider_check", unexpected)
+    execute(parser().parse_args(["--home", str(home.root), "config", "apply", *options, "--json"]))
+    report = json.loads(capsys.readouterr().out)
+    assert report["valid"] and report["applied"]
+    assert any(check["name"] == "github:default" for check in report["checks"])
+    cached = Store.cached_models(home.db)
+    assert cached["config_digest"] == config_digest(home) != before["config_digest"]
+    assert cached["providers"] == [
+        catalog for catalog in before["providers"] if catalog["provider"] != "codex-personal"
+    ]
+    assert {name: (path / "probes.jsonl").read_bytes() for name, path in homes.items()} == calls
+    selector = AgentSelector(home, home.load())
+    assert selector.routes
+
+
+def test_fast_apply_before_model_discovery_does_not_create_database(home):
+    report = apply_config(home, skip_model_checks=True)
+    assert not report["valid"] and not report["applied"]
+    assert any("maxwell config apply" in check["message"] for check in report["checks"])
+    assert not home.db.exists()
+
+
+def test_default_apply_discovers_only_provider_without_saved_data(home, discovery, monkeypatch):
+    assert apply_config(home)["valid"]
+    before = Store.cached_models(home.db)
+    data = yaml.safe_load(home.config.read_text())
+    data["providers"]["new"] = data["providers"]["codex-work"]
+    home.config.write_text(yaml.safe_dump(data))
+    from maxwell.config_validation import discover_models, provider_check
+
+    discovered, probed = [], []
+
+    async def discover(config, name):
+        discovered.append(name)
+        return await discover_models(config, name)
+
+    def probe(config, name, model, *args, **kwargs):
+        probed.append((name, model))
+        return provider_check(config, name, model, *args, **kwargs)
+
+    monkeypatch.setattr("maxwell.config_validation.discover_models", discover)
+    monkeypatch.setattr("maxwell.config_validation.provider_check", probe)
+    report = apply_config(home)
+    assert report["valid"] and report["applied"]
+    assert discovered == ["new"]
+    assert set(probed) == {("new", "hidden"), ("new", "one")}
+    after = Store.cached_models(home.db)
+    catalogs = {catalog["provider"]: catalog for catalog in after["providers"]}
+    for catalog in before["providers"]:
+        assert catalogs[catalog["provider"]] == catalog
+    assert catalogs["new"]["checked_at"] == after["checked_at"]
+    assert all(model["access"] == "verified" for model in catalogs["new"]["models"])
+
+
+def test_forced_apply_refreshes_every_saved_provider(home, discovery, capsys):
+    homes, _ = discovery
+    assert apply_config(home)["valid"]
+    before = Store.cached_models(home.db)
+    counts = {
+        name: len((path / "probes.jsonl").read_text().splitlines()) for name, path in homes.items()
+    }
+    execute(parser().parse_args(["--home", str(home.root), "config", "apply", "--force", "--json"]))
+    report = json.loads(capsys.readouterr().out)
+    assert report["valid"] and report["applied"]
+    after = Store.cached_models(home.db)
+    assert after["checked_at"] > before["checked_at"]
+    for catalog in after["providers"]:
+        assert catalog["checked_at"] == after["checked_at"]
+        path = homes[catalog["provider"]] / "probes.jsonl"
+        assert len(path.read_text().splitlines()) == 2 * counts[catalog["provider"]]
+    assert not any(check["status"] == "skipped" for check in report["checks"])
+
+
+@pytest.mark.parametrize("change", ["invalid", "new-provider", "during-apply"])
+def test_fast_apply_errors_preserve_previous_metadata(home, discovery, change):
+    assert apply_config(home)["valid"]
+    before = Store.cached_models(home.db)
+    if change == "invalid":
+        home.config.write_text("invalid: [")
+    elif change == "new-provider":
+        data = yaml.safe_load(home.config.read_text())
+        data["providers"]["new"] = data["providers"]["codex-work"]
+        home.config.write_text(yaml.safe_dump(data))
+
+    def edited(check):
+        if change == "during-apply" and check["name"].startswith("models:"):
+            home.config.write_text(home.config.read_text() + "\n# changed during apply\n")
+
+    report = apply_config(home, on_check=edited, skip_model_checks=True)
+    assert not report["valid"] and not report["applied"]
+    assert Store.cached_models(home.db) == before
+
+
 def test_apply_checks_models_outside_allowlist_and_excludes_failures(home, discovery):
     homes, _ = discovery
     assert apply_config(home)["valid"]
@@ -306,7 +417,7 @@ def test_apply_checks_models_outside_allowlist_and_excludes_failures(home, disco
     data["providers"]["codex-work"]["models"] = ["one"]
     home.config.write_text(yaml.safe_dump(data))
     (homes["codex-work"] / "denied").write_text("hidden\none")
-    report = apply_config(home)
+    report = apply_config(home, force=True)
     assert report["applied"] and not report["valid"]
     stored = Store.cached_models(home.db)
     catalog = next(row for row in stored["providers"] if row["provider"] == "codex-work")
@@ -340,7 +451,7 @@ def test_apply_rereads_config_and_removes_old_provider_and_model_rows(home, disc
     del data["providers"]["codex-personal"]
     data["providers"]["claude-work"]["models"] = {"company-model": {"effort": "high"}}
     home.config.write_text(yaml.safe_dump(data))
-    assert apply_config(home)["valid"]
+    assert apply_config(home, force=True)["valid"]
     stored = Store.cached_models(home.db)
     assert {row["provider"] for row in stored["providers"]} == {"claude-work", "codex-work"}
     claude = next(row for row in stored["providers"] if row["provider"] == "claude-work")
@@ -348,7 +459,7 @@ def test_apply_rereads_config_and_removes_old_provider_and_model_rows(home, disc
     assert company["access"] == "verified" and company["checks"][0]["effort"] == "high"
     del data["providers"]["claude-work"]["models"]
     home.config.write_text(yaml.safe_dump(data))
-    assert apply_config(home)["valid"]
+    assert apply_config(home, force=True)["valid"]
     assert "company-model" not in {
         model["model"]
         for row in Store.cached_models(home.db)["providers"]
@@ -393,7 +504,12 @@ def test_models_list_before_apply_has_clear_error_and_creates_nothing(home):
     assert not home.db.exists()
 
 
-def test_apply_reloads_running_daemon_after_persisting_results(home, discovery, monkeypatch):
+@pytest.mark.parametrize("skip_model_checks", [False, True])
+def test_apply_reloads_running_daemon_after_persisting_results(
+    home, discovery, monkeypatch, skip_model_checks
+):
+    if skip_model_checks:
+        assert apply_config(home)["valid"]
     home.socket.touch()
     requests = []
 
@@ -405,6 +521,6 @@ def test_apply_reloads_running_daemon_after_persisting_results(home, discovery, 
         return {"daemon": "reloaded"}
 
     monkeypatch.setattr("maxwell.config_apply.request", reload)
-    report = apply_config(home)
+    report = apply_config(home, skip_model_checks=skip_model_checks)
     assert report["valid"] and requests == ["reload_config"]
     assert report["checks"][-1]["name"] == "daemon"

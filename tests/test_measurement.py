@@ -18,6 +18,7 @@ from maxwell.measurement import (
     compatible,
     digest,
     historical_stage,
+    measurement_contributions,
     measurement_report,
     measurement_score,
     projected_measurements,
@@ -540,3 +541,52 @@ def test_pytest_imports_pinned_source_before_external_editable_checkout(home, so
         record = projected_measurements(store, "acme/repo")[0]
         assert record.evidence["tests"]["persistent_failure_count"] == 0
         assert record.sha == original
+
+
+def test_partial_contributions_preserve_weights_and_unknown_total():
+    record = measured()
+    factors = dict(record.factors)
+    factors.pop("test_flakiness")
+    partial = record.model_copy(update={"factors": factors})
+    contributions = measurement_contributions(partial)
+    assert contributions == {name: 10 for name in FACTORS if name != "test_flakiness"}
+    assert measurement_score(partial) is None
+    assert measurement_contributions(partial.model_copy(update={"protocol": "wrong"})) is None
+
+
+def test_existing_measurement_publication_stays_on_status_issue(home, source, github, monkeypatch):
+    from maxwell.reporting import Reporter
+
+    config = configure(home, source)
+
+    async def legacy_history(reporter, repo):
+        channel = await reporter.channel(
+            repo, "dashboards", "<!-- maxwell:dashboard:v1 -->", "Maxwell status"
+        )
+        return channel["issue"]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Reporter, "history", legacy_history)
+        first = asyncio.run(run_measurements(home, config, "acme/repo"))
+    assert first["valid"]
+    dashboard = next(
+        item for item in github["issues"].values() if item["title"] == "Maxwell status"
+    )
+    original = list(github["comments"][dashboard["number"]])
+    with StoreContext(home) as store:
+        with store.db:
+            store.db.execute("DELETE FROM record_publications WHERE type='measurement'")
+    second = asyncio.run(run_measurements(home, config, "acme/repo"))
+    assert second["valid"]
+    assert github["comments"][dashboard["number"]] == original
+    history = next(item for item in github["issues"].values() if item["title"] == "Maxwell history")
+    assert len(github["comments"][history["number"]]) == 1
+    with StoreContext(home) as store:
+        assert len(projected_measurements(store, "acme/repo")) == 2
+        assert (
+            store.one(
+                "SELECT issue FROM record_publications WHERE id=?",
+                (first["measurements"][0]["id"],),
+            )["issue"]
+            == dashboard["number"]
+        )

@@ -12,7 +12,7 @@ def color(text, code, stream=None):
 
 
 def check_line(check):
-    labels = {"ok": "OK", "error": "FAIL", "skipped": "SKIP"}
+    labels = {"ok": "OK", "error": "FAIL", "skipped": "SKIP", "waiting": "WAIT"}
     name = check["name"]
     parts = name.split(":", 2)
     if parts[0] == "provider" and len(parts) > 1:
@@ -35,7 +35,10 @@ def check_line(check):
         elif "blocked by" in message:
             message = "provider errors"
     message = message.replace("\n", "\n       ")
-    badge = color(f"[{labels[status]}]", {"ok": "32", "error": "31", "skipped": "33"}[status])
+    badge = color(
+        f"[{labels[status]}]",
+        {"ok": "32", "error": "31", "skipped": "33", "waiting": "36"}[status],
+    )
     suffix = f": {message}" if message else ""
     print(f"{badge} {name}{suffix}", flush=True)
 
@@ -57,6 +60,20 @@ def scan_line(scan):
             f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}{stage}",
             flush=True,
         )
+        if decision := scan.get("agent_selection"):
+            method = {
+                "explicit": "explicit choice",
+                "thompson-source-v1": "sampled using provisional evidence",
+                "uniform-unrated-v1": "sampled equally; unrated",
+            }[decision["method"]]
+            independence = (
+                "; different model unavailable"
+                if decision["independence"] == "constrained"
+                else "; independence overridden"
+                if decision["independence"] == "overridden"
+                else ""
+            )
+            print(f"{color('[PICK]', '36')} {name}: {method}{independence}", flush=True)
     elif scan["state"] == "publishing":
         print(f"{color('[PUB]', '36')} {name}: publishing results", flush=True)
     else:
@@ -216,12 +233,19 @@ def human_lines(value, command, repo_command=None):
         return lines
     if command == "scan":
         skipped = [
-            f"{item['repository']}: no eligible findings for {item['stage']}."
+            (
+                f"{item['repository']}: no eligible findings for {item['stage']}."
+                if item.get("reason", "No eligible findings") == "No eligible findings"
+                else f"[SKIP] {item['repository']} / {item['stage']}: {item['reason']}"
+            )
             for item in value.get("skipped", [])
         ]
-        if not value["scans"] and not skipped:
+        if not value["scans"] and not skipped and not value.get("errors"):
             return ["No repositories to scan."]
-        lines = skipped
+        lines = [
+            f"[FAIL] {item['repository']} / {item['stage']}: {item['error']}"
+            for item in value.get("errors", [])
+        ] + skipped
         for scan in value["scans"]:
             if scan["report"]:
                 lines.append(f"Report: {scan['report']}")

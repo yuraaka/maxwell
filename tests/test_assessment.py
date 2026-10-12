@@ -13,6 +13,8 @@ from maxwell.store import Store
 
 
 def run(home, capsys, *arguments):
+    if "--stage" not in arguments:
+        arguments = ("--stage", "hunt", *arguments)
     execute(
         parser().parse_args(
             [
@@ -99,7 +101,9 @@ def test_hunt_review_audit_and_forced_reassessment(home, hunted, github, capsys)
         item for item in github["issues"].values() if item["title"] == "Maxwell status"
     )
     assert "| Recorded total tokens (input + output) | 5,500 |" in dashboard["body"]
-    executions = [decode_record(item["body"]) for item in github["comments"][dashboard["number"]]]
+    history = next(item for item in github["issues"].values() if item["title"] == "Maxwell history")
+    assert not github["comments"].get(dashboard["number"])
+    executions = [decode_record(item["body"]) for item in github["comments"][history["number"]]]
     review_execution = next(item for item in executions if item.id == review["id"])
     assert review_execution.agent.role == "reviewer" and review_execution.finding_ids == [
         record.finding_id
@@ -364,7 +368,7 @@ def test_review_is_still_blocked_by_daily_execution_limit(home, hunted, capsys):
     assert store.one("SELECT executed FROM scans WHERE stage='audit'")["executed"] == 0
 
 
-def test_failed_assessment_publication_is_reconciled_without_another_agent_call(
+def test_assessment_publication_is_reconciled_without_another_agent_call(
     home,
     hunted,
     github,
@@ -382,16 +386,20 @@ def test_failed_assessment_publication_is_reconciled_without_another_agent_call(
 
     with monkeypatch.context() as patch:
         patch.setattr(GitHub, "create_comment", lost)
-        with pytest.raises(SystemExit):
-            run(home, capsys, "--stage", "review")
-        result = json.loads(capsys.readouterr().out)
-    assert not result["valid"] and result["scans"][0]["state"] == "completed"
-    assert result["scans"][0]["publication_errors"]
-    assert store.one("SELECT state FROM record_publications")["state"] == "uncertain"
+        result = run(home, capsys, "--stage", "review")
+    assert result["valid"] and result["scans"][0]["state"] == "completed"
+    assert not result["scans"][0]["publication_errors"]
+    assert (
+        store.one("SELECT state FROM record_publications WHERE type='assessment'")["state"]
+        == "published"
+    )
     repeated = run(home, capsys, "--stage", "review")
     assert repeated["valid"] and repeated["scans"] == []
     assert len(assessments(github, issue)) == 1
-    assert store.one("SELECT state FROM record_publications")["state"] == "published"
+    assert (
+        store.one("SELECT state FROM record_publications WHERE type='assessment'")["state"]
+        == "published"
+    )
     assert store.one("SELECT COUNT(*) AS n FROM scans WHERE stage='review'")["n"] == 1
     assert store.one("SELECT report_sent FROM scans WHERE stage='review'")["report_sent"] == 1
     execution_id = assessments(github, issue)[0].execution_id
@@ -417,3 +425,22 @@ def test_issue_option_requires_repository(home):
                 ]
             )
         )
+
+
+def test_review_and_audit_agent_output_updates_factor_associations(home, hunted, github, capsys):
+    _, issue, _ = hunted
+    result = Path(home.load().provider.executable).parent / "assessment.json"
+    result.write_text(json.dumps({"factors": ["test_runtime"]}))
+    reviewed = run(home, capsys, "--stage", "review")
+    assert reviewed["valid"]
+    assert assessments(github, issue)[0].factors == ["test_runtime"]
+    assert "maxwell:factor:test_runtime" in {
+        label["name"] for label in github["issues"][issue]["labels"]
+    }
+    result.write_text(json.dumps({"factors": []}))
+    audited = run(home, capsys, "--stage", "audit")
+    assert audited["valid"]
+    assert assessments(github, issue)[1].factors == []
+    assert not any(
+        label["name"].startswith("maxwell:factor:") for label in github["issues"][issue]["labels"]
+    )

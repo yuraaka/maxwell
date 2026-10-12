@@ -12,6 +12,19 @@ from maxwell.github import GitHub
 from maxwell.store import Store
 
 
+def test_quota_wait_output_identifies_account_and_preserves_diagnostics(capsys):
+    check_line(
+        {
+            "name": "github:default",
+            "status": "waiting",
+            "message": "remaining 0; retry at 2026-10-12 15:00:00 UTC; job retained",
+        }
+    )
+    output = capsys.readouterr().out
+    assert "[WAIT] GitHub / default" in output
+    assert "remaining 0" in output and "15:00:00 UTC" in output and "job retained" in output
+
+
 @pytest.mark.parametrize("heartbeat,badge", [(False, "[STEP]"), (True, "[WAIT]")])
 def test_scan_progress_formats_phase_and_elapsed(heartbeat, badge, capsys):
     scan_line(

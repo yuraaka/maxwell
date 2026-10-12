@@ -16,6 +16,20 @@ class ProbeResult(BaseModel):
     ok: Literal[True]
 
 
+def strict_output_schema(node):
+    if isinstance(node, dict):
+        if "properties" in node:
+            node["required"] = list(node["properties"])
+            node["additionalProperties"] = False
+        node.pop("default", None)
+        for value in node.values():
+            strict_output_schema(value)
+    elif isinstance(node, list):
+        for value in node:
+            strict_output_schema(value)
+    return node
+
+
 class CLIProvider:
     def __init__(self, paths, config):
         self.paths, self.config = paths, config
@@ -32,6 +46,24 @@ class CLIProvider:
 
     def arguments(self, workspace, artifact, schema, native):
         raise NotImplementedError
+
+    def failure_detail(self, artifact):
+        detail = self.errors[-1] if self.errors else ""
+        if detail:
+            try:
+                payload = json.loads(detail)
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                    message = payload["error"].get("message")
+                    if isinstance(message, str) and message:
+                        detail = message
+            except ValueError:
+                pass
+        stderr = artifact / "stderr.log"
+        if not detail and stderr.is_file():
+            with stderr.open("rb") as stream:
+                stream.seek(max(0, stderr.stat().st_size - 2000))
+                detail = stream.read(2000).decode(errors="replace").strip()
+        return self.redact(detail)[:2000]
 
     async def scan(self, workspace, artifact, prompt, on_start):
         return await self.run(workspace, artifact, prompt, on_start)
@@ -54,13 +86,8 @@ class CLIProvider:
         except ValidationError:
             raise ValueError("Provider returned an invalid connection-check response") from None
         except (ValueError, OSError) as exc:
-            detail = self.errors[-1] if self.errors else ""
-            stderr = artifact / "stderr.log"
-            if not detail and stderr.is_file():
-                with stderr.open("rb") as stream:
-                    stream.seek(max(0, stderr.stat().st_size - 2000))
-                    detail = stream.read(2000).decode(errors="replace").strip()
-            message = f"{exc}: {detail}" if detail else str(exc)
+            detail = self.failure_detail(artifact)
+            message = f"{exc}: {detail}" if detail and detail not in str(exc) else str(exc)
             raise ValueError(self.redact(message)[:3000]) from None
 
     async def run(
@@ -70,7 +97,10 @@ class CLIProvider:
         if result_type is ScanResult:
             result_type = ScanResult.bounded(self.config.limits.max_candidates_per_scan)
         schema = artifact / "schema.json"
-        schema.write_text(json.dumps(result_type.model_json_schema()))
+        output_schema = result_type.model_json_schema()
+        if settings.adapter == "codex":
+            output_schema = strict_output_schema(output_schema)
+        schema.write_text(json.dumps(output_schema))
         result_file = artifact / "result.json"
         environment, native, self.secrets = runtime_environment(self.paths, settings)
         args = self.arguments(workspace, artifact, schema, native)
@@ -146,10 +176,20 @@ class CLIProvider:
                 asyncio.create_task(capture(process.stderr, artifact / "stderr.log")),
                 asyncio.create_task(process.wait()),
             ]
-            await asyncio.wait_for(asyncio.gather(*tasks), self.config.limits.scan_timeout_seconds)
+            timeout = self.config.limits.scan_timeout_seconds
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"{settings.adapter} agent timed out after {timeout:g}s "
+                    "(limits.scan_timeout_seconds); see redacted artifacts"
+                ) from exc
             self.usage.complete = process.returncode == 0
             if process.returncode:
                 message = f"{settings.adapter} exited with status {process.returncode}"
+                detail = self.failure_detail(artifact)
+                if detail:
+                    message = f"{message}: {detail}"
                 raise ValueError(message if probing else f"{message}; see redacted artifacts")
             self.write_result(result_file)
             if not result_file.exists() or result_file.stat().st_size > MAX_RESULT_BYTES:
@@ -319,6 +359,10 @@ Do not invent findings to fill the candidate limit. This heuristic does not prov
 Use repository-relative paths and real source line numbers. Cite concrete source evidence.
 Distinguish expected behavior from the suspected defect; never claim reproduction.
 Prefer correctness issues. Avoid speculative rewrites and generic style preferences.
+For each finding, list factors whose measured burden its repair would reduce: complexity,
+duplication, coupling, test_runtime, test_flakiness. Explain the association in evidence.
+Use [] when no structural association is established. Bugs need no structural association;
+never invent an association or numerical entropy reduction to justify a correctness fix.
 Look for existing bugs as well as introduced bugs and regressions. Use the changes since the
 previous successful hunt to investigate changed behavior and its effects on callers and related
 components. The diff guides attention; it never restricts the whole-repository search.

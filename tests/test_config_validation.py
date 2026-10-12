@@ -10,6 +10,7 @@ import yaml
 from maxwell.cli import execute, parser
 from maxwell.config import Limits, Paths
 from maxwell.config_validation import validate_config
+from maxwell.github import GitHub
 from maxwell.store import Store
 
 
@@ -301,3 +302,28 @@ def test_secret_redaction_cannot_corrupt_report_types(home, github_requests, cap
     code, report = command(home, capsys)
     assert code == 0 and report["valid"] is True
     assert any("[REDACTED]" in check["message"] for check in report["checks"])
+
+
+def test_apply_waits_for_github_quota_and_reports_status_without_failing(home, monkeypatch):
+    send = httpx.Client.send
+    waits, checks = [], []
+    rejected = False
+
+    def limited(client, request, **kwargs):
+        nonlocal rejected
+        if request.url.path == "/user" and not rejected:
+            rejected = True
+            return httpx.Response(429, headers={"retry-after": "60"}, request=request)
+        return send(client, request, **kwargs)
+
+    def wait(client, response, delay):
+        waits.append(delay)
+        client.on_status("waiting for GitHub quota; job retained")
+
+    monkeypatch.setattr(httpx.Client, "send", limited)
+    monkeypatch.setattr(GitHub, "wait_for_quota", wait)
+    report = validate_config(home, on_check=checks.append)
+    assert report["valid"]
+    assert waits == [60]
+    assert any(check["status"] == "waiting" for check in checks)
+    assert not any(check["status"] == "waiting" for check in report["checks"])

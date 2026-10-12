@@ -72,7 +72,11 @@ async def measure_one(
             (identity, repository_record["name"], time.time(), str(artifact)),
         )
     repository = Repository(paths, {**repository_record, "directory": None})
-    client = GitHub(config.github.for_account(repository_record["github_account"]))
+    client = GitHub(
+        config.github.for_account(repository_record["github_account"]),
+        on_status=progress,
+        account=repository_record["github_account"],
+    )
     reporter = Reporter(store, client, config, paths)
     worktree = None
     try:
@@ -207,12 +211,20 @@ async def measure_one(
             record = record.model_copy(update={"baseline_id": baseline.id})
         save(baseline)
         progress("publishing measurement")
-        issue = await reporter.dashboard(record.repository)
+        await reporter.dashboard(record.repository)
+        issue = await reporter.history(record.repository)
         for row in store.rows(
             "SELECT m.data FROM measurements m LEFT JOIN record_publications p ON p.repository=m.repository AND p.type='measurement' AND p.id=m.id WHERE m.repository=? AND m.state='completed' AND m.data IS NOT NULL AND p.id IS NULL",
             (record.repository,),
         ):
-            store.queue_record(RECORD_ADAPTER.validate_json(row["data"]), issue)
+            pending_record = RECORD_ADAPTER.validate_json(row["data"])
+            source = store.one(
+                "SELECT issue,status FROM github_records WHERE repository=? AND type='measurement' AND id=?",
+                (record.repository, pending_record.id),
+            )
+            if source and source["status"] != "current":
+                raise ValueError("Existing measurement record requires reconciliation")
+            store.queue_record(pending_record, source["issue"] if source else issue)
         await reporter.publish_records(record.repository)
         await reporter.project_repository_records(record.repository)
         await reporter.dashboard(record.repository)

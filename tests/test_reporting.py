@@ -11,6 +11,57 @@ from maxwell.repositories import git
 from maxwell.store import Store
 
 
+def test_unchanged_sync_revalidates_without_charging_reads_or_recreating_labels(
+    home, source, github
+):
+    config = home.load()
+    store = Store(home.db)
+    store.register("acme/repo", str(source), "HEAD")
+    try:
+        for _ in range(2):
+            client = GitHub(config.github)
+            try:
+                asyncio.run(Reporter(store, client, config, home).sync(process_commands=False))
+            finally:
+                client.close()
+        before_requests = len(github["requests"])
+        before_unchanged = github["unchanged_reads"]
+        client = GitHub(config.github)
+        try:
+            asyncio.run(Reporter(store, client, config, home).sync(process_commands=False))
+        finally:
+            client.close()
+        requests = github["requests"][before_requests:]
+        assert requests and all(method == "GET" for method, _, _ in requests)
+        assert github["unchanged_reads"] - before_unchanged == len(requests)
+    finally:
+        store.close()
+
+
+def test_projection_skips_comments_only_when_github_reports_zero(home, github, monkeypatch):
+    config = home.load()
+    store = Store(home.db)
+    client = GitHub(config.github)
+    reporter = Reporter(store, client, config, home)
+    issue = client.create_issue("acme/repo", "Status", "<!-- maxwell:dashboard:v1 -->")
+    comments = []
+
+    def load_comments(repo, number):
+        comments.append(number)
+        return []
+
+    monkeypatch.setattr(client, "comments", load_comments)
+    try:
+        asyncio.run(reporter.project_issue_records("acme/repo", {**issue, "comments": 0}))
+        assert comments == []
+        asyncio.run(reporter.project_issue_records("acme/repo", {**issue, "comments": 1}))
+        asyncio.run(reporter.project_issue_records("acme/repo", issue))
+        assert comments == [issue["number"], issue["number"]]
+    finally:
+        client.close()
+        store.close()
+
+
 @pytest.mark.parametrize(
     "reported,expected",
     [
@@ -129,3 +180,13 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
     finally:
         client.close()
         store.close()
+
+
+def test_dashboard_without_measurement_links_unknown_components():
+    from maxwell.contracts import FACTORS
+    from maxwell.reporting import component_dashboard
+
+    body = component_dashboard("acme/repo", None)
+    assert body.count("[Unknown](") == len(FACTORS)
+    assert "0.00 points" not in body
+    assert "Measurement evidence" not in body

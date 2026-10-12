@@ -13,8 +13,8 @@ def consensus(records):
     return "unresolved"
 
 
-def agent_reputation(store, repository):
-    records = [
+def current_reputation_records(store, repository):
+    return [
         (row["issue"], RECORD_ADAPTER.validate_json(row["data"]))
         for row in store.rows(
             "SELECT issue,data FROM github_records WHERE repository=? AND status='current' "
@@ -22,6 +22,54 @@ def agent_reputation(store, repository):
             (repository,),
         )
     ]
+
+
+def agent_identity(agent):
+    return (agent.adapter, agent.model, agent.effort) if agent else None
+
+
+def selection_evidence(store, repository, role):
+    records = current_reputation_records(store, repository)
+    assessments = defaultdict(list)
+    for issue, record in records:
+        if isinstance(record, AssessmentRecord):
+            assessments[issue].append(record)
+    outcomes = defaultdict(lambda: [0, 0])
+    observations = set()
+    for issue, finding in records:
+        if (
+            not isinstance(finding, FindingRecord)
+            or finding.finding.identity(repository) != finding.id
+        ):
+            continue
+        reviews, audits = finding_assessments(assessments[issue], finding)
+        if role == "hunter":
+            outcome = consensus(audits or reviews)
+            identity = agent_identity(finding.agent)
+            if identity and outcome in ("supported", "rejected"):
+                outcomes[identity][outcome == "rejected"] += 1
+        elif role == "reviewer":
+            audit_verdict = consensus(audits)
+            grouped = defaultdict(list)
+            for review in reviews:
+                if identity := agent_identity(review.agent):
+                    grouped[identity].append(review)
+            for identity, group in grouped.items():
+                observation = (finding.id, finding.sha, identity)
+                verdict = consensus(group)
+                if (
+                    observation in observations
+                    or verdict not in ("supported", "rejected")
+                    or audit_verdict not in ("supported", "rejected")
+                ):
+                    continue
+                observations.add(observation)
+                outcomes[identity][verdict != audit_verdict] += 1
+    return dict(outcomes)
+
+
+def agent_reputation(store, repository):
+    records = current_reputation_records(store, repository)
     assessments = defaultdict(list)
     for issue, record in records:
         if isinstance(record, AssessmentRecord):

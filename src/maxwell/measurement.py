@@ -3,9 +3,9 @@ import json
 import math
 from datetime import UTC, datetime
 
+from maxwell.contracts import FACTORS
 from maxwell.records import RECORD_ADAPTER
 
-FACTORS = ("complexity", "duplication", "coupling", "test_runtime", "test_flakiness")
 ANALYZER = "python-ast-tokens-v1"
 POLICY = "maintenance-v1"
 
@@ -29,7 +29,7 @@ def measurement_policy(settings, repository):
     return policy
 
 
-def measurement_score(record):
+def measurement_contributions(record):
     if (
         record.policy_version != POLICY
         or record.analyzer_version != ANALYZER
@@ -48,20 +48,19 @@ def measurement_score(record):
         or not math.isclose(sum(weights.values()), 1)
     ):
         return None
-    if any(
-        name not in record.factors or record.factor_status.get(name) != "measured"
+    return {
+        name: 100 * weights[name] * min(factor.numerator / factor.denominator, 1)
         for name in FACTORS
-    ):
+        if (factor := record.factors.get(name)) is not None
+        and record.factor_status.get(name) == "measured"
+    }
+
+
+def measurement_score(record):
+    contributions = measurement_contributions(record)
+    if contributions is None or set(contributions) != set(FACTORS):
         return None
-    return round(
-        100
-        * sum(
-            weights[name]
-            * min(record.factors[name].numerator / record.factors[name].denominator, 1)
-            for name in FACTORS
-        ),
-        4,
-    )
+    return round(sum(contributions.values()), 4)
 
 
 def compatible(first, second):

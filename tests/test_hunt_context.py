@@ -238,7 +238,17 @@ def test_git_comparison_disables_external_diff_and_textconv(source):
 def scan(home, capsys):
     execute(
         parser().parse_args(
-            ["--home", str(home.root), "scan", "acme/repo", "--model", "fake-model", "--json"]
+            [
+                "--home",
+                str(home.root),
+                "scan",
+                "acme/repo",
+                "--stage",
+                "hunt",
+                "--model",
+                "fake-model",
+                "--json",
+            ]
         )
     )
     return json.loads(capsys.readouterr().out)["scans"][0]
@@ -261,7 +271,7 @@ def test_hunt_context_reconstructs_from_github_in_a_fresh_home(
         if "<!-- maxwell:dashboard:v1 -->" in issue["body"]
     )
     record = measurement(first["sha"], home.load().measurement)
-    github["comments"][dashboard["number"]].append(
+    github["comments"].setdefault(dashboard["number"], []).append(
         {"id": 9999, "body": record_report(record), "user": {"login": "maintainer"}}
     )
     (source / "app.py").write_text(

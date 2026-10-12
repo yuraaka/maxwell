@@ -299,6 +299,6 @@ def test_v2_registration_migrates_without_enabling_checkout_management(directory
             assert record["github_account"] == "work"
             assert record["paused"] == 1
             assert record["last_sha"] == "existing-sha"
-            assert store.db.execute("PRAGMA user_version").fetchone()[0] == 10
+            assert store.db.execute("PRAGMA user_version").fetchone()[0] == 11
         finally:
             store.close()

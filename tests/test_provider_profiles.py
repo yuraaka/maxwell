@@ -17,6 +17,7 @@ from maxwell.config_validation import validate_config
 from maxwell.contracts import Usage, estimate_cost
 from maxwell.daemon import Daemon
 from maxwell.github import GitHub
+from maxwell.provider import create_provider
 from maxwell.provider_runtime import native_errors, native_settings, runtime_environment
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
 from maxwell.repositories import stop_orphan
@@ -56,6 +57,23 @@ model = args[args.index('--model') + 1] if '--model' in args else os.environ.get
 workspace = Path(args[args.index('--cd') + 1]) if codex else Path.cwd()
 schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text()) if codex else json.loads(args[args.index('--json-schema') + 1])
 probe = 'ok' in schema['properties']
+if codex:
+    def check_schema(node):
+        if isinstance(node, dict):
+            if 'properties' in node:
+                missing = set(node['properties']) - set(node.get('required', []))
+                if missing or node.get('additionalProperties') is not False:
+                    raise ValueError('Invalid schema for response_format: missing required ' + ', '.join(sorted(missing)))
+            for value in node.values():
+                check_schema(value)
+        elif isinstance(node, list):
+            for value in node:
+                check_schema(value)
+    try:
+        check_schema(schema)
+    except ValueError as exc:
+        print(json.dumps({'type': 'turn.failed', 'error': {'message': str(exc)}}), flush=True)
+        sys.exit(1)
 connection = {}
 if codex:
     if '--ignore-user-config' not in args:
@@ -91,6 +109,14 @@ if mode == 'wait':
 if mode == 'fail':
     print(os.environ.get('COMPANY_GATEWAY_TOKEN', ''), file=sys.stderr)
     sys.exit(1)
+if mode in ('scan-error', 'stderr-error'):
+    message = 'Invalid schema: missing factors ' + os.environ.get('COMPANY_GATEWAY_TOKEN', '')
+    if mode == 'scan-error':
+        message = json.dumps({'error': {'message': message, 'type': 'invalid_request_error'}})
+        print(json.dumps({'type': 'turn.failed', 'error': {'message': message}}), flush=True)
+    else:
+        print(message, file=sys.stderr)
+    sys.exit(1)
 if mode == 'modify':
     (workspace / 'app.py').write_text('changed by model')
 result = {'summary': 'Native discovery ' + os.environ.get('COMPANY_GATEWAY_TOKEN', ''),
@@ -102,6 +128,12 @@ elif 'verdict' in schema['properties']:
     result = {'summary': 'Source investigation complete.', 'verdict': 'supported',
               'actionability': 'actionable', 'priority': 'P1',
               'evidence': 'app.py:2 divides by len(values), which is zero for an empty list.'}
+if codex and not probe:
+    if 'verdict' in schema['properties']:
+        result['factors'] = [] if mode == 'clear-factors' else None
+    else:
+        for finding in result['findings']:
+            finding.setdefault('factors', [])
 if mode == 'probe-error':
     message = 'Model access denied ' + os.environ.get('COMPANY_GATEWAY_TOKEN', '')
     if codex:
@@ -197,10 +229,57 @@ def native_daemon(home, native, source):
     daemon.store.close()
 
 
-def test_manual_scan_requires_model_even_with_one_provider():
-    with pytest.raises(SystemExit) as error:
-        parser().parse_args(["scan", "acme/repo"])
-    assert error.value.code == 2
+def test_manual_scan_defaults_to_pipeline_and_automatic_model_selection():
+    args = parser().parse_args(["scan"])
+    assert args.model is None and args.provider is None and args.stage is None
+
+
+@pytest.mark.parametrize("stage", ["hunt", "review", "audit"])
+def test_codex_output_schemas_accept_required_factors(home, native, source, directory, stage):
+    _, config = native
+    config = config.model_copy(update={"provider": config.providers["first"].for_model("chosen")})
+    provider = create_provider(home, config)
+    artifact = directory / f"strict-{stage}"
+    artifact.mkdir()
+    operation = provider.scan if stage == "hunt" else provider.assess
+    result = asyncio.run(operation(source, artifact, "Investigate source", lambda pid: None))
+    schema = json.loads((artifact / "schema.json").read_text())
+    if stage == "hunt":
+        assert "factors" in schema["$defs"]["Finding"]["required"]
+        assert result.findings[0].factors == []
+        assert schema["properties"]["findings"]["maxItems"] == config.limits.max_candidates_per_scan
+    else:
+        assert "factors" in schema["required"]
+        assert result.factors is None
+        assert {"type": "null"} in schema["properties"]["factors"]["anyOf"]
+
+
+def test_codex_assessment_preserves_explicit_empty_factors(home, native, source, directory):
+    homes, config = native
+    (homes["first"] / "mode").write_text("clear-factors")
+    config = config.model_copy(update={"provider": config.providers["first"].for_model("chosen")})
+    artifact = directory / "clear-factors"
+    artifact.mkdir()
+    result = asyncio.run(
+        create_provider(home, config).assess(source, artifact, "Review", lambda pid: None)
+    )
+    assert result.factors == []
+
+
+@pytest.mark.parametrize("mode", ["scan-error", "stderr-error"])
+def test_native_scan_failure_surfaces_redacted_diagnostic(native_daemon, monkeypatch, mode):
+    daemon, homes = native_daemon
+    monkeypatch.setenv("COMPANY_GATEWAY_TOKEN", "gateway-secret")
+    daemon.config.providers["first"].env = ["COMPANY_GATEWAY_TOKEN"]
+    (homes["first"] / "mode").write_text(mode)
+    request_scan(daemon, repository="acme/repo", model="chosen")
+    scan = run_next(daemon)
+    assert scan["state"] == "failed"
+    assert "codex exited with status 1: Invalid schema: missing factors" in scan["error"]
+    assert "Invalid schema: missing factors" in scan_report(scan)
+    assert "gateway-secret" not in scan["error"]
+    assert "gateway-secret" not in scan_report(scan)
+    assert scan["admitted"] == 0
 
 
 def test_registration_does_not_require_provider_selection(home, native, source):
@@ -579,6 +658,12 @@ def test_native_failures_are_fenced_and_bounded(native_daemon, adapter, mode):
     request_scan(daemon, repository="acme/repo", provider=adapter, model="chosen")
     scan = run_next(daemon)
     assert scan["state"] == "failed"
+    if mode == "wait":
+        public_adapter = "claude" if adapter == "claude" else "codex"
+        assert (
+            f"{public_adapter} agent timed out after 1s (limits.scan_timeout_seconds)"
+            in scan["error"]
+        )
     assert daemon.store.rows("SELECT * FROM findings") == []
     assert not daemon.store.rows("SELECT pid FROM scans WHERE pid IS NOT NULL")
     assert scan["executed"] == 1
@@ -1122,7 +1207,7 @@ def test_legacy_routes_are_removed_without_changing_execution_history(home, nati
     assert report["valid"], report
     migrated = Store(home.db)
     try:
-        assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert not migrated.one(
             "SELECT name FROM sqlite_master WHERE name='repository_stage_routes'"
         )

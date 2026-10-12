@@ -72,10 +72,21 @@ def parser():
     config = add_command(commands, "config", help="Initialize or apply configuration")
     config_commands = config.add_subparsers(dest="config_command", required=True)
     add_command(config_commands, "init", help="Create private configuration and runtime files")
-    add_command(
+    apply = add_command(
         config_commands,
         "apply",
-        help="Reload settings, discover models, verify access, and save metadata",
+        help="Reload settings and check models for providers without saved data",
+    )
+    refresh = apply.add_mutually_exclusive_group()
+    refresh.add_argument(
+        "--force",
+        action="store_true",
+        help="Rediscover and validate every provider's models, replacing saved checks",
+    )
+    refresh.add_argument(
+        "--skip-model-checks",
+        action="store_true",
+        help="Reuse saved model metadata without model discovery or access probes",
     )
     models = add_command(commands, "models", help="Show stored models and efforts")
     model_commands = models.add_subparsers(dest="models_command", required=True)
@@ -105,9 +116,13 @@ def parser():
     )
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
-    scan = add_command(commands, "scan", help="Run hunting, review, or audit and publish results")
+    scan = add_command(commands, "scan", help="Run hunt → review → audit, or select one stage")
     scan.add_argument("repository", nargs="?")
-    scan.add_argument("--stage", choices=["hunt", "review", "audit"], default="hunt")
+    scan.add_argument(
+        "--stage",
+        choices=["hunt", "review", "audit"],
+        help="Run only this stage (default: all three sequentially)",
+    )
     scan.add_argument("--issue", type=positive_int, help="Finding issue to review or audit")
     scan.add_argument(
         "--limit",
@@ -116,11 +131,11 @@ def parser():
     )
     scan.add_argument("--force", action="store_true", help="Reassess an already assessed finding")
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
-    scan.add_argument("--model", required=True, help="Model to use for this stage")
+    scan.add_argument("--model", help="Pin a model (default: automatic sampling)")
     scan.add_argument(
         "--effort", help="Reasoning effort for this run; 'default' uses the provider default"
     )
-    scan.add_argument("--provider", help="Connection to use; required with multiple providers")
+    scan.add_argument("--provider", help="Constrain selection to this connection")
     configure_completion(root)
     return root
 
@@ -214,7 +229,12 @@ def execute(args):
     if args.command == "config" and args.config_command == "apply":
         if not args.json:
             print("Applying config...", flush=True)
-        report = apply_config(paths, on_check=None if args.json else check_line)
+        report = apply_config(
+            paths,
+            on_check=None if args.json else check_line,
+            force=args.force,
+            skip_model_checks=args.skip_model_checks,
+        )
         emit(report)
         if not report["valid"]:
             raise SystemExit(1)

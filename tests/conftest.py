@@ -1,3 +1,4 @@
+import hashlib
 import json
 import socket
 import subprocess
@@ -120,6 +121,7 @@ def github():
         "drop_create": False,
         "comment_id": 1000,
         "requests": [],
+        "unchanged_reads": 0,
         "tokens": {},
     }
     lock = threading.Lock()
@@ -130,7 +132,16 @@ def github():
 
         def respond(self, code, data):
             payload = json.dumps(data).encode()
+            etag = '"' + hashlib.sha256(payload).hexdigest() + '"'
+            if self.command == "GET" and code == 200 and self.headers.get("If-None-Match") == etag:
+                state["unchanged_reads"] += 1
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
             self.send_response(code)
+            if self.command == "GET" and code == 200:
+                self.send_header("ETag", etag)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -172,6 +183,8 @@ def github():
                         if page == 1
                         else []
                     )
+                elif len(parts) == 4 and parts[-1] == "labels":
+                    data = list(state["labels"].values()) if page == 1 else []
                 elif len(parts) == 6 and parts[-1] == "comments":
                     data = state["comments"].get(int(parts[-2]), []) if page == 1 else []
                 elif len(parts) == 5 and parts[-2] == "issues":

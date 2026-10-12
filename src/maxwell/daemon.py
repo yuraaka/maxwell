@@ -227,7 +227,7 @@ class Daemon:
                     prompt = assessment_prompt(job["repository"], stage, target)
                 else:
                     progress("loading existing issues from GitHub")
-                    client = GitHub(access)
+                    client = GitHub(access, on_status=progress, account=record["github_account"])
                     try:
                         known, remote_identities = await Reporter(
                             self.store, client, self.config, self.paths
@@ -290,6 +290,7 @@ class Daemon:
                         actionability=result.actionability,
                         priority=result.priority,
                         evidence=result.evidence,
+                        factors=result.factors,
                         supersedes=target.previous.id if target.previous else None,
                         references=[review.id for review in target.reviews],
                     )
@@ -337,7 +338,7 @@ class Daemon:
             findings = []
         except Exception as exc:
             findings = []
-            error = self.config.redact(str(exc))[:2000]
+            error = (self.config.redact(str(exc)).strip() or type(exc).__name__)[:2000]
             summary = f"{stage_label} failed: {error}"
             self.log.warning("Scan %s failed: %s", job["id"], error)
         finally:
@@ -444,7 +445,9 @@ class Daemon:
                     name, account = record["name"], record["github_account"]
                     try:
                         if account not in clients:
-                            clients[account] = GitHub(self.config.github.for_account(account))
+                            clients[account] = GitHub(
+                                self.config.github.for_account(account), account=account
+                            )
                         key = (name, account)
                         if key not in reporters:
                             reporters[key] = Reporter(

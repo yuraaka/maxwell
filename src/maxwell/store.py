@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from maxwell.records import RECORD_ADAPTER, AssessmentRecord, StageExecution, record_digest
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class Store:
@@ -40,6 +40,10 @@ class Store:
                 allocated INTEGER, error TEXT, checked REAL NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS dashboards (
+                repository TEXT PRIMARY KEY, issue INTEGER, url TEXT,
+                state TEXT NOT NULL DEFAULT 'pending', error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS histories (
                 repository TEXT PRIMARY KEY, issue INTEGER, url TEXT,
                 state TEXT NOT NULL DEFAULT 'pending', error TEXT
             );
@@ -238,7 +242,11 @@ class Store:
             "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",
             (record.repository, record.type, record.id),
         )
-        if existing and existing != {"issue": issue, "data": data}:
+        if existing and (
+            existing["issue"] != issue
+            or record_digest(RECORD_ADAPTER.validate_json(existing["data"]))
+            != record_digest(record)
+        ):
             raise ValueError("Published records are immutable; use a new superseding record")
         self.db.execute(
             "INSERT OR IGNORE INTO record_publications(repository,type,id,issue,data) "
@@ -278,19 +286,17 @@ class Store:
                 (execution.id, execution.repository, execution.state, execution.model_dump_json()),
             )
 
-    def apply_models(self, report, digest):
+    def apply_models(self, report, digest, *, reused_providers=()):
         checked_at = time.time()
         with self.db:
             self.db.execute("DELETE FROM model_catalogs")
             for catalog in report["providers"]:
-                catalog["checked_at"] = checked_at
+                if catalog["provider"] not in reused_providers:
+                    catalog["checked_at"] = checked_at
                 stored_catalog = {
                     **catalog,
                     "models": [
-                        model
-                        for model in catalog["models"]
-                        if (model.get("efforts") or model.get("default_effort"))
-                        and model["access"] != "unavailable"
+                        model for model in catalog["models"] if model["access"] != "unavailable"
                     ],
                 }
                 self.db.execute(
@@ -318,7 +324,7 @@ class Store:
             ).fetchone():
                 raise ValueError("Run `maxwell config apply` to discover and check models first")
             application = connection.execute(
-                "SELECT checked_at,valid FROM config_application WHERE id=1"
+                "SELECT checked_at,valid,config_digest FROM config_application WHERE id=1"
             ).fetchone()
             if not application:
                 raise ValueError("Run `maxwell config apply` to discover and check models first")
@@ -336,6 +342,7 @@ class Store:
                 "providers": [json.loads(row[0]) for row in rows],
                 "checked_at": application[0],
                 "valid": bool(application[1]),
+                "config_digest": application[2],
             }
         finally:
             connection.close()
@@ -666,6 +673,9 @@ class Store:
             ),
             "dashboard_problems": self.rows(
                 "SELECT repository,state,error FROM dashboards WHERE error IS NOT NULL OR state='uncertain'"
+            ),
+            "history_problems": self.rows(
+                "SELECT repository,state,error FROM histories WHERE error IS NOT NULL OR state='uncertain'"
             ),
             "hunter_rating": "unrated; requires independently assessed outcomes",
             "entropy": "unavailable; requires a complete measurement baseline",
