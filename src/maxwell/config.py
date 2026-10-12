@@ -188,6 +188,8 @@ class Limits(Settings):
     scan_interval_seconds: float = Field(default=1800, ge=1)
     max_findings_per_scan: int = Field(default=3, ge=1)
     max_candidates_per_scan: int = Field(default=DEFAULT_SCAN_CANDIDATES, ge=1)
+    max_hunt_diff_chars: int = Field(default=30_000, ge=1)
+    max_hunt_changed_files: int = Field(default=200, ge=1)
     max_reviews_per_scan: int = Field(default=1, ge=1)
     max_audits_per_scan: int = Field(default=1, ge=1)
     human_queue_max: int = Field(default=6, ge=1)

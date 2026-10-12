@@ -16,6 +16,19 @@ def digest(value):
     ).hexdigest()
 
 
+def measurement_policy(settings, repository):
+    policy = settings.model_dump(exclude={"tests"})
+    policy["runtime_normalization"] = "min(median_seconds/budget_seconds,1)"
+    profile = settings.tests.get(repository)
+    if profile:
+        policy["tests"] = {
+            **profile.model_dump(exclude={"command", "environment"}),
+            "command_fingerprint": digest(profile.command),
+            "environment_settings_fingerprint": digest(profile.environment),
+        }
+    return policy
+
+
 def measurement_score(record):
     if (
         record.policy_version != POLICY

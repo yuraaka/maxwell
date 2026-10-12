@@ -17,6 +17,7 @@ from maxwell.measurement import (
     compatible,
     digest,
     historical_stage,
+    measurement_policy,
     measurement_report,
     measurement_score,
     projected_measurements,
@@ -86,14 +87,7 @@ async def measure_one(
             store.db.execute("UPDATE measurements SET sha=? WHERE id=?", (sha, identity))
         factors, status, evidence, fingerprint = {}, {}, {}, None
         profile = config.measurement.tests.get(repository_record["name"])
-        policy = config.measurement.model_dump(exclude={"tests"})
-        policy["runtime_normalization"] = "min(median_seconds/budget_seconds,1)"
-        if profile:
-            policy["tests"] = {
-                **profile.model_dump(exclude={"command", "environment"}),
-                "command_fingerprint": digest(profile.command),
-                "environment_settings_fingerprint": digest(profile.environment),
-            }
+        policy = measurement_policy(config.measurement, repository_record["name"])
         if skip_source or not run_tests:
             progress("loading historical stage results from GitHub")
             await reporter.project_repository_records(repository_record["name"])

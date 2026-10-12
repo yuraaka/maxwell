@@ -374,7 +374,8 @@ The human review queue limit applies only to hunting; daily budget/execution lim
 apply to every stage. Reports, terminal progress, and `--json` identify the selected stage.
 
 `scan --stage hunt` requests a fresh inspection even when the revision is unchanged. Each hunt
-currently inspects a whole pinned revision rather than only a diff. Discovery asks the agent to
+inspects a whole pinned revision, with measurement hotspots and a diff to guide attention.
+Discovery asks the agent to
 map components, sweep correctness, configuration, recovery, resource handling, security,
 and maintenance defects, then review interactions. It collects up to
 `limits.max_candidates_per_scan` concrete candidates (default 100, any positive integer)
@@ -504,6 +505,24 @@ including closed findings and legacy issue markers, are checked for duplicates e
 fresh local database. Ordinary open GitHub issues provide context but cannot guarantee
 semantic deduplication. Pull requests are excluded. If GitHub cannot be read completely,
 discovery fails before starting the agent rather than using stale SQLite context.
+After refreshing GitHub records, hunters also receive the latest measurement matching the
+current measurement policy, its earliest compatible baseline, and published source/test
+hotspots. Measurement and reused-stage evidence carries its original revision, age, and
+test environment fingerprint. Missing measurements stay explicitly unknown and do not
+block bug hunting; old hotspots must be checked against the current source.
+
+Hunters receive a Git diff from the latest successful published hunter execution to the
+current pinned commit, independently of provider/model routing. Failed executions and
+review/audit executions cannot establish that revision. First hunts, missing commits, and
+rewritten history fall back to a whole-repository investigation with an explicit reason.
+The prompt asks for both existing bugs and introduced bugs or regressions, including
+effects on callers outside the diff. An unchanged revision still receives a fresh hunt.
+`limits.max_hunt_diff_chars` (default 30000) and `limits.max_hunt_changed_files` (default 200)
+bound the inline change context; truncation and total counts are explicit. Hunters can
+inspect remaining changes using read-only Git commands. The redacted context is saved
+alongside each hunt's prompt as `hunt-context.json`. Hunts do not execute tests to refresh
+measurement history.
+
 The status report combines projected GitHub execution history with local
 runs, deduplicating execution IDs so a fresh home retains published token totals.
 

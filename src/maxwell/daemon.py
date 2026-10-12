@@ -12,6 +12,7 @@ from maxwell.assessment import AssessmentTarget, assessment_prompt
 from maxwell.config import Limits, ProviderSettings
 from maxwell.contracts import Usage, estimate_cost, micros
 from maxwell.github import GitHub
+from maxwell.hunt_context import build_hunt_context
 from maxwell.provider import create_provider, discovery_prompt
 from maxwell.records import AssessmentRecord, public_agent
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
@@ -233,12 +234,20 @@ class Daemon:
                         ).discovery_context(job["repository"])
                     finally:
                         client.close()
+                    progress("loading measurement and change context")
+                    hunt_context = await build_hunt_context(
+                        self.store, job["repository"], sha, worktree, scan_config
+                    )
+                    (artifact / "hunt-context.json").write_text(
+                        self.config.redact(json.dumps(hunt_context, indent=2))
+                    )
                     prompt = discovery_prompt(
                         job["repository"],
                         sha,
                         scan_config.limits.max_findings_per_scan,
                         known,
                         candidate_limit=scan_config.limits.max_candidates_per_scan,
+                        hunt_context=hunt_context,
                     )
                 (artifact / "prompt.txt").write_text(self.config.redact(prompt))
                 policy = execution or self.config.model_dump(mode="json")
