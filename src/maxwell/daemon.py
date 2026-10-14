@@ -12,7 +12,7 @@ from maxwell.assessment import AssessmentTarget, assessment_prompt
 from maxwell.config import Limits, ProviderSettings
 from maxwell.contracts import Usage, estimate_cost, micros
 from maxwell.github import GitHub
-from maxwell.hunt_context import build_hunt_context
+from maxwell.hunt_context import build_hunt_context, measurement_context
 from maxwell.provider import create_provider, discovery_prompt
 from maxwell.records import AssessmentRecord, public_agent
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
@@ -224,7 +224,13 @@ class Daemon:
                 state, summary, cost = "skipped", "Revision already scanned; no model call.", 0
             else:
                 if target:
-                    prompt = assessment_prompt(job["repository"], stage, target)
+                    context = measurement_context(
+                        self.store, job["repository"], sha, self.config.measurement
+                    )
+                    (artifact / "assessment-context.json").write_text(
+                        self.config.redact(json.dumps(context, indent=2))
+                    )
+                    prompt = assessment_prompt(job["repository"], stage, target, context)
                 else:
                     progress("loading existing issues from GitHub")
                     client = GitHub(access, on_status=progress, account=record["github_account"])
@@ -291,6 +297,7 @@ class Daemon:
                         priority=result.priority,
                         evidence=result.evidence,
                         factors=result.factors,
+                        repair=result.repair,
                         supersedes=target.previous.id if target.previous else None,
                         references=[review.id for review in target.reviews],
                     )

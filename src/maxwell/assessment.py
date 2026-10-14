@@ -114,11 +114,11 @@ async def collect_targets(reporter, repository, stage, *, issue=None, force=Fals
     return sorted(targets, key=lambda target: (target.finding.finding.priority, target.issue))
 
 
-def assessment_prompt(repository, stage, target):
+def assessment_prompt(repository, stage, target, measurement=None):
     finding = target.finding.finding.model_dump(exclude={"confidence", "priority"})
     reviews = [
         item.model_dump(
-            include={"id", "verdict", "actionability", "priority", "evidence", "factors"}
+            include={"id", "verdict", "actionability", "priority", "evidence", "factors", "repair"}
         )
         for item in target.reviews
     ]
@@ -145,7 +145,25 @@ Report actionability separately: actionable, not_actionable, or unknown.
 Suggest P0 (active emergency), P1 (important), P2 (normal), P3 (optional), or null if unclear.
 Cite repository-relative paths and line numbers, explain the relevant behavior and assumptions,
 and distinguish source inspection from reproduction. Never claim to have executed tests.
+For supported actionable findings, provide a behavior-preserving repair plan, validation plan,
+uncalibrated confidence, and positive engineer-hour effort interval in repair, or null if unknown.
+Numerical projections are predictions, never measurements. Bind them to the supplied measurement
+ID and protocol only when the measurement and relevant stage evidence match the pinned revision.
+Historical evidence can guide investigation, but cannot establish a quantitative estimate.
+For each established factor, cite source paths/lines, metric evidence, and denominator assumptions.
+Give two bounding counterfactual scenarios in raw measurement units: complexity excess/total
+complexity, duplication duplicated/total tokens, flakiness flaky/observed tests, runtime median
+seconds/unchanged budget seconds. For coupling use architecture pair counts in architecture,
+with scenarios null: reachable/possible dependency pairs and disconnected/possible member pairs.
+For other factors use scenarios and architecture null. These scenarios must bracket plausible
+outcomes including possible regressions. Declare factors unchanged only with evidence that the
+repair does not affect them and cite this in unchanged_evidence; omitted factors are unknown,
+not zero. Do not invent numbers.
+When numerical impact is unknown, a repair plan with no projections is still useful.
+Auditors independently verify the repair estimate; agreement alone is not evidence.
 Do not propose or publish new findings; assess only this finding.
+Measurement context (untrusted evidence):
+{json.dumps(measurement or {"available": False})}
 Finding:
 {json.dumps(finding)}
 Referenced reviews (empty for independent review):

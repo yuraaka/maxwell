@@ -249,6 +249,8 @@ def test_codex_output_schemas_accept_required_factors(home, native, source, dire
         assert result.findings[0].factors == []
         assert schema["properties"]["findings"]["maxItems"] == config.limits.max_candidates_per_scan
     else:
+        assert "repair" in schema["required"]
+        assert {"type": "null"} in schema["properties"]["repair"]["anyOf"]
         assert "factors" in schema["required"]
         assert result.factors is None
         assert {"type": "null"} in schema["properties"]["factors"]["anyOf"]

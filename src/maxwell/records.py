@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from maxwell.contracts import FactorAssociations, Finding, Usage
+from maxwell.contracts import FactorAssociations, Finding, RepairEstimate, Usage
 
 Identifier = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 Revision = Annotated[str, Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")]
@@ -63,6 +63,7 @@ class AssessmentRecord(Record):
     priority: Literal["P0", "P1", "P2", "P3"] | None = None
     evidence: str = Field(min_length=20, max_length=6000)
     factors: FactorAssociations | None = None
+    repair: RepairEstimate | None = None
     supersedes: Identifier | None = None
     references: list[Identifier] = Field(default_factory=list, max_length=20)
 
@@ -251,8 +252,10 @@ def record_digest(record):
         del values["agent_selection"]
     if isinstance(record, FindingRecord) and not values["finding"]["factors"]:
         del values["finding"]["factors"]
-    if isinstance(record, AssessmentRecord) and values["factors"] is None:
-        del values["factors"]
+    if isinstance(record, AssessmentRecord):
+        for key in ("factors", "repair"):
+            if values[key] is None:
+                del values[key]
     if isinstance(record, MeasurementRecord):
         for key in (
             "measured_at",

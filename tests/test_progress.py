@@ -71,3 +71,24 @@ def test_heartbeat_tracks_current_phase_and_total_elapsed(monkeypatch):
     progress.emit(heartbeat=True)
     assert events[-1]["phase"] == "publishing results to GitHub"
     assert events[-1]["elapsed"] == 75
+
+
+def test_progress_uses_terminal_refresh_and_preserves_measurement_fraction():
+    class Callback:
+        refresh_interval = 0.12
+
+        def __init__(self):
+            self.events = []
+
+        def __call__(self, event):
+            self.events.append(event)
+
+    callback = Callback()
+    progress = ScanProgress({"repository": "acme/repo"}, callback)
+    assert progress.interval == 0.12
+    progress.update({"phase": "test run 1/2 · 3/10 tests", "stage_fraction": 0.325})
+    progress.emit(heartbeat=True)
+    assert callback.events[-1]["stage_fraction"] == 0.325
+    assert callback.events[-1]["phase"] == "test run 1/2 · 3/10 tests"
+    progress.update("publishing measurement")
+    assert "stage_fraction" not in callback.events[-1]

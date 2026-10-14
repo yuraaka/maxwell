@@ -411,7 +411,7 @@ async def run_measurements(
 
                 def progress(value):
                     nonlocal phase
-                    phase = value
+                    phase = value["phase"] if isinstance(value, dict) else value
                     if on_progress:
                         on_progress(
                             {

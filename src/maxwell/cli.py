@@ -12,7 +12,7 @@ import httpx
 
 from maxwell import __version__
 from maxwell.cli_help import TreeParser
-from maxwell.cli_output import check_line, color, measurement_line, model_lines, output, scan_line
+from maxwell.cli_output import check_line, color, measurement_line, model_lines, output
 from maxwell.completion import bash_completion, configure_completion
 from maxwell.config import Paths
 from maxwell.config_apply import apply_config
@@ -27,6 +27,7 @@ from maxwell.repositories import (
     validate_branch,
     validate_ref,
 )
+from maxwell.scan_display import ScanDisplay
 from maxwell.store import Store
 
 
@@ -318,23 +319,28 @@ def execute(args):
         if not report["valid"]:
             raise SystemExit(1)
     elif args.command == "scan":
-        report = asyncio.run(
-            run_scans(
-                paths,
-                config,
-                args.repository,
-                args.model,
-                provider=args.provider,
-                effort=args.effort,
-                priority=int(args.priority[1]),
-                stage=args.stage,
-                issue=args.issue,
-                limit=args.limit,
-                force=args.force,
-                skip_stages=args.skip_stage,
-                on_progress=None if args.json else scan_line,
+        display = None if args.json else ScanDisplay()
+        try:
+            report = asyncio.run(
+                run_scans(
+                    paths,
+                    config,
+                    args.repository,
+                    args.model,
+                    provider=args.provider,
+                    effort=args.effort,
+                    priority=int(args.priority[1]),
+                    stage=args.stage,
+                    issue=args.issue,
+                    limit=args.limit,
+                    force=args.force,
+                    skip_stages=args.skip_stage,
+                    on_progress=display,
+                )
             )
-        )
+        finally:
+            if display:
+                display.finish()
         emit(report)
         if not report["valid"]:
             raise SystemExit(1)

@@ -43,55 +43,6 @@ def check_line(check):
     print(f"{badge} {name}{suffix}", flush=True)
 
 
-def scan_line(scan):
-    name = scan["repository"]
-    if scan["state"] == "progress":
-        elapsed = scan["elapsed"]
-        minutes, seconds = divmod(elapsed, 60)
-        badge = "[WAIT]" if scan["heartbeat"] else "[STEP]"
-        print(
-            f"{color(badge, '36')} {name}: {scan['phase']} ({minutes}:{seconds:02d} elapsed)",
-            flush=True,
-        )
-    elif scan["state"] == "running":
-        effort = f" / {scan['effort']}" if scan.get("effort") else ""
-        stage = f" / {scan['stage']}" if scan.get("stage") in ("review", "audit") else ""
-        print(
-            f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}{stage}",
-            flush=True,
-        )
-        if decision := scan.get("agent_selection"):
-            method = {
-                "explicit": "explicit choice",
-                "thompson-source-v1": "sampled using provisional evidence",
-                "uniform-unrated-v1": "sampled equally; unrated",
-            }[decision["method"]]
-            independence = (
-                "; different model unavailable"
-                if decision["independence"] == "constrained"
-                else "; independence overridden"
-                if decision["independence"] == "overridden"
-                else ""
-            )
-            print(f"{color('[PICK]', '36')} {name}: {method}{independence}", flush=True)
-    elif scan["state"] == "publishing":
-        print(f"{color('[PUB]', '36')} {name}: publishing results", flush=True)
-    else:
-        success = scan["state"] == "completed" and not scan["publication_errors"]
-        badge = color("[OK]" if success else "[FAIL]", "32" if success else "31")
-        detail = (
-            f"{scan['admitted']} new findings"
-            if success
-            else scan["error"] or "; ".join(scan["publication_errors"]) or scan["state"]
-        )
-        if success and scan.get("selection"):
-            detail += f"; {scan['selection']['skipped']} candidates skipped"
-        if success and scan.get("stage") in ("review", "audit"):
-            verdicts = ", ".join(item["verdict"] for item in scan.get("assessments", []))
-            detail = f"{scan['stage']}: {verdicts or 'no assessment'}"
-        print(f"{badge} {name}: {detail}", flush=True)
-
-
 def measurement_line(item):
     badge = "[WAIT]" if item["heartbeat"] else "[STEP]"
     print(
@@ -232,43 +183,85 @@ def human_lines(value, command, repo_command=None):
         lines[0] = f"{verb} {lines[0]}"
         return lines
     if command == "scan":
-        skipped = [
-            (
-                f"{item['repository']}: no eligible findings for {item['stage']}."
-                if item.get("reason", "No eligible findings") == "No eligible findings"
-                else f"[SKIP] {item['repository']} / {item['stage']}: {item['reason']}"
-            )
-            for item in value.get("skipped", [])
-        ]
-        if (
-            not value["scans"]
-            and not value.get("measurements")
-            and not skipped
-            and not value.get("errors")
-        ):
+        scans = value.get("scans", [])
+        measurements = value.get("measurements", [])
+        skipped = value.get("skipped", [])
+        errors = value.get("errors", [])
+        repositories = sorted(
+            {
+                item["repository"]
+                for item in [*scans, *measurements, *skipped, *errors, *value.get("statuses", [])]
+            }
+        )
+        if not repositories:
             return ["No repositories to scan."]
-        lines = [
-            f"[FAIL] {item['repository']} / {item['stage']}: {item['error']}"
-            for item in value.get("errors", [])
-        ] + skipped
-        for item in value.get("measurements", []):
-            score = f"{item['score']:.2f}/100" if item.get("score") is not None else "unknown"
-            lines.append(f"[MEASURE] {item['repository']}: entropy {score}")
-            for factor, status in item.get("factor_status", {}).items():
-                if status != "measured":
-                    lines.append(f"[UNKNOWN] {factor}: {status}")
-            if item.get("report"):
-                lines.append(f"Measurement: {item['report']}")
-        for scan in value["scans"]:
-            if scan["report"]:
-                lines.append(f"Report: {scan['report']}")
-            for finding in scan["findings"]:
-                if finding["url"]:
-                    lines.append(f"Finding: {finding['url']}")
-            for assessment in scan.get("assessments", []):
-                lines.append(
-                    f"Assessment: https://github.com/{scan['repository']}/issues/{assessment['issue']}"
-                )
+        lines = []
+        for repository in repositories:
+            runs = [item for item in scans if item["repository"] == repository]
+            successful = [
+                item
+                for item in runs
+                if item["state"] == "completed" and not item["publication_errors"]
+            ]
+            parts = [
+                f"{sum(item['admitted'] for item in successful if item['stage'] == 'hunt')} new findings"
+            ]
+            for stage in ("review", "audit"):
+                verdicts = [
+                    assessment["verdict"]
+                    for item in successful
+                    if item["stage"] == stage
+                    for assessment in item.get("assessments", [])
+                ]
+                if verdicts:
+                    counts = [
+                        f"{verdicts.count(verdict)} {verdict}"
+                        for verdict in ("supported", "rejected", "inconclusive")
+                        if verdict in verdicts
+                    ]
+                    parts.append(f"{stage}: {', '.join(counts)}")
+            measurement = next(
+                (item for item in measurements if item["repository"] == repository), None
+            )
+            if measurement:
+                score = measurement.get("score")
+                parts.append(f"entropy {score:.2f}/100" if score is not None else "entropy unknown")
+            lines.append(f"{color(repository, '1;36')}: {'; '.join(parts)}")
+            failures = {}
+            for item in errors:
+                if item["repository"] == repository:
+                    key = (item["stage"], item["error"])
+                    failures[key] = failures.get(key, 0) + 1
+            for item in runs:
+                if item["state"] != "completed" or item["publication_errors"]:
+                    key = (
+                        item["stage"],
+                        item["error"] or "; ".join(item["publication_errors"]) or item["state"],
+                    )
+                    failures[key] = failures.get(key, 0) + 1
+            for (stage, message), count in failures.items():
+                suffix = f" ({count} executions)" if count > 1 else ""
+                lines.append(f"[FAIL] {repository} / {stage}: {message}{suffix}")
+            for item in skipped:
+                if item["repository"] == repository:
+                    lines.append(f"[SKIP] {repository} / {item['stage']}: {item['reason']}")
+            if measurement:
+                unknown = [
+                    f"{factor}: {status}"
+                    for factor, status in measurement.get("factor_status", {}).items()
+                    if status != "measured"
+                ]
+                if unknown:
+                    lines.append("Unknown factors: " + "; ".join(unknown))
+            status = next(
+                (item for item in value.get("statuses", []) if item["repository"] == repository),
+                None,
+            )
+            lines.append(
+                f"{color('Status:', '1;36')} {color(status['url'], '36;4')}"
+                if status
+                else "Status: unavailable (not published to GitHub)"
+            )
         return lines
     return []
 

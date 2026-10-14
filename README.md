@@ -779,7 +779,63 @@ need no association. Reviewers and auditors independently confirm or correct thi
 The latest applicable assessment stage controls labels; conflicting decisions conservatively
 remove disputed associations. Rejected findings lose their factor labels. Legacy assessments
 without a factor decision retain earlier associations. Finding identity does not change.
-These associations are qualitative; numerical impact estimates and ranking are a later step.
+Associations remain qualitative; numerical estimates require a repair plan and measurement evidence.
+
+### Scan progress output
+
+Interactive `maxwell scan` updates a compact framed panel for **Measure → Hunt → Review → Audit**.
+Measure includes source analysis and test runs. Review and audit show completed/selected
+finding counts; the current model, activity, and elapsed time appear as space permits.
+A spinner and moving highlight refresh about eight times per second during long operations.
+Test runs report live completed/total counts, failures, and the current test; the measure
+segment advances through source analysis, individual test runs, and publication. Animation
+is an activity indicator and never invents completed work.
+Active stages use yellow, cyan, magenta, and green; completed stages show a green check,
+failures a red cross, and pending/skipped stages are muted. The continuous green/gray bar
+tracks stage and assessment completion, not predicted time remaining. `NO_COLOR` disables
+colors. Later stages continue after failures. Redirected output prints plain stage milestones
+without phase or heartbeat spam.
+
+The final summary links to the main **Maxwell status** issue and aggregates findings,
+verdicts, and repeated failures. Local report paths and individual issue links remain in
+`maxwell scan --json`; they are omitted from the human output. Detailed agent diagnostics
+are retained in `~/.maxwell/logs/daemon.log` and the existing per-execution artifacts.
+
+### Repair estimates and fix ranking
+
+Reviewers and auditors can attach a behavior-preserving repair plan, proposed validation,
+uncalibrated confidence, and an engineer-hour effort interval to their GitHub assessments.
+They predict two bounding raw metric scenarios, including changing denominator populations.
+Coupling uses dependency reachability and member cohesion pair counts; runtime keeps the
+measured budget fixed. Maxwell calculates weighted point changes using the referenced
+measurement policy. Negative changes mean a predicted regression, not a reduction.
+
+The status description contains a fix queue. The `maintenance-impact-v1` ranking score is
+**lower estimated point reduction × confidence / upper effort hours**. Only positive,
+complete estimates receive a rank score. All five factors must be projected or explicitly
+declared unchanged with evidence. Partial estimates, missing records, conflicting plans,
+policy mismatches, old measurements, and reused evidence from another revision remain
+unranked with an explanation. Predictions cannot be added across issues because repairs
+may overlap. Bug severity has its own priority list and is never replaced by entropy impact.
+
+The latest applicable supported, actionable assessment controls the queue: human decisions,
+then audits, then provisional reviews. An audit with no estimate does not revive a review's
+estimate. GitHub records reconstruct this queue in a fresh SQLite database; no migration or
+paid reassessment runs automatically. Closed and rejected issues leave the queue.
+
+New `maxwell scan` reviews and audits request estimates automatically. Existing assessments
+remain unknown until refreshed, for example:
+
+```sh
+maxwell scan --stage review --force owner/repo
+maxwell scan --stage audit --force owner/repo
+```
+
+Assessments remain read-only and never execute the validation plan. Closing an issue does
+not establish a validated fix or an observed entropy reduction. Dashboard tables display the first
+50 entries per track and report how many additional entries are omitted; this is a presentation
+limit and does not limit collection or assessment. Independent repair validation
+and post-fix measurement attribution are the next workflow.
 
 Future execution and measurement records go to a separate **Maxwell history** issue marked
 `<!-- maxwell:history:v1 -->`. Assessments remain on their finding issues. Legacy generated execution and measurement comments on the status issue are removed; they are not migrated. Pending

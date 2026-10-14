@@ -637,3 +637,26 @@ def test_cleanup_retires_uncertain_legacy_measurement_publication(home, source, 
             assert not github["comments"].get(store.one("SELECT issue FROM histories")["issue"])
         finally:
             client.close()
+
+
+def test_measurement_reports_live_test_counts_before_suite_finishes(home, source, github):
+    (source / "test_live.py").write_text(
+        "import time\ndef test_first(): pass\ndef test_second(): time.sleep(0.6)\n"
+    )
+    commit(source)
+    config = configure(home, source, runs=2, warmups=0)
+    events = []
+    report = asyncio.run(run_measurements(home, config, "acme/repo", on_progress=events.append))
+    assert report["valid"]
+    phases = [event["phase"] for event in events]
+    assert any("1/2 tests" in phase and "test_second" in phase for phase in phases)
+    assert any("2/2 tests · 0 failed" in phase for phase in phases)
+    assert all(isinstance(phase, str) for phase in phases)
+    with StoreContext(home) as store:
+        row = store.one("SELECT artifact FROM measurements")
+    from pathlib import Path
+
+    snapshots = sorted(Path(row["artifact"]).glob("test-*/progress.json"))
+    assert len(snapshots) == 2
+    assert json.loads(snapshots[0].read_text())["completed"] == 2
+    assert not list((home.root / "repos").glob("*/worktrees/*"))

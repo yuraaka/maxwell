@@ -87,9 +87,88 @@ class SelectionStats(BaseModel):
         return self
 
 
+class EstimateRange(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    low: float = Field(ge=0)
+    high: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def check_order(self):
+        if self.low > self.high:
+            raise ValueError("Estimate range must be ordered")
+        return self
+
+
+class RatioProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    numerator: float = Field(ge=0)
+    denominator: float = Field(gt=0)
+
+
+class ArchitectureProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    reachable_pairs: float = Field(ge=0)
+    possible_dependency_pairs: float = Field(ge=0)
+    disconnected_pairs: float = Field(ge=0)
+    possible_member_pairs: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def check_counts(self):
+        if (
+            self.reachable_pairs > self.possible_dependency_pairs
+            or self.disconnected_pairs > self.possible_member_pairs
+        ):
+            raise ValueError("Architecture pairs cannot exceed their populations")
+        return self
+
+
+class FactorProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    factor: Factor
+    scenarios: list[RatioProjection] | None = Field(default=None, min_length=2, max_length=2)
+    architecture: list[ArchitectureProjection] | None = Field(
+        default=None, min_length=2, max_length=2
+    )
+    evidence: str = Field(min_length=20, max_length=3000)
+    assumptions: str = Field(min_length=10, max_length=3000)
+
+    @model_validator(mode="after")
+    def check_architecture(self):
+        if (self.factor == "coupling") != (self.architecture is not None) or (
+            (self.factor != "coupling") != (self.scenarios is not None)
+        ):
+            raise ValueError("Coupling projections require architecture pair scenarios only")
+        return self
+
+
+class RepairEstimate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    plan: str = Field(min_length=20, max_length=4000)
+    validation: str = Field(min_length=20, max_length=3000)
+    confidence: float = Field(ge=0, le=1)
+    effort_hours: EstimateRange
+    measurement_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    protocol: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    projections: list[FactorProjection] = Field(default_factory=list, max_length=5)
+    unchanged: FactorAssociations = Field(default_factory=list)
+    unchanged_evidence: str | None = Field(default=None, max_length=3000)
+
+    @model_validator(mode="after")
+    def check_factors(self):
+        factors = [projection.factor for projection in self.projections]
+        if len(factors) != len(set(factors)) or set(factors) & set(self.unchanged):
+            raise ValueError("Projected and unchanged factors must be unique and disjoint")
+        if self.unchanged and len(self.unchanged_evidence or "") < 20:
+            raise ValueError("Unchanged factors require evidence")
+        if self.effort_hours.low <= 0:
+            raise ValueError("Repair effort must be positive")
+        return self
+
+
 class AssessmentResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     summary: str = Field(min_length=1, max_length=6000)
+    repair: RepairEstimate | None = None
     factors: FactorAssociations | None = None
     verdict: Literal["supported", "rejected", "inconclusive"]
     actionability: Literal["actionable", "not_actionable", "unknown"]

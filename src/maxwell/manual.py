@@ -1,6 +1,7 @@
 import asyncio
 import fcntl
 import json
+import logging
 import signal
 
 from maxwell.agent_selection import AgentSelector
@@ -66,11 +67,12 @@ async def execute_job(
             on_progress(
                 {
                     **job,
+                    "stage": stage,
                     "effort": execution["settings"].get("effort"),
                     "agent_selection": execution.get("agent_selection"),
                 }
             )
-        progress = ScanProgress(job, on_progress)
+        progress = ScanProgress({**job, "stage": stage}, on_progress)
         async with progress.watch():
             await engine.scan(job, on_progress=progress.update)
         if task.cancelling():
@@ -207,6 +209,10 @@ async def run_scans(
         store = Store(paths.db)
         engine = Daemon(paths, config)
         engine.store = store
+        log_handler = logging.FileHandler(paths.log)
+        log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        engine.log = logging.Logger("maxwell.manual")
+        engine.log.addHandler(log_handler)
         task = asyncio.current_task()
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
@@ -231,6 +237,27 @@ async def run_scans(
             results, skipped, errors, measurements = [], [], [], []
             stages = (stage,) if stage else ("hunt", "review", "audit")
             for record in records:
+
+                def stage_event(current_stage, status, **details):
+                    if on_progress:
+                        on_progress(
+                            {
+                                "repository": record["name"],
+                                "state": "stage",
+                                "stage": current_stage,
+                                "status": status,
+                                **details,
+                            }
+                        )
+
+                if on_progress:
+                    on_progress(
+                        {
+                            "repository": record["name"],
+                            "state": "plan",
+                            "stages": ["measure", *stages] if stage is None else list(stages),
+                        }
+                    )
                 client = GitHub(
                     config.github.for_account(record["github_account"]),
                     account=record["github_account"],
@@ -238,7 +265,10 @@ async def run_scans(
                 reporter = Reporter(store, client, config, paths)
                 try:
                     if stage is None:
-                        progress = ScanProgress({"repository": record["name"]}, on_progress)
+                        stage_event("measure", "running")
+                        progress = ScanProgress(
+                            {"repository": record["name"], "stage": "measure"}, on_progress
+                        )
                         try:
                             async with progress.watch():
                                 measured = await measure_one(
@@ -271,8 +301,18 @@ async def run_scans(
                                     "error": config.redact(str(exc)),
                                 }
                             )
+                        stage_event(
+                            "measure",
+                            "failed"
+                            if any(
+                                item["repository"] == record["name"] and item["stage"] == "measure"
+                                for item in errors
+                            )
+                            else "completed",
+                        )
                     for current_stage in stages:
                         if current_stage in skip_stages:
+                            stage_event(current_stage, "skipped", detail="explicitly skipped")
                             skipped.append(
                                 {
                                     "repository": record["name"],
@@ -281,22 +321,15 @@ async def run_scans(
                                 }
                             )
                             continue
-                        if on_progress and stage is None:
-                            on_progress(
-                                {
-                                    "repository": record["name"],
-                                    "state": "progress",
-                                    "phase": f"starting {current_stage} stage",
-                                    "elapsed": 0,
-                                    "heartbeat": False,
-                                }
-                            )
+                        stage_event(current_stage, "running")
+                        stage_results = []
                         try:
                             if current_stage == "hunt":
                                 targets = [None]
                             else:
                                 preparation = ScanProgress(
-                                    {"repository": record["name"]}, on_progress
+                                    {"repository": record["name"], "stage": current_stage},
+                                    on_progress,
                                 )
                                 preparation.update(f"loading {current_stage} findings from GitHub")
                                 client.on_status = preparation.update
@@ -324,10 +357,21 @@ async def run_scans(
                                             "reason": "No eligible findings",
                                         }
                                     )
+                            if on_progress:
+                                on_progress(
+                                    {
+                                        "repository": record["name"],
+                                        "state": "batch",
+                                        "stage": current_stage,
+                                        "total": len(targets),
+                                        "completed": 0,
+                                    }
+                                )
                             for target in targets:
                                 if not selector.explicit:
                                     preparation = ScanProgress(
-                                        {"repository": record["name"]}, on_progress
+                                        {"repository": record["name"], "stage": current_stage},
+                                        on_progress,
                                     )
                                     preparation.update("loading agent evidence from GitHub")
                                     client.on_status = preparation.update
@@ -359,7 +403,32 @@ async def run_scans(
                                     on_progress=on_progress,
                                 )
                                 results.append(result)
+                                stage_results.append(result)
+                                if on_progress:
+                                    on_progress(
+                                        {
+                                            "repository": record["name"],
+                                            "state": "batch",
+                                            "stage": current_stage,
+                                            "total": len(targets),
+                                            "completed": len(stage_results),
+                                        }
+                                    )
+                            stage_event(
+                                current_stage,
+                                "skipped"
+                                if not targets
+                                else "failed"
+                                if any(
+                                    item["state"] != "completed" or item["publication_errors"]
+                                    for item in stage_results
+                                )
+                                else "completed",
+                                total=len(targets),
+                                completed=len(stage_results),
+                            )
                         except Exception as exc:
+                            stage_event(current_stage, "failed")
                             if stage is not None:
                                 raise
                             errors.append(
@@ -374,6 +443,19 @@ async def run_scans(
             return {
                 "scans": results,
                 "measurements": measurements,
+                "statuses": [
+                    {
+                        "repository": record["name"],
+                        "url": f"https://github.com/{record['name']}/issues/{dashboard['issue']}",
+                    }
+                    for record in records
+                    if (
+                        dashboard := store.one(
+                            "SELECT issue FROM dashboards WHERE repository=?", (record["name"],)
+                        )
+                    )
+                    and dashboard["issue"]
+                ],
                 "skipped": skipped,
                 "errors": errors,
                 "valid": not errors
@@ -385,3 +467,4 @@ async def run_scans(
         finally:
             loop.remove_signal_handler(signal.SIGTERM)
             store.close()
+            log_handler.close()

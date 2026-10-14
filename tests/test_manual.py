@@ -34,23 +34,12 @@ def test_foreground_scan_publishes_without_daemon_and_leaves_other_jobs_alone(
     try:
         execute(scan_args(home, "acme/repo"))
         text = capsys.readouterr().out
-        assert "[RUN] acme/repo" in text and "[PUB] acme/repo" in text
-        assert "[OK] acme/repo: 1 new findings" in text
-        phases = [
-            "preparing repository",
-            "source ready at",
-            "loading existing issues from GitHub",
-            "starting agent",
-            "agent running",
-            "validating 1 candidate findings",
-            "cleaning up worktree",
-            "publishing results",
-            "1 new findings",
-        ]
-        positions = [text.index(phase) for phase in phases]
-        assert positions == sorted(positions)
-        assert "elapsed)" in text
-        assert "Report:" in text and "Finding:" in text
+        assert "Hunt>" in text and "Hunt+" in text
+        assert "Hunt+ 1/1" not in text
+        assert "acme/repo: 1 new findings" in text
+        assert "Status: https://github.com/acme/repo/issues/" in text
+        assert "Report:" not in text and "Finding:" not in text
+        assert "[WAIT]" not in text and "[STEP]" not in text
         assert "fake-provider-secret" not in text and "fake-github-secret" not in text
         scan = store.one("SELECT * FROM scans WHERE repository='acme/repo'")
         assert scan["state"] == "completed" and scan["report_sent"] == 1
@@ -272,10 +261,12 @@ def test_silent_provider_reports_waiting_until_timeout(
         execute(scan_args(home, "acme/repo"))
     assert error.value.code == 1
     text = capsys.readouterr().out
-    assert "[WAIT] acme/repo: agent running" in text
+    assert "Hunt>" in text
+    assert "[WAIT]" not in text
     assert "[FAIL] acme/repo" in text
     detail = "codex agent timed out after 1s (limits.scan_timeout_seconds)"
     assert detail in text
+    assert detail in home.log.read_text()
     completed = Store(home.db)
     try:
         scan = completed.one("SELECT * FROM scans")
@@ -369,7 +360,7 @@ def test_manual_scan_interrupt_terminates_provider_and_records_cancellation(
     )
     pid = None
     try:
-        assert process.stdout.readline().startswith("[RUN] acme/repo")
+        assert process.stdout.readline().startswith("acme/repo [")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             scan = store.one("SELECT * FROM scans WHERE pid IS NOT NULL")

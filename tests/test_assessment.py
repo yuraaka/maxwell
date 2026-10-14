@@ -267,8 +267,9 @@ def test_human_output_identifies_stage_and_verdict(home, hunted, capsys):
         )
     )
     output = capsys.readouterr().out
-    assert "/ review" in output and "review: supported" in output
-    assert "Assessment: https://github.com/acme/repo/issues/" in output
+    assert "Review>" in output and "review: 1 supported" in output
+    assert "Status: https://github.com/acme/repo/issues/" in output
+    assert "Assessment:" not in output
     execute(
         parser().parse_args(
             [
@@ -283,7 +284,7 @@ def test_human_output_identifies_stage_and_verdict(home, hunted, capsys):
             ]
         )
     )
-    assert "no eligible findings for review" in capsys.readouterr().out
+    assert "[SKIP] acme/repo / review: No eligible findings" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("options", [["--issue", "0"], ["--limit", "-1"], ["--stage", "fix"]])
@@ -444,3 +445,32 @@ def test_review_and_audit_agent_output_updates_factor_associations(home, hunted,
     assert not any(
         label["name"].startswith("maxwell:factor:") for label in github["issues"][issue]["labels"]
     )
+
+
+def test_review_publishes_repair_and_audit_receives_it(home, hunted, github, capsys):
+    _, issue, _ = hunted
+    repair = {
+        "plan": "Guard empty input before dividing by the collection length.",
+        "validation": "Add an empty-input regression test and run the affected suite.",
+        "confidence": 0.8,
+        "effort_hours": {"low": 0.5, "high": 1},
+    }
+    payload = Path(home.load().provider.executable).parent / "assessment.json"
+    payload.write_text(json.dumps({"repair": repair}))
+    reviewed = run(home, capsys, "--stage", "review")
+    assert reviewed["valid"]
+    record = assessments(github, issue)[0]
+    assert record.repair.plan == repair["plan"]
+    artifact = home.root / "artifacts" / record.execution_id
+    assert "available" in json.loads((artifact / "assessment-context.json").read_text())
+    assert "engineer-hour effort" in (artifact / "prompt.txt").read_text()
+    payload.write_text(json.dumps({"repair": None}))
+    audited = run(home, capsys, "--stage", "audit")
+    audit = assessments(github, issue)[1]
+    assert audited["valid"] and audit.repair is None
+    prompt = (home.root / "artifacts" / audit.execution_id / "prompt.txt").read_text()
+    assert repair["plan"] in prompt
+    status = next(item for item in github["issues"].values() if item["title"] == "Maxwell status")
+    assert "missing: No repair estimate" in status["body"]
+    assert "audited" in status["body"]
+    assert not github["comments"].get(status["number"])

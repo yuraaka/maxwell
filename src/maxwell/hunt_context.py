@@ -68,6 +68,8 @@ def measurement_context(store, repository, sha, settings):
     result = {
         "available": True,
         **provenance(current, sha, now),
+        "protocol": current.protocol,
+        "policy": current.policy,
         "policy_version": current.policy_version,
         "analyzer_version": current.analyzer_version,
         "score": measurement_score(current),

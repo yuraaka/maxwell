@@ -1,3 +1,4 @@
+import io
 import json
 import re
 import subprocess
@@ -6,9 +7,10 @@ import sys
 import pytest
 
 from maxwell.cli import execute, parser
-from maxwell.cli_output import check_line, model_lines, scan_line
+from maxwell.cli_output import check_line, human_lines, model_lines
 from maxwell.config_validation import validate_config
 from maxwell.github import GitHub
+from maxwell.scan_display import ScanDisplay
 from maxwell.store import Store
 
 
@@ -25,18 +27,124 @@ def test_quota_wait_output_identifies_account_and_preserves_diagnostics(capsys):
     assert "remaining 0" in output and "15:00:00 UTC" in output and "job retained" in output
 
 
-@pytest.mark.parametrize("heartbeat,badge", [(False, "[STEP]"), (True, "[WAIT]")])
-def test_scan_progress_formats_phase_and_elapsed(heartbeat, badge, capsys):
-    scan_line(
+def test_redirected_scan_output_does_not_repeat_phases_or_heartbeats():
+    stream = io.StringIO()
+    display = ScanDisplay(stream)
+    display({"repository": "acme/repo", "state": "plan", "stages": ["review"]})
+    display({"state": "stage", "stage": "review", "status": "running"})
+    display({"state": "batch", "total": 9, "completed": 0})
+    for index in range(9):
+        for heartbeat in (False, True):
+            display(
+                {
+                    "state": "progress",
+                    "phase": "agent running",
+                    "elapsed": 75,
+                    "heartbeat": heartbeat,
+                }
+            )
+        display({"state": "batch", "total": 9, "completed": index + 1})
+    display(
+        {"state": "stage", "stage": "review", "status": "completed", "total": 9, "completed": 9}
+    )
+    display.finish()
+    text = stream.getvalue()
+    assert len(text.splitlines()) == 2
+    assert "Review>" in text and "Review+ 9/9" in text
+    assert "agent running" not in text and "\033" not in text
+
+
+def test_interactive_scan_rewrites_colored_panel_and_preserves_stage_failure(monkeypatch):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("COLUMNS", "90")
+    stream = Terminal()
+    display = ScanDisplay(stream)
+    display(
         {
             "repository": "acme/repo",
-            "state": "progress",
-            "phase": "agent running",
-            "elapsed": 75,
-            "heartbeat": heartbeat,
+            "state": "plan",
+            "stages": ["measure", "hunt", "review", "audit"],
         }
     )
-    assert capsys.readouterr().out == f"{badge} acme/repo: agent running (1:15 elapsed)\n"
+    for stage in ("measure", "hunt", "review", "audit"):
+        display({"state": "stage", "stage": stage, "status": "running"})
+        display({"state": "batch", "total": 3, "completed": 1})
+        display({"state": "running", "model": "model-a", "effort": "high"})
+        display({"state": "progress", "phase": "agent running", "elapsed": 75, "heartbeat": True})
+        display(
+            {
+                "state": "stage",
+                "stage": stage,
+                "status": "failed" if stage == "hunt" else "completed",
+                "total": 3,
+                "completed": 3,
+            }
+        )
+    display.finish()
+    text = stream.getvalue()
+    frames = re.split(r"\033\[5A\r\033\[0J", text)
+    assert len(frames) > 1
+    for frame in frames:
+        plain = re.sub(r"\033\[[0-9;]*m", "", frame)
+        lines = plain.splitlines()
+        assert len(lines) == 5
+        assert all(len(line) == 89 for line in lines)
+        assert lines[0].startswith("╭ Maxwell · acme/repo")
+        assert lines[-1].startswith("╰")
+    assert "\033[1;35mReview 1/3" in text
+    assert "\033[1;31m✗ Hunt" in text
+    assert "\033[32m✓ Audit" in text
+    assert "━━━━━━━━" in text and "100%" in text
+    assert "Review>" not in text and "Hunt!" not in text
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_scan_quota_diagnostics_are_deduplicated(terminal, monkeypatch):
+    monkeypatch.setenv("TERM", "xterm")
+    stream = io.StringIO()
+    stream.isatty = lambda: terminal
+    display = ScanDisplay(stream)
+    display({"repository": "acme/repo", "state": "plan", "stages": ["hunt"]})
+    for _ in range(20):
+        display(
+            {
+                "state": "progress",
+                "phase": "waiting for GitHub quota; remaining 0; retry at 15:00 UTC; job retained",
+            }
+        )
+    text = stream.getvalue()
+    milestones = [line for line in text.splitlines() if "acme/repo: waiting" in line]
+    assert len(milestones) == 1
+    assert "remaining 0; retry at 15:00 UTC; job retained" in milestones[0]
+
+
+def test_scan_summary_groups_failures_and_links_main_status():
+    scan = {
+        "repository": "acme/repo",
+        "stage": "review",
+        "state": "completed",
+        "admitted": 0,
+        "publication_errors": [],
+        "report": "/private/report.md",
+        "findings": [],
+        "assessments": [{"verdict": "supported", "issue": 2}],
+        "error": None,
+    }
+    report = {
+        "scans": [scan] * 9 + [{**scan, "state": "failed", "error": "Agent timed out"}] * 3,
+        "statuses": [{"repository": "acme/repo", "url": "https://github.com/acme/repo/issues/4"}],
+    }
+    text = "\n".join(human_lines(report, "scan"))
+    assert "review: 9 supported" in text
+    assert text.count("Agent timed out") == 1 and "(3 executions)" in text
+    assert text.count("Status:") == 1 and text.endswith("https://github.com/acme/repo/issues/4")
+    assert "Report:" not in text and "Assessment:" not in text
+    assert "private" not in text
 
 
 @pytest.mark.parametrize(
@@ -195,3 +303,82 @@ def test_model_tables_align_with_and_without_colors(terminal, monkeypatch):
         assert "\033[36mshort" in text
     else:
         assert text == plain
+
+
+@pytest.mark.parametrize("columns", [40, 80, 120])
+@pytest.mark.parametrize("no_color", [False, True])
+def test_scan_panel_fits_terminal_and_respects_no_color(columns, no_color, monkeypatch):
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("COLUMNS", str(columns))
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    if no_color:
+        monkeypatch.setenv("NO_COLOR", "")
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    display = ScanDisplay(stream)
+    display(
+        {
+            "repository": "yuraaka/maxwell",
+            "state": "plan",
+            "stages": ["measure", "hunt", "review", "audit"],
+        }
+    )
+    display({"state": "stage", "stage": "measure", "status": "completed"})
+    display({"state": "stage", "stage": "hunt", "status": "completed"})
+    display({"state": "stage", "stage": "review", "status": "running"})
+    display({"state": "batch", "total": 9, "completed": 4})
+    display({"state": "running", "model": "gpt-6.1-sol", "effort": "high"})
+    display({"state": "progress", "phase": "agent running"})
+    frame = display.panel("2:21")
+    plain = [re.sub(r"\033\[[0-9;]*m", "", line) for line in frame]
+    assert all(len(line) == min(100, columns - 1) for line in plain)
+    assert "4/9" in plain[1] and "61%" in plain[2]
+    assert "2:21" in plain[3]
+    assert any(re.search(r"\033\[[0-9;]*m", line) for line in frame) != no_color
+
+
+def test_dumb_terminal_scan_uses_plain_output(monkeypatch):
+    monkeypatch.setenv("TERM", "dumb")
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    display = ScanDisplay(stream)
+    display({"repository": "acme/repo", "state": "plan", "stages": ["hunt"]})
+    display({"state": "stage", "stage": "hunt", "status": "running"})
+    display.finish()
+    assert "\033" not in stream.getvalue()
+    assert "╭" not in stream.getvalue()
+
+
+def test_scan_animation_changes_without_inventing_completed_work(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    now = [100.0]
+    monkeypatch.setattr("maxwell.scan_display.time.monotonic", lambda: now[0])
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("COLUMNS", "90")
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    display = ScanDisplay(stream)
+    display(
+        {
+            "repository": "acme/repo",
+            "state": "plan",
+            "stages": ["measure", "hunt", "review", "audit"],
+        }
+    )
+    display({"state": "stage", "stage": "measure", "status": "running"})
+    display({"state": "progress", "phase": "test run 1/2"})
+    first = display.panel("0:00")
+    now[0] += 0.25
+    second = display.panel("0:00")
+    assert first[2] != second[2] and first[3] != second[3]
+    assert display.progress() == 0
+    assert display.refresh_interval < 0.2
+    display(
+        {
+            "state": "progress",
+            "phase": "test run 1/2 · 2/4 tests · 0 failed",
+            "stage_fraction": 0.375,
+        }
+    )
+    assert display.progress() == 0.09375
+    assert "2/4 tests" in "".join(display.panel("0:01"))

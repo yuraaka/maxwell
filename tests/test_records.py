@@ -632,6 +632,7 @@ def test_factor_associations_validate_and_keep_legacy_identities_and_digests(rec
             del values["finding"]["factors"]
         else:
             del values["factors"]
+            del values["repair"]
         expected = hashlib.sha256(
             json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

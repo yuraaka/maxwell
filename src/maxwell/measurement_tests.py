@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -53,15 +54,56 @@ async def run_test_measurement(
         Path(__file__).with_name("measurement_probe.py"), probe / "_maxwell_measurement_probe.py"
     )
     runs, invalid, fingerprint = [], [], None
+    total_runs = profile.warmups + profile.runs
     for index in range(profile.warmups + profile.runs):
-        progress(f"test run {index + 1}/{profile.warmups + profile.runs}")
+        label = f"test run {index + 1}/{total_runs}"
+        progress({"phase": label, "stage_fraction": (1 + index) / (total_runs + 2)})
         _, worktree = await prepare_snapshot(repository, f"{identity}-test-{index}", token, sha)
         process = None
+        monitoring = None
         run_dir = artifact / f"test-{index}"
         run_dir.mkdir()
         home = run_dir / "home"
         home.mkdir()
         report_path = run_dir / "report.json"
+        progress_path = run_dir / "progress.json"
+        last_snapshot = None
+
+        def read_progress():
+            nonlocal last_snapshot
+            try:
+                data = json.loads(progress_path.read_text())
+                if data == last_snapshot:
+                    return
+                completed, total = data["completed"], data["total"]
+                if not (
+                    isinstance(completed, int)
+                    and isinstance(total, int)
+                    and 0 <= completed <= total
+                    and total > 0
+                ):
+                    return
+                failed, current = data["failed"], data["current"]
+                if not isinstance(failed, int) or failed < 0 or not isinstance(current, str):
+                    return
+                last_snapshot = data
+                phase = f"{label} · {completed}/{total} tests · {failed} failed"
+                if current:
+                    phase += f" · {current[:500]}"
+                progress(
+                    {
+                        "phase": phase,
+                        "stage_fraction": (1 + index + completed / total) / (total_runs + 2),
+                    }
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+
+        async def monitor():
+            while True:
+                read_progress()
+                await asyncio.sleep(0.25)
+
         environment = {
             "PATH": os.defpath,
             "LANG": "C.UTF-8",
@@ -108,12 +150,14 @@ async def run_test_measurement(
                 (artifact / "process.json").write_text(
                     json.dumps({"pid": process.pid, "report": str(report_path)})
                 )
+                monitoring = asyncio.create_task(monitor())
                 try:
                     await asyncio.wait_for(process.wait(), profile.timeout_seconds)
                 except TimeoutError:
                     invalid.append(f"Run {index + 1}: timeout")
                     continue
             duration = time.monotonic() - start
+            read_progress()
             if git("rev-parse", "HEAD", cwd=worktree) != sha or git(
                 "status", "--porcelain", "--untracked-files=no", cwd=worktree
             ):
@@ -156,6 +200,10 @@ async def run_test_measurement(
         except (OSError, ValueError, KeyError, TypeError):
             invalid.append(f"Run {index + 1}: runner or report error")
         finally:
+            if monitoring is not None:
+                monitoring.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await monitoring
             if process is not None:
                 await finish_group(process)
             await asyncio.to_thread(repository.cleanup, worktree)

@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from maxwell.assessment import current_assessments, finding_factors
 from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, FACTORS, SelectionStats
 from maxwell.github import PublicationUncertain
+from maxwell.impact import fix_queue, queue_report
 from maxwell.measurement import (
     compatible,
     measurement_contributions,
@@ -155,6 +156,26 @@ def record_report(record):
                 else ""
             )
         )
+        if record.repair:
+            repair = record.repair
+            body += (
+                f"\n#### Proposed repair (estimate, not observed)\n\n{repair.plan}\n\n"
+                f"Validation plan: {repair.validation}\n\n"
+                f"Effort: {repair.effort_hours.low:g}–{repair.effort_hours.high:g} engineer-hours; "
+                f"uncalibrated confidence: {repair.confidence:.0%}.\n\n"
+                f"Measurement: `{repair.measurement_id or 'unknown'}`; "
+                f"protocol: `{repair.protocol or 'unknown'}`.\n"
+            )
+            for projection in repair.projections:
+                scenarios = projection.architecture or projection.scenarios
+                body += (
+                    f"\n**{projection.factor}** counterfactual scenarios: "
+                    + json.dumps([item.model_dump() for item in scenarios])
+                    + f"\n\n{projection.evidence}\n\nAssumptions: {projection.assumptions}\n"
+                )
+            body += f"\nDeclared unchanged: {', '.join(repair.unchanged) or 'none'}.\n"
+            if repair.unchanged_evidence:
+                body += f"\n{repair.unchanged_evidence}\n"
         if record.execution_id:
             body += f"\nExecution: `{record.execution_id}`.\n"
         if record.supersedes:
@@ -905,6 +926,8 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
                 decisions = audits or reviews
                 if decisions and all(record.verdict == "supported" for record in decisions):
                     source_supported += 1
+        maintenance, bugs = fix_queue(self.store, repo, remote, measurements)
+        queue_body = queue_report(repo, maintenance, bugs)
         body = f"""{marker}
 # Maxwell status
 
@@ -914,6 +937,8 @@ Open bug burden: **{source_supported} source-supported**, **{human_confirmed} hu
 Reported separately from structural entropy; source support does not imply reproduction.
 
 {measurement_body}
+
+{queue_body}
 
 [Execution and measurement history](https://github.com/{repo}/issues/{history_issue}).
 
