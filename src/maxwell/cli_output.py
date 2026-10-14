@@ -203,9 +203,13 @@ def human_lines(value, command, repo_command=None):
                 for item in runs
                 if item["state"] == "completed" and not item["publication_errors"]
             ]
-            parts = [
-                f"{sum(item['admitted'] for item in successful if item['stage'] == 'hunt')} new findings"
-            ]
+            parts = (
+                [
+                    f"{sum(item['admitted'] for item in successful if item['stage'] == 'hunt')} new findings"
+                ]
+                if any(item["stage"] == "hunt" for item in runs)
+                else []
+            )
             for stage in ("review", "audit"):
                 verdicts = [
                     assessment["verdict"]
@@ -226,7 +230,7 @@ def human_lines(value, command, repo_command=None):
             if measurement:
                 score = measurement.get("score")
                 parts.append(f"entropy {score:.2f}/100" if score is not None else "entropy unknown")
-            lines.append(f"{color(repository, '1;36')}: {'; '.join(parts)}")
+            lines.append(f"{color(repository, '1;36')}: {'; '.join(parts) or 'scan finished'}")
             failures = {}
             for item in errors:
                 if item["repository"] == repository:
@@ -253,6 +257,13 @@ def human_lines(value, command, repo_command=None):
                 ]
                 if unknown:
                     lines.append("Unknown factors: " + "; ".join(unknown))
+            for item in runs:
+                for repair in item.get("repairs", []):
+                    lines.append(
+                        f"Repair: {repair['outcome']} · local commit {repair['commit'] or 'none'}"
+                    )
+                    lines.append(f"Branch: {repair['branch']}")
+                    lines.append(f"Worktree: {repair['worktree']}")
             status = next(
                 (item for item in value.get("statuses", []) if item["repository"] == repository),
                 None,

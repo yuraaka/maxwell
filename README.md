@@ -3,7 +3,8 @@
 Maxwell runs hunting, review, and audit manually from your terminal. Hunting inspects
 committed source snapshots and creates deduplicated **suspected** findings as GitHub issues.
 Review and audit publish independent source assessments and report token usage per execution.
-Maxwell does not reproduce, fix, or merge changes yet.
+An explicit repair stage produces local fix branches and host-executed check evidence.
+Independent repair validation, reproduction, and integration are later milestones.
 
 ## Install
 
@@ -376,10 +377,10 @@ refresh can work.
 Repository-level provider/model/effort routes have been removed. Existing databases
 migrate automatically, retaining repositories and historical execution snapshots.
 `repo add` and `repo change` no longer accept `--provider`, `--model`, `--effort`, or
-`--stage`. Stage selection belongs to `scan`; reproduction, fix, and validation
-execution are later milestones.
+`--stage`. Stage selection belongs to `scan`; repair is opt-in and independent
+validation is a later milestone.
 
-Use `scan --stage hunt|review|audit` to execute one stage at a time. Existing scripts
+Use `scan --stage hunt|review|audit|repair` to execute one stage at a time. Existing scripts
 that should only hunt must now specify `--stage hunt`:
 
 ```bash
@@ -389,6 +390,51 @@ maxwell scan owner/repo --stage audit --provider codex-work --model your-auditor
 ```
 
 Provider aliases select local connections; published identities use `codex` or `claude`.
+### Repair a supported finding
+
+```bash
+maxwell scan owner/repo --stage repair
+maxwell scan owner/repo --stage repair --issue 12
+maxwell scan owner/repo --stage repair --provider codex-work --model your-fixer-model
+```
+
+Repair handles **one finding per invocation**. Without `--issue`, it selects the first
+eligible finding from the impact-ranked queue, then supported actionable bugs by
+severity and unranked maintenance findings. Conflicting, rejected, closed, and
+nonactionable findings are skipped. Numerical impact estimates are optional. GitHub
+is authoritative for selection, assessments, and prior prepared repairs.
+
+Maxwell creates `maxwell/repair/<execution-id>` in its local mirror and retains the
+worktree. The base is the finding's original pinned revision; newer main changes
+may require later integration. Your maintained checkout stays unchanged. The fixer
+edits source and adds regression coverage; Maxwell runs the configured
+`measurement.tests.<owner/repo>.command` **once**, or detects the existing pytest
+suite. The command is selected before editing. Configure a runner for other test
+frameworks. A missing runner, failing checks, no edits, or missing bug regression
+coverage does not produce a prepared repair.
+
+Codex receives `workspace-write` only for repair, with network access disabled.
+Claude Code receives Read/Grep/Glob/Edit/Write; shell execution remains disabled.
+Maxwell owns Git staging and commits and rejects agent changes to Git refs, HEAD,
+configuration, or the index. Checks run with a private HOME and a sanitized environment.
+Source assessments keep their read-only permissions.
+
+Output shows the retained branch, worktree, and local commit. GitHub receives an
+immutable repair comment on the finding with input assessments, agent identity,
+changed files, and actual host check results. The status issue body links to repair
+attempts. Commits remain **local-only**; Maxwell does not push, merge, open PRs, close
+findings, or report an observed entropy reduction. A prepared repair still needs
+human inspection and independent validation.
+
+Failed checks can retain a committed draft, clearly marked `checks_failed`.
+Timeouts, cancellations, and interruptions preserve edits and diagnostics in
+`~/.maxwell/artifacts/<execution-id>/repair.json` and the retained worktree. Publication
+retries reuse the stored record without rerunning the fixer. Previously prepared
+repairs for the same inputs are skipped; `--force` allows a new attempt.
+`--limit` is rejected for repair. Default scans remain measure → hunt → review → audit.
+
+### Review and audit
+
 Each assessment uses a fresh agent execution with automatic or explicit model/provider/effort selection.
 The reviewer receives the finding evidence, without hunter confidence or agent identity.
 The auditor also receives the current review verdicts and evidence, without reviewer identity.
@@ -424,6 +470,12 @@ hunting uses `limits.max_findings_per_scan` for its publication limit.
 When no findings are eligible, the command succeeds without starting an agent.
 
 `limits.scan_timeout_seconds` bounds each agent execution and defaults to 600 seconds.
+If Claude exits successfully without structured output, Maxwell makes one formatting-only
+retry using its existing response, with repository tools disabled. The retry is capped at
+60 seconds and the remaining execution timeout; its tokens belong to the same execution.
+Both responses remain in redacted artifacts (`events.jsonl` and `format-retry/events.jsonl`).
+If correction fails, Maxwell reports missing structured output explicitly.
+
 For longer investigations, increase it in `config.yaml` and run `maxwell config apply`.
 A timeout stops the agent and reports the provider, timeout, and setting in the CLI
 and scan report; incomplete findings are not published.

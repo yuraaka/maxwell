@@ -207,7 +207,15 @@ def stop_orphan(pid, artifact):
     command = subprocess.run(
         ["ps", "-ww", "-p", str(pid), "-o", "args="], capture_output=True, text=True, timeout=5
     ).stdout
-    markers = (str(Path(artifact) / filename) for filename in ("result.json", "settings.json"))
+    markers = (
+        str(Path(artifact) / filename)
+        for filename in (
+            "result.json",
+            "settings.json",
+            "format-retry/result.json",
+            "format-retry/settings.json",
+        )
+    )
     if not any(marker in command for marker in markers):
         return
     try:

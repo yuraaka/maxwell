@@ -153,9 +153,13 @@ class ScanDisplay:
             elif status == "skipped":
                 label, code = f"– {label}", "2"
             elif status == "running":
-                code = {"measure": "1;33", "hunt": "1;36", "review": "1;35", "audit": "1;32"}.get(
-                    stage, "1;36"
-                )
+                code = {
+                    "measure": "1;33",
+                    "hunt": "1;36",
+                    "review": "1;35",
+                    "audit": "1;32",
+                    "repair": "1;34",
+                }.get(stage, "1;36")
                 if stage in ("review", "audit") and self.total:
                     label += f" {self.completed}/{self.total}"
             else:

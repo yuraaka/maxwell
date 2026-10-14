@@ -24,6 +24,7 @@ from maxwell.records import (
     ExecutionRecord,
     FindingRecord,
     MeasurementRecord,
+    RepairRecord,
     decode_record,
     encode_record,
     execution_record,
@@ -52,7 +53,7 @@ def agent_selection_report(value):
     basis = {
         "explicit": "explicit model override",
         "thompson-source-v1": "Thompson sampling from provisional source support or reviewer–auditor agreement",
-        "uniform-unrated-v1": "uniform sampling; auditor quality is unrated",
+        "uniform-unrated-v1": "uniform sampling; quality is unrated",
     }[decision.method]
     body = f"\nAgent selection: {basis}; {decision.candidates} eligible public identities. Independence: {decision.independence}.\n"
     if decision.method == "thompson-source-v1":
@@ -70,6 +71,8 @@ def scan_report(scan, finding_ids=(), *, record=None):
     result = (
         f"{scan['admitted']} new candidates"
         if stage == "discovery"
+        else "Local repair attempt; awaiting independent validation"
+        if stage == "repair"
         else "Source assessment; not reproduced"
     )
     body = f"""<!-- maxwell:scan:{scan["id"]} -->
@@ -84,7 +87,7 @@ Agent: `{identity}`
 | --- | --- | --- |
 | {label} | {tokens} | {result} |
 | Reproduction | Not run | Later milestone |
-| Fixing | Not run | Later milestone |
+| Fixing | {"See repair record" if stage == "repair" else "Not run"} | {"Local branch retained" if stage == "repair" else "Explicit repair stage"} |
 | Validation / integration | Not run | Later milestone |
 
 **{tokens}.** Includes the failed attempt, if any.
@@ -182,6 +185,25 @@ def record_report(record):
             body += f"\nSupersedes: `{record.supersedes}`.\n"
         if record.references:
             body += "\nReferences: " + ", ".join(f"`{item}`" for item in record.references) + ".\n"
+    elif isinstance(record, RepairRecord):
+        body = (
+            f"{marker}\n### Repair — {record.outcome}\n\n"
+            f"Agent: `{record.agent.display()}`; base: `{record.sha}`\n\n"
+            f"{record.summary}\n\n{record.explanation}\n\nLocal branch: `{record.branch}`\n\n"
+            f"Local worktree: `{record.worktree}`\n\n"
+            f"Local commit: `{record.commit or 'none'}`. Local-only; cannot be fetched from GitHub.\n\n"
+            "Awaiting human inspection and independent validation; no observed entropy reduction.\n\n"
+            f"Changed files: {', '.join(record.files) or 'none'}.\n\n"
+            f"Regression coverage claimed by fixer: {', '.join(record.regression_tests) or 'none'}.\n\n"
+            f"Execution: `{record.execution_id}`; assessment inputs: {', '.join(record.references)}.\n"
+        )
+        for check in record.checks:
+            body += (
+                f"\nHost check: **{check.state}**, exit {check.returncode}, {check.seconds:.2f}s.\n\n"
+                f"Command: `{json.dumps(check.command)}`\n\n{check.detail}\n"
+            )
+        for concern in record.concerns:
+            body += f"\n- {concern}\n"
     elif isinstance(record, ExecutionRecord):
         identity = record.agent.display() if record.agent else "Unknown legacy agent"
         body = (
@@ -307,7 +329,7 @@ class Reporter:
                 if isinstance(record, FindingRecord):
                     if comment_id or record.id != finding_id:
                         raise ValueError("Finding record must match its issue marker")
-                elif isinstance(record, AssessmentRecord):
+                elif isinstance(record, (AssessmentRecord, RepairRecord)):
                     if not comment_id or record.finding_id != finding_id:
                         raise ValueError("Assessment belongs to a different finding")
                 elif not comment_id:
@@ -928,6 +950,19 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
                     source_supported += 1
         maintenance, bugs = fix_queue(self.store, repo, remote, measurements)
         queue_body = queue_report(repo, maintenance, bugs)
+        repairs = self.store.rows(
+            "SELECT issue,comment,data FROM github_records WHERE repository=? "
+            "AND type='repair' AND status='current' ORDER BY observed DESC LIMIT 20",
+            (repo,),
+        )
+        if repairs:
+            queue_body += "\n### Local repair attempts\n\n"
+            for row in repairs:
+                repair = RECORD_ADAPTER.validate_json(row["data"])
+                url = (
+                    f"https://github.com/{repo}/issues/{row['issue']}#issuecomment-{row['comment']}"
+                )
+                queue_body += f"- [#{row['issue']}: {repair.outcome}]({url}) · `{repair.branch}` · local-only; awaiting validation.\n"
         body = f"""{marker}
 # Maxwell status
 
@@ -945,7 +980,7 @@ Reported separately from structural entropy; source support does not imply repro
 <details>
 <summary>Activity, tokens, and agent reputation</summary>
 
-Hunting, review, and audit use separate executions. Source assessments do not imply reproduction.
+Hunting, review, audit, and repair use separate executions. Source assessments do not imply reproduction.
 
 | Metric | Value |
 | --- | --- |

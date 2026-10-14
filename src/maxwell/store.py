@@ -4,7 +4,13 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from maxwell.records import RECORD_ADAPTER, AssessmentRecord, StageExecution, record_digest
+from maxwell.records import (
+    RECORD_ADAPTER,
+    AssessmentRecord,
+    RepairRecord,
+    StageExecution,
+    record_digest,
+)
 
 SCHEMA_VERSION = 11
 
@@ -159,10 +165,25 @@ class Store:
                 raise ValueError("A GitHub source cannot change record identity")
             if existing and (existing["issue"], existing["comment"]) != (issue, comment):
                 raise ValueError("Record identity already belongs to another GitHub source")
-            if isinstance(record, AssessmentRecord):
+            if isinstance(record, RepairRecord):
+                finding = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? "
+                    "AND type='finding' AND status='current'",
+                    (record.repository, issue),
+                )
+                if not finding:
+                    raise ValueError("Repair requires its current finding record")
+                subject = RECORD_ADAPTER.validate_json(finding["data"])
+                if subject.id != record.finding_id or subject.sha != record.sha:
+                    raise ValueError("Repair targets a different finding or revision")
+            if isinstance(record, (AssessmentRecord, RepairRecord)):
                 for reference in [
                     *record.references,
-                    *([record.supersedes] if record.supersedes else []),
+                    *(
+                        [record.supersedes]
+                        if isinstance(record, AssessmentRecord) and record.supersedes
+                        else []
+                    ),
                 ]:
                     target = self.one(
                         "SELECT data FROM github_records WHERE repository=? AND type='assessment' AND id=?",
@@ -229,14 +250,14 @@ class Store:
         record = RECORD_ADAPTER.validate_python(record)
         if record.type == "finding":
             raise ValueError("Findings are published as issues, not comments")
-        if isinstance(record, AssessmentRecord):
+        if isinstance(record, (AssessmentRecord, RepairRecord)):
             finding = self.one(
                 "SELECT id FROM findings WHERE repository=? AND issue=? "
                 "UNION SELECT id FROM github_records WHERE repository=? AND issue=? AND type='finding'",
                 (record.repository, issue, record.repository, issue),
             )
             if not finding or finding["id"] != record.finding_id:
-                raise ValueError("Assessment must be published on its finding issue")
+                raise ValueError("Assessment or repair must be published on its finding issue")
         data = record.model_dump_json()
         existing = self.one(
             "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",

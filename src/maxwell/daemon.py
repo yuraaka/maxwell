@@ -7,6 +7,7 @@ import os
 import signal
 import time
 import uuid
+from pathlib import Path
 
 from maxwell.assessment import AssessmentTarget, assessment_prompt
 from maxwell.config import Limits, ProviderSettings
@@ -14,9 +15,10 @@ from maxwell.contracts import Usage, estimate_cost, micros
 from maxwell.github import GitHub
 from maxwell.hunt_context import build_hunt_context, measurement_context
 from maxwell.provider import create_provider, discovery_prompt
-from maxwell.records import AssessmentRecord, public_agent
+from maxwell.records import AssessmentRecord, RepairRecord, public_agent
+from maxwell.repair import execute_repair, recover_check, write_manifest
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
-from maxwell.repositories import Repository, stop_orphan
+from maxwell.repositories import Repository, git, stop_orphan
 from maxwell.selection import select_candidates
 from maxwell.store import Store
 
@@ -135,6 +137,34 @@ class Daemon:
     def recover(self):
         for job in self.store.rows("SELECT * FROM scans WHERE state='running'"):
             stop_orphan(job["pid"], job["artifact"])
+            publications = []
+            if job["stage"] == "repair" and job["artifact"]:
+                recover_check(job["artifact"])
+                artifact = Path(job["artifact"])
+                try:
+                    manifest = json.loads((artifact / "repair.json").read_text())
+                    if manifest.get("record"):
+                        public = RepairRecord.model_validate(manifest["record"]).model_copy(
+                            update={
+                                "outcome": "interrupted",
+                                "summary": "Repair interrupted; local worktree retained.",
+                            }
+                        )
+                        if manifest.get("state") == "committing" and not public.commit:
+                            worktree = Path(public.worktree)
+                            head = git("rev-parse", "HEAD", cwd=worktree)
+                            if (
+                                head != public.sha
+                                and git("show", "--no-patch", "--format=%P", "HEAD", cwd=worktree)
+                                == public.sha
+                            ):
+                                public = public.model_copy(update={"commit": head})
+                        manifest["record"] = public.model_dump(mode="json")
+                        publications = [(public, manifest["target"]["issue"])]
+                    manifest["state"] = "interrupted"
+                    write_manifest(artifact, manifest)
+                except (OSError, ValueError, KeyError):
+                    pass
             self.store.finish(
                 job,
                 "interrupted",
@@ -142,12 +172,16 @@ class Daemon:
                 Usage(),
                 None,
                 error="Interrupted; explicit rescan is allowed",
+                publications=publications,
             )
             self.log.warning(
                 "Recovered interrupted scan %s; retained budget reservation", job["id"]
             )
 
     async def scan(self, job, on_progress=None):
+        if job.get("stage") == "repair":
+            return await execute_repair(self, job, on_progress)
+
         def progress(phase):
             if on_progress:
                 on_progress(phase)

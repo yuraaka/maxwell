@@ -5,7 +5,7 @@ from maxwell.config_apply import config_digest
 from maxwell.reputation import selection_evidence
 from maxwell.store import Store
 
-ROLES = {"hunt": "hunter", "review": "reviewer", "audit": "auditor"}
+ROLES = {"hunt": "hunter", "review": "reviewer", "audit": "auditor", "repair": "fixer"}
 
 
 class AgentSelector:
@@ -76,7 +76,7 @@ class AgentSelector:
         elif distinct:
             candidates = distinct
         evidence = self.evidence_provider(store, repository, ROLES[stage])
-        unrated_auditor = stage == "audit" and not any(
+        unrated_auditor = stage in ("audit", "repair") and not any(
             sum(evidence.get(candidate, [0, 0])) for candidate in candidates
         )
         if self.explicit or unrated_auditor:

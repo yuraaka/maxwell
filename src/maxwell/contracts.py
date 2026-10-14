@@ -213,3 +213,16 @@ def estimate_cost(usage: Usage, provider) -> int | None:
         + Decimal(usage.output_tokens) * Decimal(str(provider.output_usd_per_mtok))
     )
     return int(cost.to_integral_value(rounding=ROUND_CEILING))
+
+
+class RepairResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    outcome: Literal["edited", "blocked"]
+    summary: str = Field(min_length=1, max_length=3000)
+    explanation: str = Field(min_length=20, max_length=6000)
+    regression_tests: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=100
+    )
+    concerns: list[Annotated[str, Field(min_length=1, max_length=1000)]] = Field(
+        default_factory=list, max_length=20
+    )

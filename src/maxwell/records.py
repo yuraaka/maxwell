@@ -110,6 +110,50 @@ class ExecutionRecord(Record):
     agent_selection: AgentSelection | None = None
 
 
+class RepairCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    command: list[str] = Field(max_length=100)
+    state: Literal["passed", "failed", "timeout", "unavailable", "cancelled"]
+    returncode: int | None = None
+    seconds: float = Field(default=0, ge=0)
+    detail: str = Field(default="", max_length=2000)
+    log: str | None = None
+
+
+class RepairRecord(Record):
+    type: Literal["repair"] = "repair"
+    finding_id: Identifier
+    sha: Revision
+    execution_id: Identifier
+    agent: PublicAgent
+    references: list[Identifier] = Field(min_length=1, max_length=20)
+    plan: RepairEstimate | None = None
+    outcome: Literal["prepared", "checks_failed", "blocked", "failed", "cancelled", "interrupted"]
+    summary: str = Field(min_length=1, max_length=6000)
+    explanation: str = Field(default="", max_length=6000)
+    branch: str = Field(pattern=r"^maxwell/repair/[a-f0-9]{32}$")
+    worktree: str = Field(min_length=1, max_length=2000)
+    commit: Revision | None = None
+    files: list[str] = Field(default_factory=list, max_length=1000)
+    regression_tests: list[str] = Field(default_factory=list, max_length=100)
+    checks: list[RepairCheck] = Field(default_factory=list, max_length=10)
+    concerns: list[str] = Field(default_factory=list, max_length=50)
+    availability: Literal["local-only"] = "local-only"
+
+    @model_validator(mode="after")
+    def check_prepared(self):
+        if self.agent.role != "fixer":
+            raise ValueError("Repair agent must be a fixer")
+        if self.outcome == "prepared" and (
+            not self.commit
+            or not self.files
+            or not self.checks
+            or any(check.state != "passed" for check in self.checks)
+        ):
+            raise ValueError("Prepared repairs require a commit, changes, and passing host checks")
+        return self
+
+
 class MeasurementFactor(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     numerator: float = Field(ge=0)
@@ -224,7 +268,7 @@ class StageExecution(BaseModel):
 
 
 PublicRecord = Annotated[
-    FindingRecord | AssessmentRecord | ExecutionRecord | MeasurementRecord,
+    FindingRecord | AssessmentRecord | ExecutionRecord | MeasurementRecord | RepairRecord,
     Field(discriminator="type"),
 ]
 RECORD_ADAPTER = TypeAdapter(PublicRecord)
@@ -284,6 +328,7 @@ def public_agent(scan):
         "audit": "auditor",
         "reproduction": "reproducer",
         "fix": "fixer",
+        "repair": "fixer",
         "validation": "validator",
     }
     return PublicAgent(

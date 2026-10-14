@@ -123,7 +123,7 @@ def parser():
     scan.add_argument("repository", nargs="?")
     scan.add_argument(
         "--stage",
-        choices=["hunt", "review", "audit"],
+        choices=["hunt", "review", "audit", "repair"],
         help="Run only this agent stage (default: measure, hunt, review, audit)",
     )
     scan.add_argument(
@@ -133,13 +133,17 @@ def parser():
         choices=["source", "tests", "hunt", "review", "audit"],
         help="Disable a stage; source/tests reuse compatible GitHub history (repeatable)",
     )
-    scan.add_argument("--issue", type=positive_int, help="Finding issue to review or audit")
+    scan.add_argument(
+        "--issue", type=positive_int, help="Finding issue to review, audit, or repair"
+    )
     scan.add_argument(
         "--limit",
         type=positive_int,
         help="Override the stage's configured assessment limit per repository",
     )
-    scan.add_argument("--force", action="store_true", help="Reassess an already assessed finding")
+    scan.add_argument(
+        "--force", action="store_true", help="Reassess a finding or retry its prepared repair"
+    )
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     scan.add_argument("--model", help="Pin a model (default: automatic sampling)")
     scan.add_argument(

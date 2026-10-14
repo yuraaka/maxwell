@@ -11,6 +11,7 @@ from maxwell.daemon import Daemon
 from maxwell.github import GitHub
 from maxwell.measurement_runner import measure_one, recover_measurements
 from maxwell.progress import ScanProgress
+from maxwell.repair import collect_repair_targets
 from maxwell.reporting import Reporter
 from maxwell.store import Store
 
@@ -149,6 +150,14 @@ async def execute_job(
             "JOIN finding_observations o ON o.finding_id=f.id WHERE o.scan_id=?",
             (identifier,),
         ),
+        repairs=[
+            {**json.loads(row["data"]), "issue": row["issue"], "publication_state": row["state"]}
+            for row in store.rows(
+                "SELECT data,issue,state FROM record_publications WHERE repository=? "
+                "AND type='repair' AND json_extract(data,'$.execution_id')=?",
+                (record["name"], identifier),
+            )
+        ],
         assessments=[
             {
                 **json.loads(row["data"]),
@@ -188,10 +197,14 @@ async def run_scans(
     on_progress=None,
     skip_stages=(),
 ):
-    if stage not in (None, "hunt", "review", "audit"):
-        raise ValueError("Stage must be hunt, review, or audit")
+    if stage not in (None, "hunt", "review", "audit", "repair"):
+        raise ValueError("Stage must be hunt, review, audit, or repair")
     if stage in (None, "hunt") and (issue is not None or limit is not None or force):
-        raise ValueError("--issue, --limit, and --force apply to an explicit review or audit only")
+        raise ValueError(
+            "--issue, --limit, and --force apply to an explicit review, audit, or repair only"
+        )
+    if stage == "repair" and limit is not None:
+        raise ValueError("Repair handles one finding per run; --limit is not supported")
     if issue is not None and repository is None:
         raise ValueError("--issue requires a repository")
     if (issue is not None and issue < 1) or (limit is not None and limit < 1):
@@ -237,6 +250,8 @@ async def run_scans(
             results, skipped, errors, measurements = [], [], [], []
             stages = (stage,) if stage else ("hunt", "review", "audit")
             for record in records:
+                if stage == "repair" and results:
+                    break
 
                 def stage_event(current_stage, status, **details):
                     if on_progress:
@@ -334,10 +349,20 @@ async def run_scans(
                                 preparation.update(f"loading {current_stage} findings from GitHub")
                                 client.on_status = preparation.update
                                 async with preparation.watch():
-                                    targets = await collect_targets(
+                                    collector = (
+                                        collect_repair_targets
+                                        if current_stage == "repair"
+                                        else collect_targets
+                                    )
+                                    arguments = (
+                                        {}
+                                        if current_stage == "repair"
+                                        else {"stage": current_stage}
+                                    )
+                                    targets = await collector(
                                         reporter,
                                         record["name"],
-                                        current_stage,
+                                        **arguments,
                                         issue=issue,
                                         force=force,
                                     )
