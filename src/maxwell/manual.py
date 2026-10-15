@@ -9,6 +9,30 @@ from maxwell.reporting import Reporter
 from maxwell.store import Store
 
 
+async def publish(store, config, paths, record):
+    client = GitHub(config.github.for_account(record["github_account"]))
+    errors = []
+    try:
+        await Reporter(store, client, config, paths).sync(
+            repository=record["name"], process_commands=False
+        )
+    except Exception as exc:
+        errors.append(config.redact(str(exc)))
+    finally:
+        client.close()
+    errors.extend(
+        row["error"] or "GitHub publication outcome is uncertain"
+        for row in store.rows(
+            "SELECT error FROM findings WHERE repository=? "
+            "AND (error IS NOT NULL OR state='uncertain') "
+            "UNION ALL SELECT error FROM dashboards WHERE repository=? "
+            "AND (error IS NOT NULL OR state='uncertain')",
+            (record["name"], record["name"]),
+        )
+    )
+    return errors
+
+
 async def run_scans(
     paths,
     config,
@@ -58,14 +82,12 @@ async def run_scans(
                     "AND state NOT IN ('closed','confirmed','rejected')",
                     (record["name"],),
                 )["n"]
+                publication_errors = []
                 if pending >= config.limits.human_queue_max:
-                    client = GitHub(config.github.for_account(record["github_account"]))
-                    try:
-                        await Reporter(store, client, config, paths).refresh_findings(
-                            record["name"], process_commands=False
-                        )
-                    finally:
-                        client.close()
+                    # Unpublished findings fill the queue too; retry them so admission can recover.
+                    if on_progress:
+                        on_progress({"repository": record["name"], "state": "publishing"})
+                    publication_errors = await publish(store, config, paths, record)
                 identifier = store.enqueue(record["name"], priority, execution=execution)
                 job = store.claim(
                     micros(config.limits.daily_budget_usd),
@@ -87,29 +109,10 @@ async def run_scans(
                     if task.cancelling():
                         raise asyncio.CancelledError
                 current = store.one("SELECT * FROM scans WHERE id=?", (identifier,))
-                publication_errors = []
                 if job is not None:
                     if on_progress:
                         on_progress({**current, "state": "publishing"})
-                    client = GitHub(config.github.for_account(record["github_account"]))
-                    try:
-                        await Reporter(store, client, config, paths).sync(
-                            repository=record["name"], process_commands=False
-                        )
-                    except Exception as exc:
-                        publication_errors.append(config.redact(str(exc)))
-                    finally:
-                        client.close()
-                    publication_errors.extend(
-                        row["error"] or "GitHub publication outcome is uncertain"
-                        for row in store.rows(
-                            "SELECT error FROM findings WHERE repository=? "
-                            "AND (error IS NOT NULL OR state='uncertain') "
-                            "UNION ALL SELECT error FROM dashboards WHERE repository=? "
-                            "AND (error IS NOT NULL OR state='uncertain')",
-                            (record["name"], record["name"]),
-                        )
-                    )
+                    publication_errors = await publish(store, config, paths, record)
                 report = paths.root / "reports" / f"{identifier}.md"
                 result = {
                     key: current[key]

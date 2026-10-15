@@ -377,7 +377,8 @@ a status issue containing `<!-- maxwell:dashboard:v1 -->`; Maxwell will adopt it
 Comment publication also searches for its marker before retrying. GitHub writes are
 reconciled and idempotent where possible; exactly-once external delivery is not promised.
 Publication failures are reported by the scan command and retained in SQLite.
-The next manual scan of that repository retries or reconciles pending publications.
+The next manual scan of that repository retries or reconciles pending publications,
+even when that run is itself blocked by the human review queue limit.
 
 ## Ratings and Entropy
 

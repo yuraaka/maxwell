@@ -186,6 +186,54 @@ def test_closed_github_issue_frees_a_full_manual_review_queue(home, source, gith
         store.close()
 
 
+def test_blocked_manual_scan_retries_unpublished_findings_that_fill_the_queue(
+    home, source, github, monkeypatch, capsys
+):
+    data = yaml.safe_load(home.config.read_text())
+    data["limits"]["human_queue_max"] = 1
+    home.config.write_text(yaml.safe_dump(data))
+    store = Store(home.db)
+    store.register("acme/repo", str(source), "main")
+    gate = {"available": False}
+    original = GitHub.create_issue
+
+    def flaky(self, *args, **kwargs):
+        if not gate["available"]:
+            raise ValueError("GitHub unavailable fake-github-secret")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitHub, "create_issue", flaky)
+
+    def run():
+        with pytest.raises(SystemExit):
+            execute(scan_args(home, "acme/repo", "--json"))
+        text = capsys.readouterr().out
+        assert "fake-github-secret" not in text
+        return json.loads(text)["scans"][0]
+
+    try:
+        first = run()
+        assert first["state"] == "completed" and first["publication_errors"]
+        finding = store.one("SELECT state,issue FROM findings")
+        assert finding["state"] == "pending" and finding["issue"] is None
+        blocked = run()
+        assert blocked["state"] == "failed" and "review queue" in blocked["error"]
+        assert blocked["publication_errors"]
+        assert store.one("SELECT state,issue FROM findings")["issue"] is None
+        gate["available"] = True
+        recovered = run()
+        assert recovered["state"] == "failed" and not recovered["publication_errors"]
+        finding = store.one("SELECT state,issue FROM findings")
+        assert finding["state"] == "published" and finding["issue"]
+        assert store.one("SELECT state FROM dashboards")["state"] == "published"
+        github["issues"][finding["issue"]]["state"] = "closed"
+        execute(scan_args(home, "acme/repo", "--json"))
+        assert json.loads(capsys.readouterr().out)["valid"]
+        assert store.one("SELECT state FROM findings")["state"] == "closed"
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("interrupt,exit_code", [(signal.SIGINT, 130), (signal.SIGTERM, 143)])
 def test_manual_scan_interrupt_terminates_provider_and_records_cancellation(
     home, source, directory, interrupt, exit_code
