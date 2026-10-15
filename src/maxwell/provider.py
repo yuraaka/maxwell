@@ -14,10 +14,20 @@ class ProbeResult(BaseModel):
     ok: Literal[True]
 
 
+def counters(usage, names):
+    if not isinstance(usage, dict):
+        return None
+    values = [usage.get(name) for name in names]
+    if any(type(value) is not int or value < 0 for value in values):
+        return None
+    return values
+
+
 class CLIProvider:
     def __init__(self, paths, config):
         self.paths, self.config = paths, config
         self.usage = Usage()
+        self.usage_invalid = False
         self.started = False
         self.secrets = []
         self.errors = []
@@ -140,7 +150,7 @@ class CLIProvider:
                 asyncio.create_task(process.wait()),
             ]
             await asyncio.wait_for(asyncio.gather(*tasks), self.config.limits.scan_timeout_seconds)
-            self.usage.complete = process.returncode == 0
+            self.usage.complete = process.returncode == 0 and not self.usage_invalid
             if process.returncode:
                 message = f"{settings.adapter} exited with status {process.returncode}"
                 raise ValueError(message if probing else f"{message}; see redacted artifacts")
@@ -209,10 +219,15 @@ class CodexProvider(CLIProvider):
 
     def event(self, event):
         if event.get("type") == "turn.completed" and "usage" in event:
-            usage = event["usage"]
-            self.usage.input_tokens += max(0, int(usage.get("input_tokens", 0)))
-            self.usage.cached_input_tokens += max(0, int(usage.get("cached_input_tokens", 0)))
-            self.usage.output_tokens += max(0, int(usage.get("output_tokens", 0)))
+            values = counters(
+                event["usage"], ("input_tokens", "cached_input_tokens", "output_tokens")
+            )
+            if values is None:
+                self.usage_invalid = True
+                return
+            self.usage.input_tokens += values[0]
+            self.usage.cached_input_tokens += values[1]
+            self.usage.output_tokens += values[2]
             self.usage.reported = True
 
 
@@ -266,15 +281,20 @@ class ClaudeProvider(CLIProvider):
         if event.get("type") != "result":
             return
         self.result = event
-        usage = event.get("usage")
-        if isinstance(usage, dict):
-            uncached = max(0, int(usage.get("input_tokens", 0)))
-            cached = max(0, int(usage.get("cache_read_input_tokens", 0)))
-            written = max(0, int(usage.get("cache_creation_input_tokens", 0)))
+        names = (
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+        )
+        values = counters(event.get("usage"), names)
+        self.usage_invalid = "usage" in event and values is None
+        if values is not None:
+            uncached, cached, written, output = values
             self.usage.input_tokens = uncached + cached + written
             self.usage.cached_input_tokens = cached
             self.usage.cache_write_tokens = written
-            self.usage.output_tokens = max(0, int(usage.get("output_tokens", 0)))
+            self.usage.output_tokens = output
             self.usage.reported = True
 
     def write_result(self, result_file):

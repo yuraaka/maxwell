@@ -107,14 +107,15 @@ if mode == 'probe-error':
         print(json.dumps({'type': 'result', 'is_error': True, 'result': message}), flush=True)
         sys.exit(0)
 print(json.dumps({'type': 'diagnostic', 'text': os.environ.get('COMPANY_GATEWAY_TOKEN', '')}), flush=True)
+usage = json.loads((home / 'usage.json').read_text()) if (home / 'usage.json').exists() else None
 if codex:
     Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps(result))
     if mode != 'unknown':
-        print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 1000,
-              'cached_input_tokens': 500, 'output_tokens': 100}}), flush=True)
+        print(json.dumps({'type': 'turn.completed', 'usage': usage if usage is not None else
+              {'input_tokens': 1000, 'cached_input_tokens': 500, 'output_tokens': 100}}), flush=True)
 else:
     print(json.dumps({'type': 'result', 'is_error': mode == 'error',
-        'structured_output': result, 'usage': {'input_tokens': 400,
+        'structured_output': result, 'usage': usage if usage is not None else {'input_tokens': 400,
         'cache_read_input_tokens': 500, 'cache_creation_input_tokens': 100,
         'output_tokens': 100}}), flush=True)
 """.replace("PYTHON", os.sys.executable).replace("FINDING", repr(finding))
@@ -462,6 +463,50 @@ def test_unpriced_limits_count_started_calls_and_preserve_unknown_usage(native_d
         daemon.store.db.execute("UPDATE scans SET started=0 WHERE executed=1")
     assert daemon.store.committed_today() == 0
     assert daemon.store.claim(1, 1, 6, daily_scan_limit=1) is not None
+
+
+CODEX_COUNTERS = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+CLAUDE_COUNTERS = {
+    "input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 0,
+}
+
+
+@pytest.mark.parametrize(
+    ("provider", "counters"), [("first", CODEX_COUNTERS), ("claude", CLAUDE_COUNTERS)]
+)
+@pytest.mark.parametrize("change", ["empty", "missing", "string", "negative", "boolean", "zero"])
+def test_incomplete_usage_counters_retain_priced_reservation(
+    native_daemon, provider, counters, change
+):
+    daemon, homes = native_daemon
+    usage = dict(counters)
+    if change == "empty":
+        usage = {}
+    elif change == "missing":
+        del usage["output_tokens"]
+    elif change == "string":
+        usage["input_tokens"] = "1000"
+    elif change == "negative":
+        usage["output_tokens"] = -5
+    elif change == "boolean":
+        usage["input_tokens"] = True
+    (homes[provider] / "usage.json").write_text(json.dumps(usage))
+    daemon.config.providers[provider].models = {
+        "priced": ModelSettings(input_usd_per_mtok=2, output_usd_per_mtok=8)
+    }
+    request_scan(daemon, repository="acme/repo", provider=provider, model="priced")
+    scan = run_next(daemon)
+    assert scan["state"] == "completed", scan["error"]
+    assert scan["accounting"] == "usd" and scan["reserved"] > 0
+    if change == "zero":
+        assert scan["cost"] == 0
+        assert daemon.store.committed_today() == 0
+    else:
+        assert scan["cost"] is None
+        assert daemon.store.committed_today() == scan["reserved"]
 
 
 def test_preparation_failure_does_not_use_unpriced_scan_allowance(native_daemon):
