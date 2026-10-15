@@ -31,6 +31,7 @@ class ScanDisplay:
         self.spending = {}
         self.pipeline = None
         self.pools = {}
+        self.backlog = {}
         self.capacities = {}
         self.execution_count = 0
         self.settled_spending = None
@@ -56,6 +57,7 @@ class ScanDisplay:
             self.spending = {}
             self.pipeline = event.get("pipeline")
             self.pools = {}
+            self.backlog = {}
             self.capacities = {}
             self.execution_count = 0
             self.status_url = None
@@ -103,6 +105,7 @@ class ScanDisplay:
         if state == "pools":
             self.repository = event["repository"]
             self.pools, self.capacities = event["pools"], event["capacities"]
+            self.backlog = event.get("backlog", {})
             self.status_url = event.get("status_url")
             self.statuses = {}
             self.stage = None
@@ -332,6 +335,11 @@ class ScanDisplay:
         ]
         lines = [top, row(stages), row(bar), row(detail)]
         if self.pipeline:
+            backlog = ", ".join(
+                f"{stage} {count}" for stage, count in self.backlog.items() if count
+            )
+            if backlog:
+                lines.append(row([("Backlog: ", "33"), (backlog, "2")]))
             lines.append(
                 row([("Status: ", "1;36"), (self.status_url or "awaiting publication", "36;4")])
             )
@@ -351,7 +359,11 @@ class ScanDisplay:
                 f"{stage} {self.pools.get(stage, 0)}/{self.capacities.get(stage, 0)}"
                 for stage in self.stages
             )
-            self.write(f"{self.repository} · {pools} · {self.cost_label()} · {self.phase}")
+            backlog = ", ".join(
+                f"{stage} {count}" for stage, count in self.backlog.items() if count
+            )
+            suffix = f" · Backlog: {backlog}" if backlog else ""
+            self.write(f"{self.repository} · {pools} · {self.cost_label()} · {self.phase}{suffix}")
         else:
             filled = int(12 * self.progress())
             bar = "#" * filled + "-" * (12 - filled)

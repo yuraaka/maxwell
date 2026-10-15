@@ -430,12 +430,15 @@ pipeline:
 Run `maxwell config apply` after editing the configuration, then start the scan.
 A running pipeline uses the settings it started with.
 
-These are admission limits per repository, including reserved publication slots,
-not parallel-agent counts or targets that force every pool to stay full. A full pool
-pauses work that would add another issue to it. Zero stops new admissions to that pool;
-existing work can still drain. Integration capacity also gates automatic merging during
-ordinary scans and PR synchronization. Manual GitHub actions can exceed a limit;
-Maxwell reports the occupancy and drains it without undoing external changes.
+Each pool first admits existing GitHub issues for its phase, up to its capacity,
+including reserved publication slots. Remaining issues stay in a separate backlog.
+For example, 33 reviewed issues with capacity 10 appear as `Rev 10/10` and a review
+backlog of 23. As audit consumes the pool, existing reviewed issues refill it before
+more reviews run. Hunting likewise pauses while enough hunted issues already exist.
+Blocked attempts yield their slots to other existing work. Zero disables admissions
+to that pool, including from backlog. These are per-repository queue sizes, not
+parallel-agent counts. Integration capacity also gates automatic merging during
+ordinary scans and PR synchronization; those paths can add to the pipeline backlog.
 
 Hunting still observes `limits.scan_interval_seconds` and `max_findings_per_scan`;
 the available hunt slots can lower the publication count further. Infinite mode measures

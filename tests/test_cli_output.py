@@ -416,6 +416,7 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
             "state": "pools",
             "pools": dict.fromkeys(stages, 1),
             "capacities": dict.fromkeys(stages, 3),
+            "backlog": {"review": 23},
             "status_url": "https://github.com/acme/repo/issues/4",
         }
     )
@@ -435,6 +436,7 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
     assert "100 executions" in panel and "$0.1000 USD" in panel
     assert "100%" not in panel and "integration pool full" in panel
     assert "https://github.com/acme/repo/issues/4" in panel
+    assert "Backlog:" in panel and "review 23" in panel
     assert not display.spending
 
 

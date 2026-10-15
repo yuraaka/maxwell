@@ -45,6 +45,19 @@ class PipelineSnapshot:
         counts.update(self.reservations)
         return {stage: counts[stage] for stage in POOLS}
 
+    def admit(self, capacities, ordered):
+        occupied = {
+            stage: min(self.reservations.get(stage, 0), capacities[stage]) for stage in POOLS
+        }
+        admitted = []
+        for item in ordered:
+            if item.pool and occupied[item.pool] < capacities[item.pool]:
+                admitted.append(item)
+                occupied[item.pool] += 1
+        totals = self.occupancy()
+        backlog = {stage: totals[stage] - occupied[stage] for stage in POOLS}
+        return admitted, occupied, backlog
+
 
 def classify_item(
     issue, finding, assessments, repair, link, pull, votes, integrations, head, policy
@@ -285,6 +298,9 @@ class PipelineRepository:
     waiting: list = field(default_factory=list)
     failed: int = 0
     measured_head: str | None = None
+    deferred: set = field(default_factory=set)
+    pools: dict = field(default_factory=dict)
+    backlog: dict = field(default_factory=dict)
 
 
 async def targets_for(reporter, repository, snapshot, stage, issue):
@@ -388,6 +404,7 @@ async def run_pipeline(
             )
         while True:
             progressed = False
+            deferred_work = False
             for context in contexts:
                 repository = context.record["name"]
                 context.waiting = []
@@ -405,19 +422,6 @@ async def run_pipeline(
                         async with preparation.watch():
                             snapshot = await load_snapshot(context.reporter, repository)
                         context.snapshot = snapshot
-                    dashboard = store.one(
-                        "SELECT issue FROM dashboards WHERE repository=?", (repository,)
-                    )
-                    emit(
-                        context,
-                        "pools",
-                        pools=snapshot.occupancy(),
-                        capacities=capacities,
-                        counts=dict(context.counts),
-                        status_url=f"https://github.com/{repository}/issues/{dashboard['issue']}"
-                        if dashboard and dashboard["issue"]
-                        else None,
-                    )
                     candidates = {stage: [] for stage in STAGES}
                     scoped = [
                         item
@@ -432,13 +436,44 @@ async def run_pipeline(
                     order += [item["issue"] for item in bugs if item["issue"] not in order]
                     order += [item["issue"] for item in maintenance if item["issue"] not in order]
                     ranks = {number: index for index, number in enumerate(order)}
-                    for item in sorted(
-                        scoped, key=lambda item: (ranks.get(item.issue, len(ranks)), item.issue)
-                    ):
+                    context.deferred.intersection_update(item.identity for item in snapshot.items)
+                    ordered = sorted(
+                        snapshot.items,
+                        key=lambda item: (
+                            context.scope is not None and item.identity not in context.scope,
+                            item.stage is None or item.identity in context.deferred,
+                            ranks.get(item.issue, len(ranks)),
+                            item.issue,
+                        ),
+                    )
+                    admitted, context.pools, context.backlog = snapshot.admit(capacities, ordered)
+                    dashboard = store.one(
+                        "SELECT issue FROM dashboards WHERE repository=?", (repository,)
+                    )
+                    emit(
+                        context,
+                        "pools",
+                        pools=context.pools,
+                        backlog=context.backlog,
+                        capacities=capacities,
+                        counts=dict(context.counts),
+                        status_url=f"https://github.com/{repository}/issues/{dashboard['issue']}"
+                        if dashboard and dashboard["issue"]
+                        else None,
+                    )
+                    for item in scoped:
+                        if item.reason:
+                            context.waiting.append(f"#{item.issue}: {item.reason}")
+                    for item in admitted:
+                        if context.scope is not None and item.identity not in context.scope:
+                            continue
                         if item.stage:
                             candidates[item.stage].append(item)
-                        elif item.reason:
-                            context.waiting.append(f"#{item.issue}: {item.reason}")
+                    for stage, count in context.backlog.items():
+                        if count:
+                            context.waiting.append(
+                                f"{stage} backlog: {count} waiting for a pool slot"
+                            )
                     if infinite:
                         candidates["hunt"] = [None]
                     executed = False
@@ -459,6 +494,9 @@ async def run_pipeline(
                                 )
                                 if not targets:
                                     context.waiting.append(f"#{issue}: no eligible {stage} target")
+                                    if subject not in context.deferred:
+                                        context.deferred.add(subject)
+                                        deferred_work = True
                                     continue
                                 target = targets[0]
                                 identity = fingerprint(stage, target, snapshot.head)
@@ -467,6 +505,9 @@ async def run_pipeline(
                                     context.waiting.append(
                                         f"{stage} #{issue}: {blocked}" if issue else blocked
                                     )
+                                    if item and subject not in context.deferred:
+                                        context.deferred.add(subject)
+                                        deferred_work = True
                                     continue
                                 route, decision = selector.select(
                                     store, repository, stage, avoid=independent_agents(target)
@@ -478,6 +519,9 @@ async def run_pipeline(
                                     context.waiting.append(
                                         f"#{issue}: no independent validation model available"
                                     )
+                                    if subject not in context.deferred:
+                                        context.deferred.add(subject)
+                                        deferred_work = True
                                     continue
                                 execution = {
                                     **config.execution(route, context.record),
@@ -575,6 +619,10 @@ async def run_pipeline(
                                 context.counts[stage] += 1
                                 context.failed += not success
                                 if not success:
+                                    context.deferred.add(subject)
+                                else:
+                                    context.deferred.discard(subject)
+                                if not success:
                                     errors.append(
                                         {
                                             "repository": repository,
@@ -594,6 +642,9 @@ async def run_pipeline(
                                 progressed = executed = True
                                 break
                             except Exception as exc:
+                                if item and subject not in context.deferred:
+                                    context.deferred.add(subject)
+                                    deferred_work = True
                                 message = config.redact(str(exc))
                                 context.waiting.append(f"{stage} #{issue}: {message}")
                                 errors.append(
@@ -606,7 +657,7 @@ async def run_pipeline(
                     errors.append({"repository": repository, "stage": "pipeline", "error": message})
                     errors[:] = errors[-20:]
                 context.waiting = list(dict.fromkeys(context.waiting))
-            if progressed:
+            if progressed or deferred_work:
                 continue
             if not infinite:
                 break
@@ -645,7 +696,8 @@ async def run_pipeline(
                     "rejected": sum(item.outcome == "rejected" for item in scoped),
                     "remaining": sum(item.outcome != "rejected" for item in scoped),
                     "failed": context.failed,
-                    "pools": snapshot.occupancy() if snapshot else {},
+                    "pools": context.pools,
+                    "backlog": context.backlog,
                     "waiting": context.waiting[:10],
                 }
             )

@@ -418,6 +418,89 @@ def test_scheduler_drains_downstream_before_admitting_upstream(scheduler):
     assert scheduler.executions == [(2, "audit"), (1, "review")]
 
 
+def test_existing_backlog_refills_bounded_pool_before_new_reviews(scheduler):
+    scheduler.config.pipeline.pools.review = 2
+    scheduler.state.update({number: ("review", "audit") for number in range(3, 8)})
+    events = []
+
+    async def execute(*args, stage, **kwargs):
+        issue = args[5]["target"]["issue"]
+        scheduler.executions.append((issue, stage))
+        scheduler.state[issue] = (None, None)
+        return scheduler.result(stage)
+
+    report = asyncio.run(scheduler.run(execute, on_progress=events.append))
+    pools = [event for event in events if event["state"] == "pools"]
+    assert pools[0]["pools"]["review"] == 2
+    assert pools[0]["backlog"]["review"] == 3
+    assert [event["backlog"]["review"] for event in pools[:4]] == [3, 2, 1, 0]
+    assert all(event["pools"]["review"] <= 2 for event in pools)
+    assert scheduler.executions == [(n, "audit") for n in range(3, 8)] + [
+        (1, "review"),
+        (2, "review"),
+    ]
+    assert report["valid"]
+
+
+def test_failed_active_issue_yields_slot_to_backlog(scheduler):
+    scheduler.config.pipeline.pools.hunt = 1
+
+    async def execute(*args, stage, **kwargs):
+        issue = args[5]["target"]["issue"]
+        scheduler.executions.append(issue)
+        if issue == 1:
+            return scheduler.result(stage, "provider failed")
+        scheduler.state[issue] = (None, None)
+        return scheduler.result(stage)
+
+    asyncio.run(scheduler.run(execute))
+    assert scheduler.executions == [1, 2]
+
+
+def test_zero_pool_leaves_existing_findings_in_backlog(scheduler):
+    scheduler.config.pipeline.pools.hunt = 0
+
+    async def execute(*args, **kwargs):
+        pytest.fail("a disabled pool must not admit existing issues")
+
+    report = asyncio.run(scheduler.run(execute))
+    assert report["pipeline_repositories"][0]["pools"]["hunt"] == 0
+    assert report["pipeline_repositories"][0]["backlog"]["hunt"] == 2
+
+
+def test_infinite_hunter_waits_for_existing_hunted_backlog(scheduler, monkeypatch):
+    scheduler.config.pipeline.pools.hunt = 1
+    scheduler.config.pipeline.pools.review = 0
+    events = []
+
+    async def execute(*args, **kwargs):
+        pytest.fail("existing hunted findings fill the pool; no hunt or review may run")
+
+    async def wait(seconds, progress):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("maxwell.pipeline.wait_for_work", wait)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scheduler.run(execute, infinite=True, on_progress=events.append))
+    pools = next(event for event in events if event["state"] == "pools")
+    assert pools["pools"]["hunt"] == 1
+    assert pools["backlog"]["hunt"] == 1
+
+
+def test_pending_publications_reserve_slots_before_backlog_admission():
+    snapshot = PipelineSnapshot(
+        [],
+        [PipelineItem(n, str(n), "review", "audit") for n in range(3)],
+        "head",
+        reservations={"review": 1},
+    )
+    capacities = StagePoolSizes(review=2).model_dump(by_alias=True)
+    admitted, pools, backlog = snapshot.admit(capacities, snapshot.items)
+    assert len(admitted) == 1
+    assert pools["review"] == 2
+    assert backlog["review"] == 2
+
+
 def test_infinite_hunt_is_clipped_then_waits_for_cadence(scheduler, monkeypatch):
     scheduler.state.clear()
     scheduler.config.pipeline.pools.hunt = 2
@@ -603,12 +686,14 @@ def test_blocked_repository_does_not_prevent_another_repository(scheduler, monke
 def test_infinite_resumes_after_daily_admission_becomes_available(scheduler, monkeypatch):
     scheduler.config.provider.input_usd_per_mtok = None
     scheduler.config.provider.output_usd_per_mtok = None
-    scheduler.config.pipeline.pools.hunt = 0
+    scheduler.config.pipeline.pools.hunt = 2
     spent = [999]
     monkeypatch.setattr(scheduler.store, "unpriced_started_today", lambda: spent[0])
     waits = []
 
     async def execute(*args, stage, **kwargs):
+        if stage == "hunt":
+            raise asyncio.CancelledError
         issue = args[5]["target"]["issue"]
         scheduler.executions.append(issue)
         scheduler.state[issue] = (None, None)
