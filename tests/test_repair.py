@@ -23,12 +23,46 @@ from maxwell.records import (
 )
 from maxwell.repair import collect_repair_targets, run_checks
 from maxwell.reporting import Reporter, record_report
-from maxwell.repositories import git
+from maxwell.repositories import Repository, git
 from maxwell.store import Store
 
 
 @pytest.fixture
-def repairable(home, source, finding, executable):
+def repairable(home, source, finding, executable, github, monkeypatch):
+    github["branches"]["main"] = git("rev-parse", "HEAD", cwd=source)
+
+    def push(repository, branch, commit, token, expected=None):
+        actual = github["branches"].get(branch)
+        if actual == commit:
+            return
+        if actual != expected:
+            raise ValueError("Remote repair branch changed; refusing to overwrite it")
+        github["branches"][branch] = commit
+        for pull in github["pulls"].values():
+            if pull["head"]["ref"] == branch:
+                pull["head"]["sha"] = commit
+
+    def fetch(repository, number, head, base_branch, base_sha, token):
+        repository.worktrees.mkdir(parents=True, exist_ok=True)
+        if not repository.mirror.exists():
+            git("init", "--bare", str(repository.mirror))
+        git("-C", str(repository.mirror), "fetch", "--no-tags", str(source), "main")
+        pull = github["pulls"][number]
+        if pull["head"]["sha"] != head or pull["base"]["sha"] != base_sha:
+            raise ValueError("PR moved while fetching")
+        git("-C", str(repository.mirror), "cat-file", "-e", head)
+        git("-C", str(repository.mirror), "cat-file", "-e", base_sha)
+
+    def fetch_revision(repository, sha, token):
+        repository.worktrees.mkdir(parents=True, exist_ok=True)
+        if not repository.mirror.exists():
+            git("init", "--bare", str(repository.mirror))
+        git("-C", str(repository.mirror), "fetch", "--no-tags", str(source), sha)
+        assert git("-C", str(repository.mirror), "rev-parse", "FETCH_HEAD") == sha
+
+    monkeypatch.setattr(Repository, "fetch_revision", fetch_revision)
+    monkeypatch.setattr(Repository, "push_repair", push)
+    monkeypatch.setattr(Repository, "fetch_pull", fetch)
     data = yaml.safe_load(home.config.read_text())
     data["measurement"] = {
         "tests": {
@@ -122,6 +156,8 @@ def test_repair_end_to_end_pinned_local_branch_and_repeat(home, source, repairab
     assert public["outcome"] == "prepared" and public["publication_state"] == "published"
     assert public["sha"] == finding.sha and public["references"] == [review.id]
     assert public["agent"]["role"] == "fixer" and public["availability"] == "local-only"
+    assert public["spending"]["micros"] == 1900 and public["spending"]["complete"]
+    assert "$0.0019 USD" in next(iter(github["pulls"].values()))["body"]
     worktree = Path(public["worktree"])
     assert worktree.is_dir() and git("rev-parse", "HEAD", cwd=worktree) == public["commit"]
     assert git("rev-parse", "HEAD^", cwd=worktree) == finding.sha
@@ -137,13 +173,14 @@ def test_repair_end_to_end_pinned_local_branch_and_repeat(home, source, repairab
     assert any(isinstance(record, RepairRecord) for record in published)
     dashboard = store.one("SELECT issue FROM dashboards")["issue"]
     assert not github["comments"].get(dashboard)
-    assert "Local repair attempts" in github["issues"][dashboard]["body"]
+    assert "Repair pull requests" in github["issues"][dashboard]["body"]
     assert public["branch"] in github["issues"][dashboard]["body"]
     again = run(home)
     assert again["valid"] and not again["scans"]
     forced = run(home, issue=issue, force=True)
-    assert forced["valid"]
-    assert forced["scans"][0]["repairs"][0]["branch"] != public["branch"]
+    assert not forced["valid"]
+    assert len(github["pulls"]) == 1
+    assert forced["scans"][0]["repairs"][0]["branch"] == public["branch"]
 
 
 @pytest.mark.parametrize(

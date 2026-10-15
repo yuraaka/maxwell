@@ -83,6 +83,7 @@ def test_legacy_measurement_digest_is_stable_and_not_a_full_baseline():
     old = record.model_dump(
         mode="json",
         exclude={
+            "spending",
             "measured_at",
             "protocol",
             "policy",

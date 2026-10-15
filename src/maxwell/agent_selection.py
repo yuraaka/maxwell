@@ -5,7 +5,14 @@ from maxwell.config_apply import config_digest
 from maxwell.reputation import selection_evidence
 from maxwell.store import Store
 
-ROLES = {"hunt": "hunter", "review": "reviewer", "audit": "auditor", "repair": "fixer"}
+ROLES = {
+    "hunt": "hunter",
+    "review": "reviewer",
+    "audit": "auditor",
+    "repair": "fixer",
+    "validate": "validator",
+    "integrate": "validator",
+}
 
 
 class AgentSelector:
@@ -76,7 +83,7 @@ class AgentSelector:
         elif distinct:
             candidates = distinct
         evidence = self.evidence_provider(store, repository, ROLES[stage])
-        unrated_auditor = stage in ("audit", "repair") and not any(
+        unrated_auditor = stage in ("audit", "repair", "validate", "integrate") and not any(
             sum(evidence.get(candidate, [0, 0])) for candidate in candidates
         )
         if self.explicit or unrated_auditor:
@@ -92,7 +99,7 @@ class AgentSelector:
             }
             identity = max(draws, key=draws.get)
             draw = draws[identity]
-            method = "thompson-source-v1"
+            method = "thompson-repair-v1" if stage == "repair" else "thompson-source-v1"
         successes, failures = evidence.get(identity, [0, 0])
         return self.rng.choice(self.routes[identity]), {
             "method": method,

@@ -206,3 +206,33 @@ def measurement_report(record, baseline=None):
             body += f"Collected test count change: {new_count - old_count:+d}.\n"
     body += "\nThis is a versioned maintenance policy, separate from agent reputation and source-assessed defects. Test evidence and runtime comparisons depend on the recorded protocol and environment.\n"
     return body
+
+
+def validation_changes(record):
+    before, after = record.before, record.after
+    if before is None or after is None:
+        return {"components": {}, "reduction": None}
+    first, second = measurement_contributions(before), measurement_contributions(after)
+    components = {}
+    source_compatible = (
+        before.repository == after.repository
+        and before.analyzer_version == after.analyzer_version
+        and before.policy_version == after.policy_version
+        and before.protocol == after.protocol
+        and before.policy == after.policy
+    )
+    if source_compatible and first is not None and second is not None:
+        for name in FACTORS:
+            if (
+                name in first
+                and name in second
+                and (not name.startswith("test_") or compatible(before, after))
+            ):
+                components[name] = round(first[name] - second[name], 4)
+    old, new = measurement_score(before), measurement_score(after)
+    reduction = (
+        round(old - new, 4)
+        if old is not None and new is not None and len(components) == len(FACTORS)
+        else None
+    )
+    return {"components": components, "reduction": reduction}

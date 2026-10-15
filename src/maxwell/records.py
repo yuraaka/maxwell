@@ -7,7 +7,14 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from maxwell.contracts import FactorAssociations, Finding, RepairEstimate, Usage
+from maxwell.contracts import (
+    FactorAssociations,
+    Finding,
+    RepairEstimate,
+    Spending,
+    Usage,
+    ValidationResult,
+)
 
 Identifier = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 Revision = Annotated[str, Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")]
@@ -33,6 +40,7 @@ class Record(BaseModel):
     version: Literal[1] = 1
     id: Identifier
     repository: str = Field(pattern=r"^[^/\s]+/[^/\s]+$", max_length=300)
+    spending: Spending | None = None
 
 
 class FindingRecord(Record):
@@ -81,7 +89,7 @@ class AssessmentRecord(Record):
 
 class AgentSelection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    method: Literal["explicit", "thompson-source-v1", "uniform-unrated-v1"]
+    method: Literal["explicit", "thompson-source-v1", "thompson-repair-v1", "uniform-unrated-v1"]
     successes: int = Field(ge=0)
     failures: int = Field(ge=0)
     draw: float | None = Field(default=None, ge=0, le=1)
@@ -90,7 +98,7 @@ class AgentSelection(BaseModel):
 
     @model_validator(mode="after")
     def check_draw(self):
-        if (self.method == "thompson-source-v1") != (self.draw is not None):
+        if (self.method in ("thompson-source-v1", "thompson-repair-v1")) != (self.draw is not None):
             raise ValueError("Only Thompson sampling requires a selection draw")
         return self
 
@@ -139,9 +147,18 @@ class RepairRecord(Record):
     checks: list[RepairCheck] = Field(default_factory=list, max_length=10)
     concerns: list[str] = Field(default_factory=list, max_length=50)
     availability: Literal["local-only"] = "local-only"
+    parent_sha: Revision | None = None
+    previous_id: Identifier | None = None
+    lineage_id: Identifier | None = None
 
     @model_validator(mode="after")
     def check_prepared(self):
+        if bool(self.previous_id) != bool(self.parent_sha) or bool(self.previous_id) != bool(
+            self.lineage_id
+        ):
+            raise ValueError("Repair amendments require predecessor, parent and lineage")
+        if self.branch != f"maxwell/repair/{self.lineage_id or self.execution_id}":
+            raise ValueError("Repair branch must match its lineage")
         if self.agent.role != "fixer":
             raise ValueError("Repair agent must be a fixer")
         if self.outcome == "prepared" and (
@@ -152,6 +169,21 @@ class RepairRecord(Record):
         ):
             raise ValueError("Prepared repairs require a commit, changes, and passing host checks")
         return self
+
+
+class RepairPullRequestRecord(Record):
+    type: Literal["pull_request"] = "pull_request"
+    finding_id: Identifier
+    finding_issue: int = Field(ge=1)
+    repair_id: Identifier
+    sha: Revision
+    head_sha: Revision
+    base_sha: Revision
+    branch: str = Field(pattern=r"^maxwell/repair/[a-f0-9]{32}$")
+    base_branch: str = Field(min_length=1, max_length=200)
+    number: int = Field(ge=1)
+    provenance: Literal["fixer", "external"] = "fixer"
+    previous_id: Identifier | None = None
 
 
 class MeasurementFactor(BaseModel):
@@ -230,6 +262,68 @@ class MeasurementRecord(Record):
         return self
 
 
+class ValidationRecord(Record):
+    type: Literal["validation"] = "validation"
+    finding_id: Identifier
+    repair_id: Identifier
+    sha: Revision
+    base_sha: Revision
+    execution_id: Identifier
+    agent: PublicAgent
+    references: list[Identifier] = Field(min_length=1, max_length=20)
+    state: Literal["completed", "failed", "cancelled", "interrupted"]
+    outcome: Literal["accepted", "rejected", "inconclusive"]
+    summary: str = Field(min_length=1, max_length=6000)
+    result: ValidationResult | None = None
+    checks: list[RepairCheck] = Field(default_factory=list, max_length=10)
+    replay: RepairCheck | None = None
+    failures: list[dict] = Field(default_factory=list, max_length=50)
+    before: MeasurementRecord | None = None
+    after: MeasurementRecord | None = None
+    supersedes: list[Identifier] = Field(default_factory=list, max_length=100)
+    pr_id: Identifier | None = None
+    pr_head: Revision | None = None
+    pr_base: Revision | None = None
+    tested_sha: Revision | None = None
+    comparison_base_sha: Revision | None = None
+
+    @model_validator(mode="after")
+    def check_validation(self):
+        if len({bool(self.pr_id), bool(self.pr_head), bool(self.pr_base)}) != 1:
+            raise ValueError("PR validation requires a revision reference and pinned head/base")
+        if self.agent.role != "validator":
+            raise ValueError("Validation agent must be a validator")
+        if self.id in self.supersedes:
+            raise ValueError("Validation cannot supersede itself")
+        for measurement, sha in (
+            (self.before, self.comparison_base_sha or self.base_sha),
+            (self.after, self.tested_sha or self.sha),
+        ):
+            if measurement and (
+                measurement.repository != self.repository or measurement.sha != sha
+            ):
+                raise ValueError("Validation measurements must match its repository and commits")
+        if self.state != "completed" and self.outcome != "inconclusive":
+            raise ValueError("Incomplete validation must remain inconclusive")
+        if self.outcome == "accepted" and (
+            not self.result
+            or self.result.verdict != "repaired"
+            or not self.checks
+            or any(check.state != "passed" for check in self.checks)
+        ):
+            raise ValueError("Accepted validation requires source support and passing host checks")
+        if self.outcome == "rejected" and (
+            not self.result or self.result.verdict != "not_repaired"
+        ):
+            raise ValueError("Rejected validation requires concrete independent source evidence")
+        return self
+
+
+class IntegrationRecord(ValidationRecord):
+    type: Literal["integration"] = "integration"
+    merge_sha: Revision
+
+
 class StageExecution(BaseModel):
     model_config = ConfigDict(
         extra="forbid", frozen=True, allow_inf_nan=False, revalidate_instances="always"
@@ -268,7 +362,14 @@ class StageExecution(BaseModel):
 
 
 PublicRecord = Annotated[
-    FindingRecord | AssessmentRecord | ExecutionRecord | MeasurementRecord | RepairRecord,
+    FindingRecord
+    | AssessmentRecord
+    | ExecutionRecord
+    | MeasurementRecord
+    | RepairRecord
+    | ValidationRecord
+    | RepairPullRequestRecord
+    | IntegrationRecord,
     Field(discriminator="type"),
 ]
 RECORD_ADAPTER = TypeAdapter(PublicRecord)
@@ -292,6 +393,15 @@ def decode_record(body):
 
 def record_digest(record):
     values = record.model_dump(mode="json")
+
+    if values["spending"] is None:
+        values.pop("spending")
+    if isinstance(record, ExecutionRecord) and values["usage"]["spending"] is None:
+        values["usage"].pop("spending")
+    if isinstance(record, ValidationRecord):
+        for name in ("before", "after"):
+            if values[name] and values[name]["spending"] is None:
+                values[name].pop("spending")
     if isinstance(record, ExecutionRecord) and values["agent_selection"] is None:
         del values["agent_selection"]
     if isinstance(record, FindingRecord) and not values["finding"]["factors"]:
@@ -312,6 +422,18 @@ def record_digest(record):
         ):
             if values[key] is None or values[key] == {}:
                 del values[key]
+    if isinstance(record, RepairRecord):
+        for key in ("parent_sha", "previous_id", "lineage_id"):
+            if values[key] is None:
+                del values[key]
+    if isinstance(record, ValidationRecord):
+        for key in ("pr_id", "pr_head", "pr_base", "tested_sha", "comparison_base_sha"):
+            if values[key] is None:
+                del values[key]
+        if values.get("result"):
+            for key in ("comments", "notes"):
+                if not values["result"].get(key):
+                    values["result"].pop(key, None)
     payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -330,6 +452,8 @@ def public_agent(scan):
         "fix": "fixer",
         "repair": "fixer",
         "validation": "validator",
+        "validate": "validator",
+        "integrate": "validator",
     }
     return PublicAgent(
         adapter=adapter,
@@ -354,6 +478,7 @@ def execution_record(scan, finding_ids=()):
         finished=scan["finished"],
         accounting="tokens",
         usage=Usage.model_validate_json(scan.get("usage") or "{}"),
+        spending=Usage.model_validate_json(scan.get("usage") or "{}").spending,
         finding_ids=list(finding_ids),
         agent_selection=execution.get("agent_selection"),
     )

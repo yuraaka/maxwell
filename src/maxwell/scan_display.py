@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -5,6 +6,7 @@ import threading
 import time
 
 from maxwell.cli_output import color
+from maxwell.pricing import cost_range
 
 
 class ScanDisplay:
@@ -22,9 +24,18 @@ class ScanDisplay:
         self.total = None
         self.phase = ""
         self.agent = ""
+        self.subject = ""
         self.started = time.monotonic()
         self.rendered_lines = 0
         self.last_wait = None
+        self.spending = {}
+        self.pipeline = None
+        self.pools = {}
+        self.capacities = {}
+        self.execution_count = 0
+        self.settled_spending = None
+        self.unknown_spending = False
+        self.status_url = None
 
     def __call__(self, event):
         with self.lock:
@@ -42,14 +53,72 @@ class ScanDisplay:
             self.statuses = {}
             self.started = time.monotonic()
             self.last_wait = None
+            self.spending = {}
+            self.pipeline = event.get("pipeline")
+            self.pools = {}
+            self.capacities = {}
+            self.execution_count = 0
+            self.status_url = None
+            self.settled_spending = None
+            self.unknown_spending = False
+            return
+        if event.get("id") and "usage" in event:
+            usage = event["usage"] or {}
+            if isinstance(usage, str):
+                usage = json.loads(usage)
+            self.spending[event["id"]] = usage.get("spending")
+        elif state == "running" and event.get("id"):
+            self.spending.setdefault(event["id"], None)
+        if (
+            event.get("id")
+            and event.get("executed") == 0
+            and state
+            in ("publishing", "completed", "failed", "cancelled", "interrupted", "skipped")
+        ):
+            self.spending.pop(event["id"], None)
+        if self.pipeline and state in (
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "skipped",
+        ):
+            value = self.spending.pop(event.get("id"), None)
+            if event.get("executed"):
+                self.execution_count += 1
+                if value is None:
+                    self.unknown_spending = True
+                else:
+                    previous = self.settled_spending or {
+                        "micros": 0,
+                        "upper_micros": None,
+                        "complete": True,
+                    }
+                    self.settled_spending = {
+                        "micros": previous["micros"] + value["micros"],
+                        "upper_micros": (previous.get("upper_micros") or previous["micros"])
+                        + (value.get("upper_micros") or value["micros"]),
+                        "complete": previous["complete"] and value["complete"],
+                    }
+        if state == "pools":
+            self.repository = event["repository"]
+            self.pools, self.capacities = event["pools"], event["capacities"]
+            self.status_url = event.get("status_url")
+            self.statuses = {}
+            self.stage = None
+            self.render()
             return
         if state == "stage":
+            if self.pipeline:
+                self.repository = event.get("repository", self.repository)
+                self.statuses = {}
             self.stage = event["stage"]
             self.stage_fraction = None
             self.statuses[self.stage] = event["status"]
             self.total = event.get("total")
             self.completed = event.get("completed", 0)
             self.phase = event.get("detail", "")
+            self.subject = event.get("subject", "")
             self.agent = ""
             if self.interactive or event["status"] == "running":
                 self.render()
@@ -62,13 +131,22 @@ class ScanDisplay:
             if "stage_fraction" in event:
                 self.stage_fraction = event["stage_fraction"]
             if (
-                any(word in self.phase.lower() for word in ("retry", "waiting for github"))
+                self.phase.lower().startswith(
+                    ("retrying github", "waiting for github", "github quota wait finished")
+                )
                 and self.phase != self.last_wait
             ):
                 self.last_wait = self.phase
                 self.clear()
                 self.write(f"{self.repository}: {self.phase}")
             if not self.interactive:
+                if (
+                    self.pipeline
+                    and self.phase.startswith("Waiting:")
+                    and self.phase != self.last_wait
+                ):
+                    self.last_wait = self.phase
+                    self.write(self.phase)
                 return
         elif state == "running":
             self.agent = "/".join(filter(None, [event.get("model"), event.get("effort")]))
@@ -81,6 +159,27 @@ class ScanDisplay:
 
     def write(self, text):
         print(text, file=self.stream, flush=True)
+
+    def cost_label(self):
+        values = list(self.spending.values())
+        if self.settled_spending:
+            values.append(self.settled_spending)
+        if self.unknown_spending:
+            values.append(None)
+        known = [value for value in values if value is not None]
+        if values and not known:
+            return "Cost unknown"
+        amount = sum(value["micros"] for value in known)
+        upper = (
+            sum(
+                value["upper_micros"] if value.get("upper_micros") is not None else value["micros"]
+                for value in known
+            )
+            if any(value.get("upper_micros") is not None for value in known)
+            else None
+        )
+        partial = len(known) != len(values) or any(not value["complete"] for value in known)
+        return f"{cost_range(amount, upper)} USD est" + (" · partial" if partial else "")
 
     def progress(self):
         done = sum(status != "running" for status in self.statuses.values())
@@ -128,7 +227,14 @@ class ScanDisplay:
                 styled("│", "2") + " " + "".join(values) + " " * available + " " + styled("│", "2")
             )
 
-        title = clipped(f" Maxwell · {self.repository} ", width - 2)
+        mode = (
+            " · continuous"
+            if self.pipeline == "infinite"
+            else " · repair queue"
+            if self.pipeline
+            else ""
+        )
+        title = clipped(f" Maxwell · {self.repository}{mode} ", width - 2)
         top = (
             styled("╭", "2")
             + styled(title, "1;36")
@@ -159,14 +265,30 @@ class ScanDisplay:
                     "review": "1;35",
                     "audit": "1;32",
                     "repair": "1;34",
+                    "validate": "1;35",
+                    "integrate": "1;32",
                 }.get(stage, "1;36")
                 if stage in ("review", "audit") and self.total:
                     label += f" {self.completed}/{self.total}"
             else:
                 code = "2"
+            if self.pipeline:
+                label = {
+                    "hunt": "Hunt",
+                    "review": "Rev",
+                    "audit": "Aud",
+                    "repair": "Fix",
+                    "validate": "Val",
+                    "integrate": "Int",
+                }.get(stage, stage.capitalize())
+                count, capacity = self.pools.get(stage, 0), self.capacities.get(stage, 0)
+                label += f" {count}/{capacity}"
+                if status != "running":
+                    code = "33" if count >= capacity else "2"
             stages.append((label, code))
         percentage = int(100 * self.progress())
-        percentage_label = f" {percentage:3d}%"
+        cost = clipped(self.cost_label(), max(0, content_width - 8))
+        percentage_label = f" {cost} · {percentage:3d}%"
         bar_width = max(0, content_width - len(percentage_label))
         filled = int(bar_width * self.progress())
         active = self.statuses.get(self.stage) == "running"
@@ -185,10 +307,12 @@ class ScanDisplay:
                 ("━" * (bar_width - filled), "90"),
                 (percentage_label, "2"),
             ]
+        if self.pipeline:
+            bar = [(f"Pools · {self.execution_count} executions · {self.cost_label()}", "2")]
         failed = any(status == "failed" for status in self.statuses.values())
         active = self.statuses.get(self.stage) == "running"
-        if active or self.stage is None:
-            activity = " · ".join(filter(None, [self.agent, self.phase]))
+        if self.pipeline or active or self.stage is None:
+            activity = " · ".join(filter(None, [self.subject, self.agent, self.phase]))
         elif failed:
             activity = "Finished with errors"
         elif len(self.statuses) == len(self.stages):
@@ -206,7 +330,12 @@ class ScanDisplay:
             (" " * max(0, content_width - len(activity) - len(elapsed)), "2"),
             (elapsed, "2"),
         ]
-        return [top, row(stages), row(bar), row(detail), styled("╰" + "─" * (width - 2) + "╯", "2")]
+        lines = [top, row(stages), row(bar), row(detail)]
+        if self.pipeline:
+            lines.append(
+                row([("Status: ", "1;36"), (self.status_url or "awaiting publication", "36;4")])
+            )
+        return [*lines, styled("╰" + "─" * (width - 2) + "╯", "2")]
 
     def render(self):
         elapsed = int(time.monotonic() - self.started)
@@ -217,6 +346,12 @@ class ScanDisplay:
             lines = self.panel(elapsed)
             self.write("\n".join(lines))
             self.rendered_lines = len(lines)
+        elif self.pipeline:
+            pools = "  ".join(
+                f"{stage} {self.pools.get(stage, 0)}/{self.capacities.get(stage, 0)}"
+                for stage in self.stages
+            )
+            self.write(f"{self.repository} · {pools} · {self.cost_label()} · {self.phase}")
         else:
             filled = int(12 * self.progress())
             bar = "#" * filled + "-" * (12 - filled)
@@ -234,7 +369,9 @@ class ScanDisplay:
                     else ""
                 )
                 labels.append(f"{stage.capitalize()}{marker}{count}")
-            self.write(f"{self.repository} [{bar}] {'  '.join(labels)}  {elapsed}")
+            self.write(
+                f"{self.repository} [{bar}] {'  '.join(labels)}  {self.cost_label()}  {elapsed}"
+            )
 
     def finish(self):
         with self.lock:
@@ -244,7 +381,13 @@ class ScanDisplay:
         if self.repository:
             if self.statuses.get(self.stage) == "running":
                 self.statuses[self.stage] = "failed"
-            self.phase = ""
+            self.phase = (
+                "Stopped"
+                if self.pipeline == "infinite"
+                else "Batch finished"
+                if self.pipeline
+                else ""
+            )
             self.agent = ""
             self.render()
             self.rendered_lines = 0

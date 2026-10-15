@@ -272,6 +272,31 @@ class MeasurementSettings(Settings):
         return value
 
 
+class AutoMergeSettings(Settings):
+    enabled: bool = False
+    required_validations: int = Field(default=2, ge=1, le=10)
+    merge_method: Literal["merge", "squash", "rebase"] = "squash"
+
+
+class RepairSettings(Settings):
+    auto_merge: AutoMergeSettings = Field(default_factory=AutoMergeSettings)
+
+
+class StagePoolSizes(Settings):
+    hunt: int = Field(default=10, ge=0)
+    review: int = Field(default=10, ge=0)
+    audit: int = Field(default=10, ge=0)
+    repair: int = Field(default=3, ge=0)
+    validation: int = Field(default=3, ge=0, alias="validate")
+    integrate: int = Field(default=1, ge=0)
+
+
+class PipelineSettings(Settings):
+    pools: StagePoolSizes = Field(default_factory=StagePoolSizes)
+    poll_seconds: float = Field(default=60, ge=1)
+    retry_seconds: float = Field(default=300, ge=1)
+
+
 class Config(Settings):
     version: Literal[1] = 1
     github: GitHubSettings = Field(default_factory=GitHubSettings)
@@ -279,6 +304,8 @@ class Config(Settings):
     providers: dict[str, ProviderSettings] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
     measurement: MeasurementSettings = Field(default_factory=MeasurementSettings)
+    repair: RepairSettings = Field(default_factory=RepairSettings)
+    pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
 
     @model_validator(mode="before")
     @classmethod
@@ -433,8 +460,18 @@ class Paths:
                     Limits,
                     MeasurementSettings,
                     MeasurementTests,
+                    RepairSettings,
+                    AutoMergeSettings,
+                    PipelineSettings,
+                    StagePoolSizes,
                 )
                 fields = {name for model in models for name in model.model_fields}
+                fields.update(
+                    field.alias
+                    for model in models
+                    for field in model.model_fields.values()
+                    if field.alias
+                )
                 errors = []
                 for error in exc.errors(
                     include_input=False, include_context=False, include_url=False
@@ -453,7 +490,9 @@ class Paths:
 
     def init_config(self):
         self.initialize()
-        data = Config().model_dump(mode="json", exclude_none=True, exclude={"provider"})
+        data = Config().model_dump(
+            mode="json", exclude_none=True, exclude={"provider"}, by_alias=True
+        )
         data["providers"] = {"codex": {"adapter": "codex", "home": "~/.codex"}}
         with self.config.open("x", encoding="utf-8") as stream:
             yaml.safe_dump(data, stream, sort_keys=False)

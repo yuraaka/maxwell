@@ -119,7 +119,12 @@ def test_no_argument_scan_publishes_hunt_review_audit_in_order(automatic, github
     execute(parser().parse_args(["--home", str(home.root), "scan", "--json"]))
     repeated = json.loads(capsys.readouterr().out)
     assert repeated["valid"] and [item["stage"] for item in repeated["scans"]] == ["hunt"]
-    assert {item["stage"] for item in repeated["skipped"]} == {"review", "audit"}
+    assert {item["stage"] for item in repeated["skipped"]} == {
+        "review",
+        "audit",
+        "validate",
+        "integrate",
+    }
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
@@ -239,8 +244,21 @@ def test_pipeline_checks_remaining_stages_on_hunter_failure(automatic, directory
     assert not report["valid"] and [item["stage"] for item in report["scans"]] == ["hunt"]
     if mode == "wait":
         assert "codex agent timed out after 1s" in report["scans"][0]["error"]
-    assert {item["stage"] for item in report["skipped"]} == {"review", "audit"}
-    assert all("No eligible findings" == item["reason"] for item in report["skipped"])
+    assert {item["stage"] for item in report["skipped"]} == {
+        "review",
+        "audit",
+        "validate",
+        "integrate",
+    }
+    assert all(
+        item["reason"]
+        == (
+            "No prepared repair PRs"
+            if item["stage"] in ("validate", "integrate")
+            else "No eligible findings"
+        )
+        for item in report["skipped"]
+    )
     assert not store.rows("SELECT * FROM scans WHERE state='queued'")
 
 
@@ -289,7 +307,7 @@ def test_pipeline_continues_other_jobs_and_stages_after_execution_failure(
         sum(item["state"] == "completed" and item["stage"] == "audit" for item in report["scans"])
         == 2
     )
-    assert not report["skipped"]
+    assert {item["stage"] for item in report["skipped"]} == {"validate", "integrate"}
 
 
 def test_unresolved_hunt_publication_does_not_fail_reviews_or_repost_issue(
@@ -336,7 +354,9 @@ def test_pipeline_respects_admission_limit_and_checks_audit_eligibility(automati
     assert report["scans"][1]["state"] == "failed"
     assert "daily_scan_limit" in report["scans"][1]["error"]
     assert report["skipped"] == [
-        {"repository": "acme/repo", "stage": "audit", "reason": "No eligible findings"}
+        {"repository": "acme/repo", "stage": "audit", "reason": "No eligible findings"},
+        {"repository": "acme/repo", "stage": "validate", "reason": "No prepared repair PRs"},
+        {"repository": "acme/repo", "stage": "integrate", "reason": "No prepared repair PRs"},
     ]
     assert not store.rows("SELECT * FROM scans WHERE state='queued'")
 
@@ -376,7 +396,7 @@ def test_pipeline_reports_context_failure_without_launching_agent(automatic, mon
     assert not report["valid"] and report["scans"] == []
     assert report["errors"] == [
         {"repository": "acme/repo", "stage": stage, "error": "GitHub unavailable"}
-        for stage in ("measure", "hunt", "review", "audit")
+        for stage in ("measure", "hunt", "review", "audit", "validate", "integrate")
     ]
     assert not store.rows("SELECT * FROM scans")
 

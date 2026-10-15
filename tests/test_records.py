@@ -628,6 +628,7 @@ def test_factor_associations_validate_and_keep_legacy_identities_and_digests(rec
     review = assessment(sha, finding_id, run_id)
     for item in (record, review):
         values = item.model_dump(mode="json")
+        values.pop("spending", None)
         if item.type == "finding":
             del values["finding"]["factors"]
         else:
@@ -873,6 +874,8 @@ def test_legacy_execution_digest_survives_optional_selection_metadata(records):
     store, _, _, _, run_id = records
     execution = execution_record(store.one("SELECT * FROM scans WHERE id=?", (run_id,)))
     legacy = execution.model_dump(mode="json")
+    legacy.pop("spending", None)
+    legacy["usage"].pop("spending", None)
     del legacy["agent_selection"]
     expected = hashlib.sha256(
         json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()

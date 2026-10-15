@@ -8,6 +8,12 @@ from typing import Annotated, Literal, get_args
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, create_model, model_validator
 
 DEFAULT_SCAN_CANDIDATES = 100
+CONCISE_OUTPUT = (
+    "Write very concise explanations. Summary: one sentence. Other prose fields: at most two "
+    "short sentences each. Cite decisive path:line evidence and the action needed; omit "
+    "narration, repeated facts, and restating the finding. Aim for at most 120 words of "
+    "explanatory prose per finding or decision, preserving necessary evidence and uncertainty."
+)
 Factor = Literal["complexity", "duplication", "coupling", "test_runtime", "test_flakiness"]
 FACTORS = get_args(Factor)
 
@@ -176,6 +182,23 @@ class AssessmentResult(BaseModel):
     evidence: str = Field(min_length=20, max_length=6000)
 
 
+class Spending(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    micros: int = Field(ge=0)
+    upper_micros: int | None = Field(default=None, ge=0)
+    currency: Literal["USD"] = "USD"
+    source: str = Field(min_length=1, max_length=500)
+    as_of: str | None = None
+    rates: dict[str, float] = Field(default_factory=dict)
+    complete: bool = False
+
+    @model_validator(mode="after")
+    def cost_range(self):
+        if self.upper_micros is not None and self.upper_micros < self.micros:
+            raise ValueError("Upper cost must not be less than the lower estimate")
+        return self
+
+
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     cached_input_tokens: int = Field(default=0, ge=0)
@@ -183,6 +206,7 @@ class Usage(BaseModel):
     output_tokens: int = Field(default=0, ge=0)
     reported: bool = False
     complete: bool = False
+    spending: Spending | None = None
 
 
 def micros(amount) -> int:
@@ -226,3 +250,29 @@ class RepairResult(BaseModel):
     concerns: list[Annotated[str, Field(min_length=1, max_length=1000)]] = Field(
         default_factory=list, max_length=20
     )
+
+
+class ValidationComment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(min_length=1, max_length=500)
+    line: int = Field(ge=1)
+    side: Literal["LEFT", "RIGHT"] = "RIGHT"
+    explanation: str = Field(min_length=20, max_length=2000)
+    suggestion: str | None = Field(default=None, max_length=2000)
+
+
+class ValidationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    verdict: Literal["repaired", "not_repaired", "inconclusive"]
+    summary: str = Field(min_length=1, max_length=2000)
+    evidence: str = Field(min_length=20, max_length=4000)
+    reproduction: Literal["reproduced", "not_reproduced", "unavailable"]
+    regression_evidence: str = Field(min_length=20, max_length=2000)
+    concerns: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=10
+    )
+    notes: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=5
+    )
+
+    comments: list[ValidationComment] = Field(default_factory=list, max_length=20)

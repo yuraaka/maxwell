@@ -121,20 +121,31 @@ def parser():
         commands, "scan", help="Run measure → hunt → review → audit, or select one agent stage"
     )
     scan.add_argument("repository", nargs="?")
+    pipeline = scan.add_mutually_exclusive_group()
+    pipeline.add_argument(
+        "--repair-all",
+        action="store_true",
+        help="Drain existing findings through review, audit, repair, validation and integration",
+    )
+    pipeline.add_argument(
+        "--infinite",
+        action="store_true",
+        help="Continuously hunt and process findings within configured stage pool sizes",
+    )
     scan.add_argument(
         "--stage",
-        choices=["hunt", "review", "audit", "repair"],
-        help="Run only this agent stage (default: measure, hunt, review, audit)",
+        choices=["hunt", "review", "audit", "repair", "validate", "integrate"],
+        help="Run only this agent stage (default: measure, hunt, review, audit, then pending validation/integration)",
     )
     scan.add_argument(
         "--skip-stage",
         action="append",
         default=[],
-        choices=["source", "tests", "hunt", "review", "audit"],
+        choices=["source", "tests", "hunt", "review", "audit", "validate", "integrate"],
         help="Disable a stage; source/tests reuse compatible GitHub history (repeatable)",
     )
     scan.add_argument(
-        "--issue", type=positive_int, help="Finding issue to review, audit, or repair"
+        "--issue", type=positive_int, help="Finding issue to review, audit, repair, or validate"
     )
     scan.add_argument(
         "--limit",
@@ -142,7 +153,9 @@ def parser():
         help="Override the stage's configured assessment limit per repository",
     )
     scan.add_argument(
-        "--force", action="store_true", help="Reassess a finding or retry its prepared repair"
+        "--force",
+        action="store_true",
+        help="Reassess a finding, retry repair, or supersede its validation",
     )
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     scan.add_argument("--model", help="Pin a model (default: automatic sampling)")
@@ -339,6 +352,8 @@ def execute(args):
                     limit=args.limit,
                     force=args.force,
                     skip_stages=args.skip_stage,
+                    repair_all=args.repair_all,
+                    infinite=args.infinite,
                     on_progress=display,
                 )
             )

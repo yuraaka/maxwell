@@ -123,6 +123,24 @@ def test_scan_quota_diagnostics_are_deduplicated(terminal, monkeypatch):
     assert "remaining 0; retry at 15:00 UTC; job retained" in milestones[0]
 
 
+@pytest.mark.parametrize("terminal", [False, True])
+def test_test_names_containing_retry_stay_inside_progress_panel(terminal, monkeypatch):
+    monkeypatch.setenv("TERM", "xterm")
+    stream = io.StringIO()
+    stream.isatty = lambda: terminal
+    display = ScanDisplay(stream)
+    display({"repository": "acme/repo", "state": "plan", "stages": ["validate"]})
+    display({"state": "stage", "stage": "validate", "status": "running"})
+    for test in ("test_formatting_retry", "test_quota_wait_obeys_retry_after"):
+        display(
+            {
+                "state": "progress",
+                "phase": f"test run 1/2 · 2/10 tests · tests/test_provider.py::{test}",
+            }
+        )
+    assert "acme/repo: test run" not in stream.getvalue()
+
+
 def test_scan_summary_groups_failures_and_links_main_status():
     scan = {
         "repository": "acme/repo",
@@ -382,3 +400,62 @@ def test_scan_animation_changes_without_inventing_completed_work(monkeypatch):
     )
     assert display.progress() == 0.09375
     assert "2/4 tests" in "".join(display.panel("0:01"))
+
+
+def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatch):
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("COLUMNS", "100")
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    display = ScanDisplay(stream)
+    stages = ["hunt", "review", "audit", "repair", "validate", "integrate"]
+    display({"repository": "acme/repo", "state": "plan", "stages": stages, "pipeline": "infinite"})
+    display(
+        {
+            "repository": "acme/repo",
+            "state": "pools",
+            "pools": dict.fromkeys(stages, 1),
+            "capacities": dict.fromkeys(stages, 3),
+            "status_url": "https://github.com/acme/repo/issues/4",
+        }
+    )
+    for index in range(100):
+        display({"state": "running", "id": str(index), "model": "model"})
+        display(
+            {
+                "state": "completed",
+                "id": str(index),
+                "executed": 1,
+                "usage": {"spending": {"micros": 1000, "complete": True}},
+            }
+        )
+    display({"state": "progress", "phase": "Waiting: integration pool full; Ctrl+C to stop"})
+    panel = "\n".join(display.panel("2:00"))
+    assert "continuous" in panel and "Int 1/3" in panel
+    assert "100 executions" in panel and "$0.1000 USD" in panel
+    assert "100%" not in panel and "integration pool full" in panel
+    assert "https://github.com/acme/repo/issues/4" in panel
+    assert not display.spending
+
+
+def test_batch_summary_uses_dashboard_without_per_execution_link_wall():
+    result = {
+        "pipeline": "repair-all",
+        "scans": [{"report": "/private/report.md"}],
+        "pipeline_repositories": [
+            {
+                "repository": "acme/repo",
+                "executions": {"repair": 8, "validate": 16},
+                "closed": 8,
+                "rejected": 2,
+                "remaining": 1,
+                "failed": 0,
+                "waiting": ["GitHub checks pending"],
+            }
+        ],
+        "statuses": [{"repository": "acme/repo", "url": "https://github.com/acme/repo/issues/4"}],
+    }
+    text = "\n".join(human_lines(result, "scan"))
+    assert "8 closed" in text and "1 remaining" in text
+    assert "GitHub checks pending" in text and "issues/4" in text
+    assert "/private/report" not in text and "Repair PR:" not in text

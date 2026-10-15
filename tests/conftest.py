@@ -114,6 +114,9 @@ if mode != 'unknown':
 @pytest.fixture
 def github():
     state = {
+        "pulls": {},
+        "branches": {},
+        "reviews": {},
         "issues": {},
         "comments": {},
         "labels": {},
@@ -123,6 +126,13 @@ def github():
         "requests": [],
         "unchanged_reads": 0,
         "tokens": {},
+        "protection": {
+            "required_status_checks": {"strict": True, "contexts": ["tests"]},
+            "enforce_admins": {"enabled": True},
+        },
+        "statuses": [{"context": "tests", "state": "success"}],
+        "check_runs": [],
+        "merges": [],
     }
     lock = threading.Lock()
 
@@ -173,6 +183,28 @@ def github():
                         "full_name": "/".join(parts[1:3]),
                         "default_branch": state.get("default_branch", "main"),
                     }
+                elif len(parts) == 6 and parts[-1] == "protection":
+                    if state["protection"] is None:
+                        return self.respond(404, {"message": "Branch not protected"})
+                    data = state["protection"]
+                elif len(parts) == 6 and parts[-1] == "status":
+                    data = {"statuses": state["statuses"]}
+                elif len(parts) == 6 and parts[-1] == "check-runs":
+                    offset = (page - 1) * 100
+                    data = {"check_runs": state["check_runs"][offset : offset + 100]}
+                elif len(parts) == 5 and parts[-2] == "commits":
+                    data = {"sha": state["branches"][parts[-1]]}
+                elif len(parts) == 4 and parts[-1] == "pulls":
+                    head = parse_qs(parsed.query).get("head", [""])[0].split(":")[-1]
+                    data = (
+                        [pull for pull in state["pulls"].values() if pull["head"]["ref"] == head]
+                        if page == 1
+                        else []
+                    )
+                elif len(parts) == 5 and parts[-2] == "pulls":
+                    data = state["pulls"][int(parts[-1])]
+                elif len(parts) == 6 and parts[-1] == "reviews":
+                    data = state["reviews"].get(int(parts[-2]), []) if page == 1 else []
                 elif len(parts) == 4 and parts[-1] == "issues":
                     data = (
                         [
@@ -199,7 +231,50 @@ def github():
             data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             parts = urlparse(self.path).path.strip("/").split("/")
             with lock:
-                if parts[-1] == "labels":
+                if parts == ["graphql"]:
+                    number = int(data["variables"]["id"].split("-")[-1])
+                    state["pulls"][number]["draft"] = "convertPullRequestToDraft" in data["query"]
+                    self.respond(200, {"data": {"ok": True}})
+                elif parts[-1] == "pulls":
+                    number = len(state["issues"]) + 1
+                    repo = "/".join(parts[1:3])
+                    data.update(
+                        number=number,
+                        node_id=f"pr-{number}",
+                        _repo=repo,
+                        user={"login": "maintainer"},
+                        state="open",
+                        merged=False,
+                        merge_commit_sha=None,
+                        mergeable=True,
+                        mergeable_state="clean",
+                        html_url=f"https://github.invalid/{repo}/pull/{number}",
+                        labels=[],
+                        pull_request={},
+                        head={
+                            "ref": data["head"],
+                            "sha": state["branches"][data["head"]],
+                            "repo": {"full_name": repo},
+                        },
+                        base={
+                            "ref": data["base"],
+                            "sha": state["branches"][data["base"]],
+                            "repo": {"full_name": repo},
+                        },
+                    )
+                    state["pulls"][number] = data
+                    state["issues"][number] = data
+                    if state.get("drop_pull"):
+                        state["drop_pull"] = False
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
+                    self.respond(201, data)
+                elif parts[-1] == "reviews":
+                    data.update(id=state["comment_id"] + 1, user={"login": "maintainer"})
+                    state["reviews"].setdefault(int(parts[-2]), []).append(data)
+                    self.respond(201, data)
+                elif parts[-1] == "labels":
                     existing = data["name"] in state["labels"]
                     state["labels"][data["name"]] = data
                     self.respond(422 if existing else 201, data)
@@ -228,6 +303,30 @@ def github():
                     self.respond(201, data)
                 else:
                     self.respond(404, {})
+
+        def do_PUT(self):
+            if not self.authorized():
+                return
+            data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            parts = urlparse(self.path).path.strip("/").split("/")
+            if parts[-1] != "merge":
+                return self.respond(404, {})
+            with lock:
+                pull = state["pulls"][int(parts[-2])]
+                state["merges"].append(data)
+                if data["sha"] != pull["head"]["sha"]:
+                    return self.respond(409, {"message": "Head changed"})
+                if state.get("merge_error"):
+                    return self.respond(state["merge_error"], {"message": "Merge blocked"})
+                if not state.get("drop_unmerged") and not state.get("report_merge_only"):
+                    pull.update(state="closed", merged=True, merge_commit_sha=data["sha"])
+                    state["branches"][pull["base"]["ref"]] = data["sha"]
+                if state.get("drop_merge") or state.get("drop_unmerged"):
+                    state["drop_merge"] = state["drop_unmerged"] = False
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.connection.close()
+                    return
+                self.respond(200, {"merged": True, "sha": data["sha"]})
 
         def do_DELETE(self):
             if not self.authorized():

@@ -7,12 +7,15 @@ from datetime import UTC, datetime
 from maxwell.records import (
     RECORD_ADAPTER,
     AssessmentRecord,
+    IntegrationRecord,
+    RepairPullRequestRecord,
     RepairRecord,
     StageExecution,
+    ValidationRecord,
     record_digest,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 
 
 class Store:
@@ -52,6 +55,22 @@ class Store:
             CREATE TABLE IF NOT EXISTS histories (
                 repository TEXT PRIMARY KEY, issue INTEGER, url TEXT,
                 state TEXT NOT NULL DEFAULT 'pending', error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS repair_publications (
+                repository TEXT NOT NULL, repair_id TEXT NOT NULL, finding_issue INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', number INTEGER, data TEXT, error TEXT,
+                PRIMARY KEY(repository,repair_id)
+            );
+            CREATE TABLE IF NOT EXISTS pr_actions (
+                repository TEXT NOT NULL, id TEXT NOT NULL, action TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', error TEXT,
+                PRIMARY KEY(repository,id,action)
+            );
+            CREATE TABLE IF NOT EXISTS pipeline_attempts (
+                repository TEXT NOT NULL REFERENCES repositories(name),
+                stage TEXT NOT NULL, subject TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                attempted REAL NOT NULL, state TEXT NOT NULL, error TEXT,
+                PRIMARY KEY(repository,stage,subject,fingerprint)
             );
             CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS events (
@@ -165,6 +184,125 @@ class Store:
                 raise ValueError("A GitHub source cannot change record identity")
             if existing and (existing["issue"], existing["comment"]) != (issue, comment):
                 raise ValueError("Record identity already belongs to another GitHub source")
+            if isinstance(record, RepairPullRequestRecord):
+                repair_row = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='repair' AND id=? AND status='current'",
+                    (record.repository, issue, record.repair_id),
+                )
+                if not repair_row or issue != record.finding_issue:
+                    raise ValueError("PR association requires its repair on the finding issue")
+                if record.previous_id:
+                    prior_row = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND id=? AND status='current'",
+                        (record.repository, record.previous_id),
+                    )
+                    if not prior_row:
+                        raise ValueError("PR revision predecessor is missing")
+                    prior = RECORD_ADAPTER.validate_json(prior_row["data"])
+                    if (
+                        prior.number,
+                        prior.finding_id,
+                        prior.finding_issue,
+                        prior.branch,
+                        prior.base_branch,
+                    ) != (
+                        record.number,
+                        record.finding_id,
+                        record.finding_issue,
+                        record.branch,
+                        record.base_branch,
+                    ):
+                        raise ValueError("PR revision predecessor belongs to a different PR")
+                repair = RECORD_ADAPTER.validate_json(repair_row["data"])
+                if (
+                    repair.finding_id != record.finding_id
+                    or repair.sha != record.sha
+                    or repair.branch != record.branch
+                    or (record.provenance == "fixer" and repair.commit != record.head_sha)
+                ):
+                    raise ValueError("PR association does not match its repair")
+            if isinstance(record, ValidationRecord):
+                subject_issue = issue
+                association = None
+                if record.pr_id:
+                    link = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND id=? AND status='current'",
+                        (record.repository, record.pr_id),
+                    )
+                    if not link:
+                        raise ValueError("Validation requires its PR association")
+                    association = RECORD_ADAPTER.validate_json(link["data"])
+                    subject_issue = association.finding_issue
+                    if not isinstance(record, IntegrationRecord) and record.sha != record.pr_head:
+                        raise ValueError("PR validation must identify its exact head revision")
+                    if (
+                        association.number != issue
+                        or association.repair_id != record.repair_id
+                        or association.finding_id != record.finding_id
+                        or association.head_sha != record.pr_head
+                        or association.base_sha != record.pr_base
+                    ):
+                        raise ValueError("Validation belongs to a different PR revision")
+                repair_row = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='repair' AND id=? AND status='current'",
+                    (record.repository, subject_issue, record.repair_id),
+                )
+                if not repair_row:
+                    raise ValueError("Validation requires its current repair record")
+                repair = RECORD_ADAPTER.validate_json(repair_row["data"])
+                if (
+                    repair.finding_id != record.finding_id
+                    or repair.sha != record.base_sha
+                    or (not association and repair.commit != record.sha)
+                    or repair.outcome != "prepared"
+                    or set(repair.references) != set(record.references)
+                    or (repair.agent.adapter, repair.agent.model)
+                    == (record.agent.adapter, record.agent.model)
+                ):
+                    raise ValueError(
+                        "Validation provenance or independent agent does not match repair"
+                    )
+                finding_row = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='finding' AND status='current'",
+                    (record.repository, subject_issue),
+                )
+                if not finding_row:
+                    raise ValueError("Validation requires its current finding")
+                subject = RECORD_ADAPTER.validate_json(finding_row["data"])
+                if subject.id != record.finding_id or subject.sha != record.base_sha:
+                    raise ValueError("Validation targets a different finding or revision")
+                if (
+                    record.outcome == "accepted"
+                    and subject.finding.kind == "bug"
+                    and (
+                        not record.replay
+                        or record.replay.state != "failed"
+                        or record.replay.returncode != 1
+                        or not record.failures
+                        or any(item.get("phase") != "call" for item in record.failures)
+                        or record.result.reproduction != "reproduced"
+                    )
+                ):
+                    raise ValueError(
+                        "Accepted bug validation requires original-defect reproduction"
+                    )
+                for reference in record.supersedes:
+                    previous = self.one(
+                        "SELECT issue,data FROM github_records WHERE repository=? AND type=? AND id=?",
+                        (record.repository, record.type, reference),
+                    )
+                    if not previous:
+                        raise ValueError("Superseded validation is missing")
+                    prior = RECORD_ADAPTER.validate_json(previous["data"])
+                    if (
+                        previous["issue"] != issue
+                        or prior.repair_id != record.repair_id
+                        or prior.sha != record.sha
+                        or prior.pr_id != record.pr_id
+                        or prior.pr_head != record.pr_head
+                        or prior.pr_base != record.pr_base
+                    ):
+                        raise ValueError("Validation supersedes a different repair")
             if isinstance(record, RepairRecord):
                 finding = self.one(
                     "SELECT data FROM github_records WHERE repository=? AND issue=? "
@@ -173,10 +311,24 @@ class Store:
                 )
                 if not finding:
                     raise ValueError("Repair requires its current finding record")
+                if record.previous_id:
+                    prior_row = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='repair' AND id=? AND status='current'",
+                        (record.repository, issue, record.previous_id),
+                    )
+                    if not prior_row:
+                        raise ValueError("Repair amendment predecessor is missing")
+                    prior = RECORD_ADAPTER.validate_json(prior_row["data"])
+                    if (
+                        prior.branch != record.branch
+                        or (prior.lineage_id or prior.execution_id) != record.lineage_id
+                        or prior.finding_id != record.finding_id
+                    ):
+                        raise ValueError("Repair amendment belongs to a different lineage")
                 subject = RECORD_ADAPTER.validate_json(finding["data"])
                 if subject.id != record.finding_id or subject.sha != record.sha:
                     raise ValueError("Repair targets a different finding or revision")
-            if isinstance(record, (AssessmentRecord, RepairRecord)):
+            if isinstance(record, (AssessmentRecord, RepairRecord, ValidationRecord)):
                 for reference in [
                     *record.references,
                     *(
@@ -189,11 +341,12 @@ class Store:
                         "SELECT data FROM github_records WHERE repository=? AND type='assessment' AND id=?",
                         (record.repository, reference),
                     )
+                    if not target and isinstance(record, ValidationRecord):
+                        raise ValueError("Validation assessment reference is missing")
                     if target:
                         assessment = RECORD_ADAPTER.validate_json(target["data"])
-                        if (
-                            assessment.finding_id != record.finding_id
-                            or assessment.sha != record.sha
+                        if assessment.finding_id != record.finding_id or assessment.sha != (
+                            record.base_sha if isinstance(record, ValidationRecord) else record.sha
                         ):
                             raise ValueError(
                                 "Assessment references a different finding or revision"
@@ -250,11 +403,22 @@ class Store:
         record = RECORD_ADAPTER.validate_python(record)
         if record.type == "finding":
             raise ValueError("Findings are published as issues, not comments")
-        if isinstance(record, (AssessmentRecord, RepairRecord)):
+        if isinstance(
+            record, (AssessmentRecord, RepairRecord, ValidationRecord, RepairPullRequestRecord)
+        ):
+            destination = issue
+            if isinstance(record, ValidationRecord) and record.pr_id:
+                link = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND id=? AND status='current'",
+                    (record.repository, record.pr_id),
+                )
+                if not link or RECORD_ADAPTER.validate_json(link["data"]).number != issue:
+                    raise ValueError("Validation must be published on its associated PR")
+                destination = RECORD_ADAPTER.validate_json(link["data"]).finding_issue
             finding = self.one(
                 "SELECT id FROM findings WHERE repository=? AND issue=? "
                 "UNION SELECT id FROM github_records WHERE repository=? AND issue=? AND type='finding'",
-                (record.repository, issue, record.repository, issue),
+                (record.repository, destination, record.repository, destination),
             )
             if not finding or finding["id"] != record.finding_id:
                 raise ValueError("Assessment or repair must be published on its finding issue")
@@ -514,18 +678,31 @@ class Store:
 
     def admission_blockers(self, identifier, daily_limit, reservation, queue_max, daily_scan_limit):
         job = self.one("SELECT repository,accounting,stage FROM scans WHERE id=?", (identifier,))
+        return self.execution_blockers(
+            job["repository"],
+            job["stage"],
+            job["accounting"],
+            daily_limit,
+            reservation,
+            queue_max,
+            daily_scan_limit,
+        )
+
+    def execution_blockers(
+        self, repository, stage, accounting, daily_limit, reservation, queue_max, daily_scan_limit
+    ):
         pending = self.one(
             "SELECT COUNT(*) AS n FROM findings WHERE repository=? "
             "AND state NOT IN ('closed','confirmed','rejected')",
-            (job["repository"],),
+            (repository,),
         )["n"]
         reasons = []
-        if job["stage"] == "discovery" and pending >= queue_max:
+        if stage == "discovery" and pending >= queue_max:
             reasons.append(
                 f"Human review queue is full: {pending}/{queue_max} unresolved findings. "
                 "Close reviewed finding issues on GitHub, or increase limits.human_queue_max"
             )
-        if job["accounting"] == "usd":
+        if accounting == "usd":
             if self.committed_today() + reservation > daily_limit:
                 reasons.append(
                     "Daily budget cannot cover another scan reservation. "
@@ -622,6 +799,7 @@ class Store:
             if current != {"state": "running", "lease": job["lease"]}:
                 raise ValueError("Stale scan result")
             for record, issue in publications:
+                record = record.model_copy(update={"spending": usage.spending})
                 self._queue_record(record, issue)
             admitted = []
             for finding in findings:

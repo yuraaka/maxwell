@@ -88,26 +88,30 @@ def test_profile(worktree, settings, repository, checkout=None):
     ), "auto-detected pytest (2 runs; no warmup)"
 
 
+def recover_test_process(artifact):
+    try:
+        process = json.loads((artifact / "process.json").read_text())
+        pid = int(process["pid"])
+        args = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        if (
+            str(artifact) in process["report"]
+            and process["report"] in args
+            and os.getpgid(pid) == pid
+        ):
+            os.killpg(pid, signal.SIGKILL)
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        pass
+
+
 def recover_measurements(store, paths):
     for row in store.rows("SELECT * FROM measurements WHERE state='running'"):
         artifact = paths.root / "artifacts" / row["id"]
-        try:
-            process = json.loads((artifact / "process.json").read_text())
-            pid = int(process["pid"])
-            args = subprocess.run(
-                ["ps", "-ww", "-p", str(pid), "-o", "args="],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            ).stdout
-            if (
-                str(artifact) in process["report"]
-                and process["report"] in args
-                and os.getpgid(pid) == pid
-            ):
-                os.killpg(pid, signal.SIGKILL)
-        except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
-            pass
+        recover_test_process(artifact)
         repository = Repository(paths, store.repository(row["repository"]))
         for worktree in repository.worktrees.glob(row["id"] + "*"):
             repository.cleanup(worktree)

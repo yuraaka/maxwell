@@ -295,7 +295,7 @@ def test_invalid_stage_cli_options_are_rejected(options):
 
 @pytest.mark.parametrize("options", [["--issue", "1"], ["--limit", "2"], ["--force"]])
 def test_hunt_rejects_assessment_options(home, options):
-    with pytest.raises(ValueError, match="explicit review, audit, or repair only"):
+    with pytest.raises(ValueError, match="explicit review, audit, repair, or validate only"):
         execute(
             parser().parse_args(
                 ["--home", str(home.root), "scan", "--model", "fake-model", *options]

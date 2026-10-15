@@ -1209,7 +1209,7 @@ def test_legacy_routes_are_removed_without_changing_execution_history(home, nati
     assert report["valid"], report
     migrated = Store(home.db)
     try:
-        assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert migrated.db.execute("PRAGMA user_version").fetchone()[0] == 13
         assert not migrated.one(
             "SELECT name FROM sqlite_master WHERE name='repository_stage_routes'"
         )

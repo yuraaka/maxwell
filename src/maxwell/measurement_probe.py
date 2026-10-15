@@ -11,6 +11,9 @@ import pytest
 
 collected = []
 outcomes = {}
+failures = []
+failed_phases = 0
+noncall_failures = 0
 durations = {}
 collection_errors = 0
 progress_path = None
@@ -67,10 +70,20 @@ def pytest_collectreport(report):
 
 
 def pytest_runtest_logreport(report):
-    global completed_tests, current_test
+    global completed_tests, current_test, failed_phases, noncall_failures
     durations[report.nodeid] = durations.get(report.nodeid, 0) + report.duration
     current = outcomes.get(report.nodeid)
     if report.failed:
+        failed_phases += 1
+        noncall_failures += report.when != "call"
+        if len(failures) < 50:
+            failures.append(
+                {
+                    "test": report.nodeid,
+                    "phase": report.when,
+                    "detail": str(report.longrepr)[-4000:],
+                }
+            )
         outcomes[report.nodeid] = "failed"
     elif current != "failed" and (report.skipped or hasattr(report, "wasxfail")):
         outcomes[report.nodeid] = "skipped"
@@ -100,6 +113,9 @@ def pytest_sessionfinish(session, exitstatus):
         json.dumps(
             {
                 "collected": collected,
+                "failures": failures,
+                "failed_phases": failed_phases,
+                "noncall_failures": noncall_failures,
                 "outcomes": outcomes,
                 "durations": durations,
                 "collection_errors": collection_errors,

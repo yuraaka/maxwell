@@ -14,10 +14,21 @@ from maxwell.progress import ScanProgress
 from maxwell.repair import collect_repair_targets
 from maxwell.reporting import Reporter
 from maxwell.store import Store
+from maxwell.validation import collect_validation_targets
 
 
 async def execute_job(
-    paths, config, store, engine, record, execution, *, stage, priority, on_progress
+    paths,
+    config,
+    store,
+    engine,
+    record,
+    execution,
+    *,
+    stage,
+    priority,
+    on_progress,
+    merge_issues=None,
 ):
     task = asyncio.current_task()
     pending = store.one(
@@ -91,7 +102,7 @@ async def execute_job(
         )
         try:
             async with progress.watch():
-                await Reporter(store, client, config, paths).sync(
+                await Reporter(store, client, config, paths, merge_issues=merge_issues).sync(
                     repository=record["name"], process_commands=False
                 )
         except Exception as exc:
@@ -134,6 +145,7 @@ async def execute_job(
             "summary",
             "error",
             "admitted",
+            "executed",
         )
     }
     result.update(
@@ -150,6 +162,23 @@ async def execute_job(
             "JOIN finding_observations o ON o.finding_id=f.id WHERE o.scan_id=?",
             (identifier,),
         ),
+        validations=[
+            {**json.loads(row["data"]), "issue": row["issue"], "publication_state": row["state"]}
+            for row in store.rows(
+                "SELECT data,issue,state FROM record_publications WHERE repository=? "
+                "AND type IN ('validation','integration') AND json_extract(data,'$.execution_id')=?",
+                (record["name"], identifier),
+            )
+        ],
+        pull_requests=[
+            json.loads(row["data"])
+            for row in store.rows(
+                "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND status='current' "
+                "AND (json_extract(data,'$.repair_id') IN (SELECT id FROM record_publications WHERE repository=? AND type='repair' AND json_extract(data,'$.execution_id')=?) "
+                "OR id IN (SELECT json_extract(data,'$.pr_id') FROM record_publications WHERE repository=? AND type IN ('validation','integration') AND json_extract(data,'$.execution_id')=?))",
+                (record["name"], record["name"], identifier, record["name"], identifier),
+            )
+        ],
         repairs=[
             {**json.loads(row["data"]), "issue": row["issue"], "publication_state": row["state"]}
             for row in store.rows(
@@ -177,6 +206,9 @@ async def execute_job(
 
 
 def independent_agents(target):
+    if target and hasattr(target, "repair"):
+        agents = [target.repair.agent, *getattr(target, "validator_agents", [])]
+        return {(agent.adapter, agent.model) for agent in agents}
     agents = [target.finding.agent, *(review.agent for review in target.reviews)] if target else []
     return {(agent.adapter, agent.model) for agent in agents if agent}
 
@@ -196,20 +228,36 @@ async def run_scans(
     force=False,
     on_progress=None,
     skip_stages=(),
+    repair_all=False,
+    infinite=False,
 ):
-    if stage not in (None, "hunt", "review", "audit", "repair"):
-        raise ValueError("Stage must be hunt, review, audit, or repair")
+    if repair_all and infinite:
+        raise ValueError("Choose either --repair-all or --infinite")
+    if (repair_all or infinite) and (
+        stage is not None or issue is not None or limit is not None or force or skip_stages
+    ):
+        raise ValueError(
+            "--repair-all/--infinite cannot be combined with --stage, --issue, --limit, --force, or --skip-stage"
+        )
+    if (repair_all or infinite) and model is not None:
+        raise ValueError(
+            "--repair-all/--infinite require automatic model selection for independent validation; omit --model"
+        )
+    if stage not in (None, "hunt", "review", "audit", "repair", "validate", "integrate"):
+        raise ValueError("Stage must be hunt, review, audit, repair, validate, or integrate")
     if stage in (None, "hunt") and (issue is not None or limit is not None or force):
         raise ValueError(
-            "--issue, --limit, and --force apply to an explicit review, audit, or repair only"
+            "--issue, --limit, and --force apply to an explicit review, audit, repair, or validate only"
         )
-    if stage == "repair" and limit is not None:
-        raise ValueError("Repair handles one finding per run; --limit is not supported")
+    if stage in ("repair", "validate", "integrate") and limit is not None:
+        raise ValueError(
+            "Repair and validation handle one finding per run; --limit is not supported"
+        )
     if issue is not None and repository is None:
         raise ValueError("--issue requires a repository")
     if (issue is not None and issue < 1) or (limit is not None and limit < 1):
         raise ValueError("--issue and --limit must be positive integers")
-    if set(skip_stages) - {"source", "tests", "hunt", "review", "audit"}:
+    if set(skip_stages) - {"source", "tests", "hunt", "review", "audit", "validate", "integrate"}:
         raise ValueError("Unknown skipped stage")
     if stage is not None and skip_stages:
         raise ValueError("--skip-stage applies to the full scan; use --stage for one agent stage")
@@ -247,10 +295,25 @@ async def run_scans(
                     )
             engine.recover()
             recover_measurements(store, paths)
+            if repair_all or infinite:
+                from maxwell.pipeline import run_pipeline
+
+                return await run_pipeline(
+                    paths,
+                    config,
+                    store,
+                    engine,
+                    records,
+                    selector,
+                    infinite=infinite,
+                    priority=priority,
+                    on_progress=on_progress,
+                    execute=execute_job,
+                )
             results, skipped, errors, measurements = [], [], [], []
-            stages = (stage,) if stage else ("hunt", "review", "audit")
+            stages = (stage,) if stage else ("hunt", "review", "audit", "validate", "integrate")
             for record in records:
-                if stage == "repair" and results:
+                if stage in ("repair", "validate", "integrate") and results:
                     break
 
                 def stage_event(current_stage, status, **details):
@@ -338,6 +401,7 @@ async def run_scans(
                             continue
                         stage_event(current_stage, "running")
                         stage_results = []
+                        skip_reasons = []
                         try:
                             if current_stage == "hunt":
                                 targets = [None]
@@ -350,15 +414,21 @@ async def run_scans(
                                 client.on_status = preparation.update
                                 async with preparation.watch():
                                     collector = (
-                                        collect_repair_targets
+                                        collect_validation_targets
+                                        if current_stage in ("validate", "integrate")
+                                        else collect_repair_targets
                                         if current_stage == "repair"
                                         else collect_targets
                                     )
                                     arguments = (
                                         {}
-                                        if current_stage == "repair"
+                                        if current_stage in ("repair", "validate", "integrate")
                                         else {"stage": current_stage}
                                     )
+                                    if current_stage == "integrate":
+                                        arguments["integrate"] = True
+                                    if current_stage in ("validate", "integrate"):
+                                        arguments["diagnostics"] = skip_reasons
                                     targets = await collector(
                                         reporter,
                                         record["name"],
@@ -371,6 +441,8 @@ async def run_scans(
                                     if current_stage == "review"
                                     else config.limits.max_audits_per_scan
                                 )
+                                if current_stage in ("repair", "validate", "integrate"):
+                                    configured_limit = 1
                                 targets = targets[
                                     : limit if limit is not None else configured_limit
                                 ]
@@ -379,7 +451,16 @@ async def run_scans(
                                         {
                                             "repository": record["name"],
                                             "stage": current_stage,
-                                            "reason": "No eligible findings",
+                                            "reason": config.redact(
+                                                "; ".join(skip_reasons[:3])
+                                                + (
+                                                    f" (+{len(skip_reasons) - 3} more)"
+                                                    if len(skip_reasons) > 3
+                                                    else ""
+                                                )
+                                            )
+                                            if skip_reasons
+                                            else "No eligible findings",
                                         }
                                     )
                             if on_progress:
@@ -408,6 +489,13 @@ async def run_scans(
                                     current_stage,
                                     avoid=independent_agents(target),
                                 )
+                                if (
+                                    current_stage in ("validate", "integrate")
+                                    and decision["independence"] != "different_model"
+                                ):
+                                    raise ValueError(
+                                        "Independent validation requires a different public adapter/model from the fixer and previous validators; select another model"
+                                    )
                                 execution = {
                                     **config.execution(route, record),
                                     "agent_selection": decision,
@@ -429,6 +517,26 @@ async def run_scans(
                                 )
                                 results.append(result)
                                 stage_results.append(result)
+                                if (
+                                    current_stage == "validate"
+                                    and config.repair.auto_merge.enabled
+                                    and not selector.explicit
+                                    and result["state"] == "completed"
+                                    and not result["publication_errors"]
+                                    and len(stage_results)
+                                    < config.repair.auto_merge.required_validations
+                                    and any(
+                                        item["outcome"] == "accepted"
+                                        for item in result["validations"]
+                                    )
+                                ):
+                                    following = await collect_validation_targets(
+                                        reporter,
+                                        record["name"],
+                                        issue=target.issue,
+                                        missing_ok=True,
+                                    )
+                                    targets.extend(following)
                                 if on_progress:
                                     on_progress(
                                         {

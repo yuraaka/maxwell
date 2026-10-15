@@ -69,10 +69,17 @@ print(json.dumps(result))
 
 def test_missing_output_is_corrected_once_without_source_tools(formatting_cli, source):
     provider, artifact = formatting_cli
+    usage_events = []
+    provider.on_usage = usage_events.append
     result = asyncio.run(provider.assess(source, artifact, "Audit the finding.", lambda pid: None))
     assert result.verdict == "supported"
     assert provider.usage.input_tokens == 200 and provider.usage.output_tokens == 20
     assert provider.usage.reported and provider.usage.complete
+    assert provider.usage.spending is not None and provider.usage.spending.complete
+    assert provider.usage.spending.micros == 560
+    costs = [usage.spending.micros if usage.spending else 0 for usage in usage_events]
+    assert costs == sorted(costs) and costs[-1] == 560
+    assert usage_events[-1].input_tokens == 200 and usage_events[-1].complete
     original = json.loads((artifact / "observed.json").read_text())
     retry = json.loads((artifact / "format-retry/observed.json").read_text())
     assert original["args"][original["args"].index("--tools") + 1] == "Read,Grep,Glob"
@@ -88,6 +95,7 @@ def test_repeated_missing_output_stops_with_artifacts(formatting_cli, source, di
     with pytest.raises(ValueError, match="formatting retry.*artifacts"):
         asyncio.run(provider.assess(source, artifact, "Audit the finding.", lambda pid: None))
     assert provider.usage.input_tokens == 200
+    assert provider.usage.spending.micros == 560
     assert (artifact / "events.jsonl").exists() and (
         artifact / "format-retry/events.jsonl"
     ).exists()

@@ -6,12 +6,15 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from maxwell.contracts import (
+    CONCISE_OUTPUT,
     DEFAULT_SCAN_CANDIDATES,
     AssessmentResult,
     RepairResult,
     ScanResult,
     Usage,
+    ValidationResult,
 )
+from maxwell.pricing import combine_spending, price_usage, reported_spending
 from maxwell.provider_runtime import codex_connection_overrides, redact, runtime_environment
 from maxwell.repositories import terminate
 
@@ -48,6 +51,28 @@ class CLIProvider:
         self.started = False
         self.secrets = []
         self.errors = []
+        self.on_usage = None
+        self.prior_usage = None
+        self.last_usage_event = None
+
+    def emit_usage(self):
+        if self.on_usage:
+            usage = self.usage.model_copy(deep=True)
+            if self.prior_usage:
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_write_tokens",
+                    "output_tokens",
+                ):
+                    setattr(usage, key, getattr(usage, key) + getattr(self.prior_usage, key))
+                usage.reported = self.prior_usage.reported or usage.reported
+                usage.complete = self.prior_usage.complete and usage.complete
+                usage.spending = combine_spending(self.prior_usage.spending, usage.spending)
+            snapshot = usage.model_dump()
+            if snapshot != self.last_usage_event:
+                self.last_usage_event = snapshot
+                self.on_usage(usage)
 
     def redact(self, text):
         return redact(text, self.config, self.secrets)
@@ -86,6 +111,9 @@ class CLIProvider:
         return await self.run(
             workspace, artifact, prompt, on_start, result_type=RepairResult, writable=True
         )
+
+    async def validate(self, workspace, artifact, prompt, on_start):
+        return await self.run(workspace, artifact, prompt, on_start, result_type=ValidationResult)
 
     async def probe(self, workspace, artifact):
         try:
@@ -190,6 +218,7 @@ class CLIProvider:
                                     self.errors.append(self.redact(message)[:2000])
                                     self.errors = self.errors[-3:]
                             self.event(event)
+                            self.emit_usage()
                         except (ValueError, TypeError):
                             continue
 
@@ -234,6 +263,11 @@ class CLIProvider:
             await asyncio.gather(*tasks, return_exceptions=True)
             if result_file.exists() and result_file.stat().st_size <= MAX_RESULT_BYTES:
                 result_file.write_text(self.redact(result_file.read_text(errors="replace")))
+            if self.usage.spending:
+                self.usage.spending = self.usage.spending.model_copy(
+                    update={"complete": self.usage.complete}
+                )
+            self.emit_usage()
 
     def write_result(self, result_file):
         pass
@@ -286,8 +320,20 @@ class CodexProvider(CLIProvider):
     def event(self, event):
         if event.get("type") == "turn.completed" and "usage" in event:
             usage = event["usage"]
+            turn = Usage(
+                input_tokens=max(0, int(usage.get("input_tokens", 0))),
+                cached_input_tokens=max(0, int(usage.get("cached_input_tokens", 0))),
+                cache_write_tokens=max(0, int(usage.get("cache_write_tokens", 0))),
+                output_tokens=max(0, int(usage.get("output_tokens", 0))),
+                reported=True,
+            )
+            spending = price_usage(turn, self.config.provider)
+            self.usage.spending = (
+                combine_spending(self.usage.spending, spending) if self.usage.reported else spending
+            )
             self.usage.input_tokens += max(0, int(usage.get("input_tokens", 0)))
             self.usage.cached_input_tokens += max(0, int(usage.get("cached_input_tokens", 0)))
+            self.usage.cache_write_tokens += turn.cache_write_tokens
             self.usage.output_tokens += max(0, int(usage.get("output_tokens", 0)))
             self.usage.reported = True
 
@@ -333,6 +379,7 @@ class ClaudeProvider(CLIProvider):
             if probing or remaining <= 0:
                 raise
             prior = self.usage.model_copy()
+            self.prior_usage = prior
             texts = self.output_texts or [self.redact(self.result.get("result") or "")]
             if not any(text.strip() for text in texts):
                 raise MissingStructuredOutput(
@@ -385,7 +432,10 @@ class ClaudeProvider(CLIProvider):
                     output_tokens=prior.output_tokens + current.output_tokens,
                     reported=prior.reported or current.reported,
                     complete=prior.complete and current.complete,
+                    spending=combine_spending(prior.spending, current.spending),
                 )
+                self.prior_usage = None
+                self.emit_usage()
 
     def arguments(self, workspace, artifact, schema, native, *, writable=False):
         settings_file = artifact / "settings.json"
@@ -452,6 +502,11 @@ class ClaudeProvider(CLIProvider):
             self.usage.cache_write_tokens = written
             self.usage.output_tokens = max(0, int(usage.get("output_tokens", 0)))
             self.usage.reported = True
+        self.usage.spending = (
+            price_usage(self.usage, self.config.provider)
+            if self.config.provider.input_usd_per_mtok is not None
+            else reported_spending(event.get("total_cost_usd"))
+        )
 
     def write_result(self, result_file):
         if not self.result or self.result.get("is_error"):
@@ -489,6 +544,7 @@ validation, error recovery, asynchronous cancellation and resource cleanup, secu
 and duplication or documentation defects. Finish with a cross-component review.
 Do not stop after finding {limit} issues: that is Maxwell's publication limit, not your discovery target.
 Return all supported distinct candidates you find, up to {candidate_limit}, using the supplied schema.
+{CONCISE_OUTPUT}
 Maxwell ranks and selects the top {limit} new findings after confidence filtering and deduplication.
 Do not invent findings to fill the candidate limit. This heuristic does not prove exhaustive coverage.
 Use repository-relative paths and real source line numbers. Cite concrete source evidence.

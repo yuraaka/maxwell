@@ -240,7 +240,7 @@ def test_v1_registration_migrates_without_changing_identity(directory):
         assert record["source_kind"] == "local"
         assert record["github_account"] == "default"
         assert record["directory"] is None
-        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == 13
     finally:
         store.close()
 

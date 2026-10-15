@@ -122,6 +122,19 @@ def repair_decision(finding, assessments):
     return decisions[0], level, associations, priority
 
 
+def input_assessments(finding, assessments):
+    decision, level, _, _ = repair_decision(finding, assessments)
+    if decision is None or level in ("not_actionable", "conflicting"):
+        return []
+    relevant = [
+        item for item in assessments if item.finding_id == finding.id and item.sha == finding.sha
+    ]
+    if decision.role == "auditor":
+        reviews, audits = finding_assessments(relevant, finding)
+        return reviews + audits
+    return active_assessments(relevant, decision.role)
+
+
 def fix_queue(store, repository, remote, measurements):
     rows = store.rows(
         "SELECT issue,data FROM github_records WHERE repository=? AND status='current' "

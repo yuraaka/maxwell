@@ -13,6 +13,7 @@ class ScanProgress:
         self.started = time.monotonic()
         self.phase = "preparing repository"
         self.details = {}
+        self.usage = None
 
     def emit(self, *, heartbeat=False):
         if self.callback:
@@ -24,11 +25,14 @@ class ScanProgress:
                     "phase": self.phase,
                     "elapsed": int(time.monotonic() - self.started),
                     "heartbeat": heartbeat,
+                    **({"usage": self.usage} if self.usage is not None else {}),
                 }
             )
 
     def update(self, phase):
         if isinstance(phase, dict):
+            if "usage" in phase:
+                self.usage = phase["usage"]
             self.phase = phase["phase"]
             self.details = {key: value for key, value in phase.items() if key != "phase"}
         else:

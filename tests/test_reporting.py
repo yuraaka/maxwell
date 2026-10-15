@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from maxwell.contracts import Finding, SelectionStats, Usage
+from maxwell.contracts import Finding, SelectionStats, Spending, Usage
 from maxwell.github import GitHub
 from maxwell.records import decode_record
 from maxwell.reporting import Reporter, record_report, scan_report, token_summary
@@ -122,6 +122,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
             output_tokens=100,
             reported=True,
             complete=True,
+            spending=Spending(micros=123_000, source="configured model tariff", complete=True),
         ),
         Usage(
             input_tokens=200,
@@ -129,6 +130,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
             output_tokens=20,
             reported=True,
             complete=False,
+            spending=Spending(micros=12_000, source="configured model tariff"),
         ),
         Usage(),
     ]
@@ -166,7 +168,10 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
         bodies = [issue["body"] for issue in github["issues"].values()] + [
             comment["body"] for comments in github["comments"].values() for comment in comments
         ]
-        assert all("$" not in body and "spending" not in body.lower() for body in bodies)
+        assert "| Recorded API-equivalent cost (USD estimate) | $0.1350 |" in dashboard
+        assert "| Executions with unknown cost | 1 |" in dashboard
+        assert "| Executions with partial cost | 1 |" in dashboard
+        assert any("Cost: unknown" in body for body in bodies)
         record = decode_record(scan_report(scans[0]))
         assert record.accounting == "tokens" and record.cost_micros is None
         assert "1,100 tokens" in record_report(record)
@@ -177,6 +182,9 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
             if issue["title"] == finding["title"]
         )
         assert decode_record(finding_body).allocated_cost_micros is None
+        assert decode_record(finding_body).spending == usages[0].spending
+        assert "$0.1230 USD" in finding_body
+        assert "shared hunter execution cost" in finding_body
     finally:
         client.close()
         store.close()

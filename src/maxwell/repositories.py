@@ -174,6 +174,117 @@ class Repository:
         git("-C", str(self.mirror), "worktree", "add", "--detach", str(worktree), sha)
         return sha, worktree
 
+    def prepare_local(self, scan_id, token=None, *, revision):
+        if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", revision):
+            raise ValueError("Local snapshot requires a full commit SHA")
+        if not re.fullmatch(r"[a-f0-9]{32}(?:-[a-z0-9-]+)?", scan_id):
+            raise ValueError("Invalid local snapshot identity")
+        sha = git("-C", str(self.mirror), "rev-parse", "--verify", f"{revision}^{{commit}}")
+        if sha != revision:
+            raise ValueError("Local snapshot revision mismatch")
+        self.worktrees.mkdir(parents=True, exist_ok=True)
+        worktree = self.worktrees / scan_id
+        git("-C", str(self.mirror), "worktree", "add", "--detach", str(worktree), sha)
+        return sha, worktree
+
+    def fetch_revision(self, sha, token):
+        if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", sha):
+            raise ValueError("Remote snapshot requires a full commit SHA")
+        self.worktrees.mkdir(parents=True, exist_ok=True)
+        if not self.mirror.exists():
+            git("init", "--bare", str(self.mirror))
+        source = f"https://github.com/{github_name(self.record['name'])}.git"
+        git("-C", str(self.mirror), "fetch", "--no-tags", "--", source, sha, token=token)
+        if git("-C", str(self.mirror), "rev-parse", "FETCH_HEAD^{commit}") != sha:
+            raise ValueError("Fetched snapshot does not match its pinned revision")
+
+    def fetch_pull(self, number, head, base_branch, base_sha, token):
+        validate_branch(base_branch)
+        self.fetch_revision(base_sha, token)
+        source = f"https://github.com/{github_name(self.record['name'])}.git"
+        git(
+            "-C",
+            str(self.mirror),
+            "fetch",
+            "--no-tags",
+            "--",
+            source,
+            f"refs/pull/{int(number)}/head",
+            token=token,
+        )
+        if git("-C", str(self.mirror), "rev-parse", "FETCH_HEAD^{commit}") != head:
+            raise ValueError("PR head changed while fetching")
+
+    def push_repair(self, branch, commit, token, expected=None):
+        if not re.fullmatch(r"maxwell/repair/[a-f0-9]{32}", branch):
+            raise ValueError("Invalid repair publication branch")
+        source = f"https://github.com/{github_name(self.record['name'])}.git"
+        remote = git(
+            "-C",
+            str(self.mirror),
+            "ls-remote",
+            "--heads",
+            source,
+            f"refs/heads/{branch}",
+            token=token,
+        )
+        actual = remote.split()[0] if remote else None
+        if actual == commit:
+            return
+        if actual != expected:
+            raise ValueError("Remote repair branch changed; refusing to overwrite it")
+        lease = f"--force-with-lease=refs/heads/{branch}:{expected or ''}"
+        git(
+            "-C",
+            str(self.mirror),
+            "push",
+            lease,
+            "--",
+            source,
+            f"{commit}:refs/heads/{branch}",
+            token=token,
+        )
+        remote = git(
+            "-C",
+            str(self.mirror),
+            "ls-remote",
+            "--heads",
+            source,
+            f"refs/heads/{branch}",
+            token=token,
+        )
+        if not remote or remote.split()[0] != commit:
+            raise ValueError("Repair branch publication requires reconciliation")
+
+    def merge_candidate(self, identity, head, base):
+        _, worktree = self.prepare_local(identity, revision=base)
+        try:
+            if head == base:
+                return base, worktree
+            git(
+                "-c",
+                "user.name=Maxwell",
+                "-c",
+                "user.email=maxwell@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "--no-autostash",
+                head,
+                cwd=worktree,
+            )
+            return git("rev-parse", "HEAD", cwd=worktree), worktree
+        except ValueError as exc:
+            conflicts = git("diff", "--name-only", "--diff-filter=U", cwd=worktree)
+            self.cleanup(worktree)
+            if conflicts:
+                raise ValueError(
+                    "Repair conflicts with target base in: " + ", ".join(conflicts.splitlines())
+                ) from exc
+            raise
+
     def unchanged(self, worktree, sha):
         return git("rev-parse", "HEAD", cwd=worktree) == sha and not git(
             "status", "--porcelain", "--untracked-files=all", "--ignored", cwd=worktree

@@ -209,7 +209,7 @@ def test_estimate_contracts_and_legacy_digest(inputs):
             RepairEstimate.model_validate({**review.repair.model_dump(), **changes})
     assert decode_record(encode_record(review)) == review
     legacy = review.model_copy(update={"repair": None, "factors": None})
-    payload = legacy.model_dump(mode="json", exclude={"repair", "factors"})
+    payload = legacy.model_dump(mode="json", exclude={"repair", "factors", "spending"})
     assert (
         record_digest(legacy)
         == hashlib.sha256(

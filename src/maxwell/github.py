@@ -224,6 +224,17 @@ class GitHub:
             "maxwell:state:audited": "5319e7",
             "maxwell:state:human-confirmed": "0e8a16",
             "maxwell:state:rejected": "eeeeee",
+            **{
+                f"maxwell:validation:{state}": color
+                for state, color in (
+                    ("pending", "fbca04"),
+                    ("stale", "fbca04"),
+                    ("accepted", "0e8a16"),
+                    ("rejected", "d73a4a"),
+                    ("inconclusive", "fbca04"),
+                )
+            },
+            "maxwell:integration:verified": "0e8a16",
             **{f"maxwell:priority:P{i}": "d4c5f9" for i in range(4)},
             **{
                 f"maxwell:{stage}:{verdict}": color
@@ -271,3 +282,74 @@ class GitHub:
                     )
                 return
         self.request("POST", f"repos/{repo}/issues/{issue}/comments", json={"body": body})
+
+    def mutate(self, path, payload, *, method="POST"):
+        try:
+            return self.request(method, path, json=payload)
+        except httpx.TransportError as exc:
+            raise PublicationUncertain(
+                "GitHub mutation response lost; reconciliation required"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                raise PublicationUncertain(
+                    "GitHub mutation may have succeeded; reconciliation required"
+                ) from exc
+            raise
+
+    def pull(self, repo, number):
+        return self.request("GET", f"repos/{repo}/pulls/{number}")
+
+    def merge_pull(self, repo, number, head, method):
+        return self.mutate(
+            f"repos/{repo}/pulls/{number}/merge",
+            {"sha": head, "merge_method": method},
+            method="PUT",
+        )
+
+    def check_runs(self, repo, sha):
+        for page in range(1, 101):
+            batch = self.request(
+                "GET",
+                f"repos/{repo}/commits/{sha}/check-runs",
+                params={"filter": "latest", "per_page": 100, "page": page},
+            )["check_runs"]
+            yield from batch
+            if len(batch) < 100:
+                return
+        raise ValueError("GitHub check pagination limit reached; auto-merge evidence incomplete")
+
+    def find_pull(self, repo, marker, branch):
+        matches = list(
+            self.paginate(
+                f"repos/{repo}/pulls", {"state": "all", "head": f"{repo.split('/')[0]}:{branch}"}
+            )
+        )
+        marked = [pull for pull in matches if marker in (pull.get("body") or "")]
+        if len(marked) > 1 or any(marker not in (pull.get("body") or "") for pull in matches):
+            raise ValueError("Repair branch already belongs to a conflicting or duplicate PR")
+        return marked[0] if marked else None
+
+    def create_pull(self, repo, title, body, branch, base):
+        return self.mutate(
+            f"repos/{repo}/pulls",
+            {"title": title, "body": body, "head": branch, "base": base, "draft": True},
+        )
+
+    def set_draft(self, pull, draft):
+        mutation = "convertPullRequestToDraft" if draft else "markPullRequestReadyForReview"
+        data = self.mutate(
+            "graphql",
+            {
+                "query": f"mutation($id: ID!) {{ {mutation}(input: {{pullRequestId: $id}}) {{ pullRequest {{ id isDraft }} }} }}",
+                "variables": {"id": pull["node_id"]},
+            },
+        )
+        if data.get("errors"):
+            raise ValueError("GitHub draft transition failed: " + str(data["errors"])[:1000])
+
+    def create_review(self, repo, number, head, body, comments):
+        return self.mutate(
+            f"repos/{repo}/pulls/{number}/reviews",
+            {"commit_id": head, "event": "COMMENT", "body": body, "comments": comments},
+        )

@@ -21,6 +21,7 @@ from maxwell.reporting import Reporter, hunter_ratings, scan_report
 from maxwell.repositories import Repository, git, stop_orphan
 from maxwell.selection import select_candidates
 from maxwell.store import Store
+from maxwell.validation import execute_validation, recover_validation
 
 
 async def request(paths, command, **arguments):
@@ -153,11 +154,9 @@ class Daemon:
                         if manifest.get("state") == "committing" and not public.commit:
                             worktree = Path(public.worktree)
                             head = git("rev-parse", "HEAD", cwd=worktree)
-                            if (
-                                head != public.sha
-                                and git("show", "--no-patch", "--format=%P", "HEAD", cwd=worktree)
-                                == public.sha
-                            ):
+                            if head != (public.parent_sha or public.sha) and git(
+                                "show", "--no-patch", "--format=%P", "HEAD", cwd=worktree
+                            ) == (public.parent_sha or public.sha):
                                 public = public.model_copy(update={"commit": head})
                         manifest["record"] = public.model_dump(mode="json")
                         publications = [(public, manifest["target"]["issue"])]
@@ -165,6 +164,8 @@ class Daemon:
                     write_manifest(artifact, manifest)
                 except (OSError, ValueError, KeyError):
                     pass
+            if job["stage"] in ("validate", "integrate"):
+                publications = recover_validation(self.paths, self.store, job)
             self.store.finish(
                 job,
                 "interrupted",
@@ -179,6 +180,8 @@ class Daemon:
             )
 
     async def scan(self, job, on_progress=None):
+        if job.get("stage") in ("validate", "integrate"):
+            return await execute_validation(self, job, on_progress)
         if job.get("stage") == "repair":
             return await execute_repair(self, job, on_progress)
 
@@ -228,6 +231,9 @@ class Daemon:
             )
             repository = Repository(self.paths, record)
             provider = self.provider_factory(self.paths, scan_config)
+            provider.on_usage = lambda usage: progress(
+                {"phase": "agent running", "usage": usage.model_dump()}
+            )
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE scans SET artifact=? WHERE id=?", (str(artifact), job["id"])
@@ -344,6 +350,8 @@ class Daemon:
                             (job["repository"],),
                         )["n"]
                     )
+                    if execution.get("publication_slots") is not None:
+                        slots = min(slots, execution["publication_slots"])
                     progress(f"ranking {len(result.findings)} candidates")
                     selected, observations, selection = select_candidates(
                         result.findings,

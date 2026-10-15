@@ -180,6 +180,18 @@ def test_missing_settings_are_reported_together(home, github_requests, capsys, m
             "github.accounts.<key>.token",
         ),
         ("provider: {api_key: [secret-value]}", "provider.api_key"),
+        (
+            "repair: {auto_merge: {required_validations: 0}}",
+            "repair.auto_merge.required_validations: Input should be greater than or equal to 1",
+        ),
+        (
+            "repair: {auto_merge: {merge_method: secret-value}}",
+            "repair.auto_merge.merge_method",
+        ),
+        (
+            "repair: {auto_merge: {secret-value: secret-value}}",
+            "repair.auto_merge.<key>",
+        ),
         ("github: {api_url: 'https://secret-value@github.com'}", "github.api_url"),
         ("false", "Invalid config.yaml"),
         ("[]", "Invalid config.yaml"),
@@ -327,3 +339,11 @@ def test_apply_waits_for_github_quota_and_reports_status_without_failing(home, m
     assert waits == [60]
     assert any(check["status"] == "waiting" for check in checks)
     assert not any(check["status"] == "waiting" for check in report["checks"])
+
+
+def test_pipeline_pool_validation_names_the_exact_yaml_key(home):
+    update_config(home, lambda data: data.update(pipeline={"pools": {"validate": -1}}))
+    with pytest.raises(
+        ValueError, match=r"pipeline.pools.validate: Input should be greater than or equal to 0"
+    ):
+        home.load(detailed=True)

@@ -1,7 +1,15 @@
 from collections import defaultdict
 
 from maxwell.assessment import finding_assessments
-from maxwell.records import RECORD_ADAPTER, AssessmentRecord, ExecutionRecord, FindingRecord
+from maxwell.impact import input_assessments
+from maxwell.records import (
+    RECORD_ADAPTER,
+    AssessmentRecord,
+    ExecutionRecord,
+    FindingRecord,
+    RepairRecord,
+    ValidationRecord,
+)
 
 
 def consensus(records):
@@ -18,7 +26,7 @@ def current_reputation_records(store, repository):
         (row["issue"], RECORD_ADAPTER.validate_json(row["data"]))
         for row in store.rows(
             "SELECT issue,data FROM github_records WHERE repository=? AND status='current' "
-            "AND type IN ('finding','assessment','execution')",
+            "AND type IN ('finding','assessment','execution','repair','validation')",
             (repository,),
         )
     ]
@@ -28,8 +36,49 @@ def agent_identity(agent):
     return (agent.adapter, agent.model, agent.effort) if agent else None
 
 
+def fixer_observations(records):
+    assessments = [record for _, record in records if isinstance(record, AssessmentRecord)]
+    findings = {record.id: record for _, record in records if isinstance(record, FindingRecord)}
+    repairs = {record.id: record for _, record in records if isinstance(record, RepairRecord)}
+    validations = [
+        record
+        for _, record in records
+        if isinstance(record, ValidationRecord) and record.type == "validation"
+    ]
+    superseded = {identity for record in validations for identity in record.supersedes}
+    groups = defaultdict(list)
+    for record in validations:
+        repair = repairs.get(record.repair_id)
+        finding = findings.get(record.finding_id)
+        if not repair or not finding or record.id in superseded or record.state != "completed":
+            continue
+        if (
+            finding.finding.identity(finding.repository) != finding.id
+            or repair.outcome != "prepared"
+            or repair.commit != (record.pr_head or record.sha)
+            or finding.sha != record.base_sha
+            or set(repair.references)
+            != {item.id for item in input_assessments(finding, assessments)}
+            or (repair.agent.adapter, repair.agent.model)
+            == (record.agent.adapter, record.agent.model)
+        ):
+            continue
+        groups[(finding.id, record.base_sha, record.sha, agent_identity(repair.agent))].append(
+            record
+        )
+    for key, current in groups.items():
+        outcomes = {record.outcome for record in current}
+        if len(outcomes) == 1 and outcomes <= {"accepted", "rejected"}:
+            yield key[-1], next(iter(outcomes))
+
+
 def selection_evidence(store, repository, role):
     records = current_reputation_records(store, repository)
+    if role == "fixer":
+        outcomes = defaultdict(lambda: [0, 0])
+        for identity, outcome in fixer_observations(records):
+            outcomes[identity][outcome == "rejected"] += 1
+        return dict(outcomes)
     assessments = defaultdict(list)
     for issue, record in records:
         if isinstance(record, AssessmentRecord):
@@ -96,6 +145,12 @@ def agent_reputation(store, repository):
                 "audit_unresolved": 0,
                 "audit_unassessed": 0,
                 "assessments": 0,
+                "repairs": 0,
+                "validation_accepted": 0,
+                "validation_rejected": 0,
+                "validation_inconclusive": 0,
+                "fixer_successes": 0,
+                "fixer_failures": 0,
                 "agreement": 0,
                 "disagreement": 0,
                 "unresolved": 0,
@@ -143,6 +198,32 @@ def agent_reputation(store, repository):
                     else:
                         outcome = "agreement" if review_verdict == audit_verdict else "disagreement"
                     result[outcome] += 1
+
+    seen_repairs = set()
+    seen_validations = set()
+    superseded = {
+        identity
+        for _, record in records
+        if isinstance(record, ValidationRecord)
+        for identity in record.supersedes
+    }
+    for _, record in records:
+        if isinstance(record, RepairRecord) and record.id not in seen_repairs:
+            seen_repairs.add(record.id)
+            _, result = tally(record.agent, "fixer")
+            result["repairs"] += 1
+        elif (
+            isinstance(record, ValidationRecord)
+            and record.id not in seen_validations
+            and record.id not in superseded
+        ):
+            seen_validations.add(record.id)
+            _, result = tally(record.agent, "validator")
+            result[f"validation_{record.outcome}"] += 1
+    for identity, outcome in fixer_observations(records):
+        result = agents.get(("fixer", *identity))
+        if result:
+            result["fixer_failures" if outcome == "rejected" else "fixer_successes"] += 1
 
     executions = set()
     for _, record in records:
@@ -205,6 +286,18 @@ def reputation_report(rows):
     )
     body += "\n#### Auditors\n\nQuality: unrated until independent validation.\n\n"
     body += table("auditor", ["Current assessments"], ["assessments"])
+    body += "\n#### Fixers: independent repair validation\n\n"
+    body += table(
+        "fixer",
+        ["Attempts", "Accepted", "Rejected"],
+        ["repairs", "fixer_successes", "fixer_failures"],
+    )
+    body += "\n#### Validators\n\nQuality: unrated until separately adjudicated.\n\n"
+    body += table(
+        "validator",
+        ["Accepted", "Rejected", "Inconclusive"],
+        ["validation_accepted", "validation_rejected", "validation_inconclusive"],
+    )
     body += "\n#### Investigation tokens\n\n"
     body += "| Agent | Role | Executions | Input | Output | Total | Unknown usage | Incomplete usage |\n"
     body += "| --- | --- | --- | --- | --- | --- | --- | --- |\n"

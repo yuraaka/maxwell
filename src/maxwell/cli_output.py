@@ -182,6 +182,25 @@ def human_lines(value, command, repo_command=None):
         lines = repository_lines(value)
         lines[0] = f"{verb} {lines[0]}"
         return lines
+    if command == "scan" and value.get("pipeline"):
+        lines = []
+        for summary in value.get("pipeline_repositories", []):
+            repository = summary["repository"]
+            counts = ", ".join(
+                f"{stage}: {count}" for stage, count in summary["executions"].items()
+            )
+            lines.append(
+                f"{color(repository, '1;36')}: {summary['closed']} closed; {summary['rejected']} rejected; {summary['remaining']} remaining; {summary['failed']} failed executions"
+            )
+            if counts:
+                lines.append(counts)
+            for reason in summary["waiting"][:3]:
+                lines.append(f"[WAIT] {reason}")
+        for error in value.get("errors", [])[-3:]:
+            lines.append(f"[FAIL] {error['repository']} / {error['stage']}: {error['error']}")
+        for status in value.get("statuses", []):
+            lines.append(f"{color('Status:', '1;36')} {color(status['url'], '36;4')}")
+        return lines or ["No repositories to scan."]
     if command == "scan":
         scans = value.get("scans", [])
         measurements = value.get("measurements", [])
@@ -258,12 +277,32 @@ def human_lines(value, command, repo_command=None):
                 if unknown:
                     lines.append("Unknown factors: " + "; ".join(unknown))
             for item in runs:
-                for repair in item.get("repairs", []):
-                    lines.append(
-                        f"Repair: {repair['outcome']} · local commit {repair['commit'] or 'none'}"
+                for validation in item.get("validations", []):
+                    from maxwell.measurement import validation_changes
+                    from maxwell.records import RECORD_ADAPTER
+
+                    reduction = validation_changes(
+                        RECORD_ADAPTER.validate_python(
+                            {
+                                key: value
+                                for key, value in validation.items()
+                                if key not in ("issue", "publication_state")
+                            }
+                        )
+                    )["reduction"]
+                    delta = (
+                        f"{reduction:+.2f} points observed reduction"
+                        if reduction is not None
+                        else "observed reduction unknown"
                     )
-                    lines.append(f"Branch: {repair['branch']}")
-                    lines.append(f"Worktree: {repair['worktree']}")
+                    lines.append(f"Validation: {validation['outcome']} · {delta}")
+                for link in item.get("pull_requests", []):
+                    lines.append(
+                        f"Repair PR: https://github.com/{repository}/pull/{link['number']}"
+                    )
+                if not item.get("pull_requests"):
+                    for repair in item.get("repairs", []):
+                        lines.append(f"Repair: {repair['outcome']} · PR publication pending")
             status = next(
                 (item for item in value.get("statuses", []) if item["repository"] == repository),
                 None,

@@ -3,8 +3,9 @@
 Maxwell runs hunting, review, and audit manually from your terminal. Hunting inspects
 committed source snapshots and creates deduplicated **suspected** findings as GitHub issues.
 Review and audit publish independent source assessments and report token usage per execution.
-An explicit repair stage produces local fix branches and host-executed check evidence.
-Independent repair validation, reproduction, and integration are later milestones.
+An explicit repair stage opens draft pull requests with host-executed check evidence.
+An explicit independent validation stage checks repairs and observes before/after measurements.
+Integration is a later milestone.
 
 ## Install
 
@@ -63,8 +64,9 @@ reference. Supply:
   Manual runs do not process comment commands.
 - `providers`: named Codex or Claude Code connections, each pointing to its existing
   configuration home. GitHub credential profiles are configured independently.
-- Optional prices for each model, in USD per million tokens. Without prices, usage is
-  reported as unpriced and admissions use `limits.daily_scan_limit` (default: 20).
+- Optional prices for each model, in USD per million tokens. Without configured prices,
+  admissions use `limits.daily_scan_limit` (default: 20); supported CLIs/models can
+  still display API-equivalent cost estimates.
 
 Credentials may be literal values in this file. Configuration files must have mode
 `0600`; runtime directories use `0700`. `config init` creates private configuration,
@@ -357,7 +359,9 @@ precedence over reviews, with no double counting. Unresolved audits do not fall 
 to positive reviews. Reviewers use agreement/disagreement with current audits. These
 are provisional source proxies, not a validated accuracy rating. Unrated agents start
 with equal priors and still have exploration opportunities. Auditor selection is uniform
-until independent validation supplies a rating. The selector is separate from orchestration
+until separately adjudicated. Fixers use accepted/rejected independent repair validation,
+with a neutral prior when unrated. Validators remain uniformly sampled and quality-unrated.
+The selector is separate from orchestration
 so future agent ratings can replace these evidence inputs.
 
 Automatic reviews prefer a different public model from the hunter; audits prefer a model
@@ -377,10 +381,9 @@ refresh can work.
 Repository-level provider/model/effort routes have been removed. Existing databases
 migrate automatically, retaining repositories and historical execution snapshots.
 `repo add` and `repo change` no longer accept `--provider`, `--model`, `--effort`, or
-`--stage`. Stage selection belongs to `scan`; repair is opt-in and independent
-validation is a later milestone.
+`--stage`. Stage selection belongs to `scan`; repair is opt-in. Full scans process pending PR validation and merged-repair integration after audit.
 
-Use `scan --stage hunt|review|audit|repair` to execute one stage at a time. Existing scripts
+Use `scan --stage hunt|review|audit|repair|validate|integrate` to execute one stage at a time. Existing scripts
 that should only hunt must now specify `--stage hunt`:
 
 ```bash
@@ -390,6 +393,72 @@ maxwell scan owner/repo --stage audit --provider codex-work --model your-auditor
 ```
 
 Provider aliases select local connections; published identities use `codex` or `claude`.
+### Drain existing findings or maintain the pipeline
+
+```bash
+maxwell scan owner/repo --repair-all
+maxwell scan owner/repo --infinite
+```
+
+`--repair-all` snapshots the existing open structured findings on GitHub and processes
+missing reviews/audits, repairs, independent validations, eligible auto-merges, and
+verification on main. It stops when no remaining transition can run, and reports what
+is still waiting. Findings arriving later belong to the next batch. It never hunts.
+
+`--infinite` keeps reconciling GitHub until Ctrl+C. It drains downstream work first,
+then hunts when there is capacity. Each repository gets one execution per scheduling
+round. Models are sampled using the existing reputation policy, with independent
+validator identities. `--provider` can constrain the pool of models; a single pinned
+`--model` cannot be used with these modes. `--stage`, `--issue`, `--limit`, `--force`,
+and `--skip-stage` select a different workflow and cannot be combined with them.
+
+Configure the maximum number of issues waiting **after** each stage:
+
+```yaml
+pipeline:
+  pools:
+    hunt: 10       # awaiting review
+    review: 10     # awaiting audit
+    audit: 10      # actionable findings awaiting repair, or needing attention
+    repair: 3      # repair PRs awaiting validation or amendment
+    validate: 3    # validated PRs awaiting merge
+    integrate: 1   # merged repairs awaiting verification on main
+  poll_seconds: 60
+  retry_seconds: 300
+```
+
+Run `maxwell config apply` after editing the configuration, then start the scan.
+A running pipeline uses the settings it started with.
+
+These are admission limits per repository, including reserved publication slots,
+not parallel-agent counts or targets that force every pool to stay full. A full pool
+pauses work that would add another issue to it. Zero stops new admissions to that pool;
+existing work can still drain. Integration capacity also gates automatic merging during
+ordinary scans and PR synchronization. Manual GitHub actions can exceed a limit;
+Maxwell reports the occupancy and drains it without undoing external changes.
+
+Hunting still observes `limits.scan_interval_seconds` and `max_findings_per_scan`;
+the available hunt slots can lower the publication count further. Infinite mode measures
+the current source/tests before hunting a new revision. Batch modes process assessments
+one at a time until blocked, instead of stopping at `max_reviews_per_scan` or
+`max_audits_per_scan`. Daily budget/scan limits still apply. Infinite mode waits for
+admission to become available, with the UTC reset time shown; a finite batch returns
+its waiting summary. GitHub quota waits retain their existing diagnostics.
+
+Completed assessments and validation votes are reused. Inconclusive assessments,
+blocked fixes, failing repair checks, and inconclusive validation stay visible for
+attention rather than being repeatedly sent to agents. Operational failures use a
+persistent cooldown, and new evidence can make work eligible again. A finite batch
+attempts repair at most once per finding; a later run can amend rejected PRs.
+The progress panel shows pool occupancy, current activity, and cumulative estimated
+spending. The final batch summary links to the main status issue.
+
+For automatic merges, enable `repair.auto_merge` below and satisfy the existing
+GitHub protection/check requirements. Otherwise PRs wait for manual merge; the next
+reconciliation picks up their integration verification. New automated repairs require
+an actionable audit or human decision; previously prepared PRs can resume using their
+original valid assessment inputs.
+
 ### Repair a supported finding
 
 ```bash
@@ -419,19 +488,133 @@ Maxwell owns Git staging and commits and rejects agent changes to Git refs, HEAD
 configuration, or the index. Checks run with a private HOME and a sanitized environment.
 Source assessments keep their read-only permissions.
 
-Output shows the retained branch, worktree, and local commit. GitHub receives an
-immutable repair comment on the finding with input assessments, agent identity,
-changed files, and actual host check results. The status issue body links to repair
-attempts. Commits remain **local-only**; Maxwell does not push, merge, open PRs, close
-findings, or report an observed entropy reduction. A prepared repair still needs
-human inspection and independent validation.
+Successful repairs push a dedicated branch and open a **draft PR** linked to the finding.
+The compact output and status dashboard link to that PR. The finding retains immutable
+repair and PR revision records; it remains open until integration verification.
+Automatic merging requires the opt-in policy below.
 
-Failed checks can retain a committed draft, clearly marked `checks_failed`.
-Timeouts, cancellations, and interruptions preserve edits and diagnostics in
-`~/.maxwell/artifacts/<execution-id>/repair.json` and the retained worktree. Publication
-retries reuse the stored record without rerunning the fixer. Previously prepared
-repairs for the same inputs are skipped; `--force` allows a new attempt.
-`--limit` is rejected for repair. Default scans remain measure → hunt → review → audit.
+Failed checks retain a local draft, clearly marked `checks_failed`. Timeouts, cancellations,
+and interruptions preserve diagnostics in `~/.maxwell/artifacts/<execution-id>/repair.json`.
+Publication retries reconcile existing branches and PR markers without rerunning the fixer.
+A rejected PR is amended on the **same branch and PR**. `--force` revises an existing open
+PR even without rejection. The remote push uses an exact lease and refuses to overwrite
+unexpected changes. Amendment records preserve predecessor, parent revision, and lineage.
+`--limit` is rejected for repair.
+
+### Independently validate a repair PR
+
+```bash
+maxwell scan owner/repo --stage validate
+maxwell scan owner/repo --stage validate --issue 12
+maxwell scan owner/repo --stage validate --provider codex-work --model your-validator-model
+```
+
+Validation handles **one PR per invocation**, fetching its exact head and target base.
+It tests a fresh merge candidate against that base and independently inspects the patch.
+Public worktree paths are never used to locate source. The validator uses a **different
+public adapter/model from the fixer**; provider aliases and effort changes do not establish
+independence. Validator quality remains unrated.
+
+For bugs with a pytest profile, Maxwell runs the declared regression files on the merge
+candidate and on the original finding revision with only those tests transplanted.
+Acceptance requires passing repaired checks, an original-source call-phase failure, and
+independent confirmation that it demonstrates the defect. Collection, setup, unrelated
+failures, or unsupported replay runners leave reproduction unresolved. Passing tests or
+lower entropy alone cannot establish correctness.
+
+Immutable validation records are published **on the PR**. One updated verdict summary
+shows host evidence and measured component changes. Actionable patch comments become
+inline GitHub `COMMENT` reviews, pinned to the inspected head. Shared-account reviewers
+use comment reviews rather than GitHub approval/request-changes events. Feedback whose
+line cannot be anchored stays in the summary.
+
+Feedback headings identify the role: **Hunter**, **Reviewer**, **Auditor**, **Fixer**,
+**Validator**, or **Integration validator**. GitHub still displays the configured account
+as the author. Agents are asked for one-sentence summaries, short evidence, and no repeated
+explanations. Checks, revision IDs, measurements, and execution metadata are expandable.
+
+Validators put merge-blocking correctness/security/regression risks in `concerns` and
+informational observations in `notes`. Notes do not prevent acceptance or auto-merge;
+blocking concerns make new validations inconclusive unless the repair is explicitly rejected.
+Existing concerns retain their blocking meaning. A fresh validation is required to reclassify
+an old concern; Maxwell does not rewrite immutable evidence.
+
+Accepted PRs become ready for review; rejected or inconclusive PRs remain drafts. Labels
+`maxwell:validation:pending|stale|accepted|rejected|inconclusive` show the current verdict.
+Any head or base movement invalidates the previous verdict. Completed current validations
+are skipped once the configured validation requirement is met; `--force` supersedes them.
+Failed attempts and publication retries are reusable.
+PR rejection does not reject the original finding.
+
+Before/after measurements compare the PR base with its tested merge candidate. Total
+reduction requires all five compatible factors; partial component observations remain
+visible. These measurements do not replace the main repository baseline. Fixer reputation
+uses independent accepted/rejected validation of the fixer's exact revision; external edits,
+conflicting verdicts, operational failures, and integration checks add no fixer quality credit.
+
+### Automatically merge verified repairs
+
+Auto-merge is disabled by default. Enable it in `config.yaml`:
+
+```yaml
+repair:
+  auto_merge:
+    enabled: true
+    required_validations: 2
+    merge_method: squash
+```
+
+Run `maxwell config apply` after changing the configuration. This policy applies to repair
+PRs in registered repositories. `required_validations` accepts 1–10 distinct public
+adapter/model identities. Provider aliases and different efforts do not add votes.
+Merge methods are `squash`, `merge`, and `rebase`.
+
+Automatic validation selects additional independent models for the same PR until the
+requirement is met. Earlier votes remain current. With an explicit `--model`, each
+invocation runs that model once; select another model for the next vote. A current rejected
+or inconclusive verdict blocks merging. Use `--force` to replace current validations, then
+collect the independent votes again. Unresolved source concerns, failed host checks, and
+missing original-defect regression evidence for bugs also block auto-merge.
+
+Maxwell checks GitHub rules and all reported checks for the current head. The target branch
+must have required status checks with **Require branches to be up to date before merging**
+and **Do not allow bypassing the above settings** enabled (the branch-protection API must
+report `strict: true` and `enforce_admins.enabled: true`). The token needs permission to
+read protection/checks and merge PRs. Equivalent ruleset-only configurations are not yet
+recognized and remain blocked. Maxwell does not change protection or bypass approvals.
+
+Head and base must still match the validated revision. The merge request pins the head;
+server-enforced up-to-date protection guards against a concurrent base change. Pending
+checks or protection/permission failures leave the PR waiting, with the reason in its
+single updated validation summary. Later GitHub syncs recheck eligibility without rerunning
+completed validators. After a lost response, Maxwell reconciles the PR's merged state and
+does not resend an uncertain merge. If GitHub still reports it open, the uncertainty remains
+visible rather than triggering a duplicate request.
+
+An automatically merged PR still requires independent integration verification before
+Maxwell closes its finding or updates the repository baseline.
+
+### Verify a merged repair
+
+After a human or automatic merge, run:
+
+```bash
+maxwell scan owner/repo --stage integrate --issue 12
+```
+
+Full `maxwell scan` runs also process pending validation and integration, one PR per
+stage (with additional validation models when auto-merge is enabled).
+`--skip-stage validate` and `--skip-stage integrate` disable those stages. Generic
+GitHub synchronization updates PR state and reconciles publications without launching models.
+Skipped validation/integration stages report the specific PR blocker, including awaiting
+merge and the current auto-merge reason, instead of a generic “No eligible findings.”
+
+Integration independently checks the current maintained branch, verifies that the recorded
+merge is present, replays the original defect, and remeasures that branch. Only an accepted
+verification whose revision and assessment inputs are still current publishes a new baseline
+and closes the finding with `maxwell:integration:verified`. The PR body deliberately uses
+“Repair for #N”, so GitHub's merge keywords cannot close the finding prematurely.
+Diagnostics remain in `~/.maxwell/artifacts/<execution-id>/validation.json`.
 
 ### Review and audit
 
@@ -589,9 +772,25 @@ does not imply a quality assessment.
 Each scan records its configured execution profile, policy snapshot, pinned revision,
 usage, result, timestamps, and artifacts. Cost calculations use integer microdollars
 and the price configuration captured for that execution. Cached input is not charged
-twice. Dollar accounting remains an internal compatibility feature; GitHub, local
-Markdown reports, and `scan --json` show token counts only. Historical public records
-retain their original fields.
+twice. Scan progress, local reports, findings, agent assessments, repair PRs and
+validation feedback show USD API-equivalent estimates alongside tokens. These are
+usage estimates, not invoices or incremental subscription charges. The progress
+total updates when the CLI reports usage; some CLIs only report it at completion.
+Each execution is counted once, even when its cost appears on several findings or
+inline comments. The status dashboard aggregates executions, including failed calls.
+
+Configured per-model rates take precedence. Without configured rates, Claude Code's
+reported `total_cost_usd` is used; Maxwell does not guess what an alias such as
+`opus[1m]` resolves to. Codex uses a bundled standard tariff snapshot verified on
+2026-10-15 for `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`,
+and `gpt-5.6-luna`, including
+cache reads/writes and the premium for requests above 272K input tokens. When Codex
+reports an aggregate above that threshold without request-level context sizes, Maxwell
+shows a short-to-long-context cost range rather than assuming a tier. Source,
+verification date and rates are saved with execution evidence. Use configured rates
+for gateways, other models, or nonstandard service tiers; the bundled rates estimate
+standard service only. Missing tariffs or usage are unknown; failed or timed-out
+attempts retain partial reported costs. Historical evidence is never repriced.
 
 For priced models, the controller reserves the configured amount before launching a scan. Daily budget
 windows use UTC. An execution with unknown spending retains its reservation, including
@@ -602,7 +801,8 @@ dispatch stops when the remaining budget cannot cover another reservation. Use a
 provider billing limit for a hard account-wide cap. Unknown reservations currently
 require operator investigation; there is no automatic financial settlement command.
 
-For unpriced models, tokens are recorded without claiming a dollar estimate.
+Models without configured prices remain unpriced for admission even when a public
+API-equivalent estimate is available.
 These runs do not reserve dollars or retain unknown-dollar holds. The global
 `limits.daily_scan_limit` caps unpriced model executions per UTC day, including failed
 or interrupted calls. Preparation failures and skipped revisions consume no count.
@@ -886,8 +1086,8 @@ maxwell scan --stage audit --force owner/repo
 Assessments remain read-only and never execute the validation plan. Closing an issue does
 not establish a validated fix or an observed entropy reduction. Dashboard tables display the first
 50 entries per track and report how many additional entries are omitted; this is a presentation
-limit and does not limit collection or assessment. Independent repair validation
-and post-fix measurement attribution are the next workflow.
+limit and does not limit collection or assessment. Independent repair validation reports
+observed snapshot changes; causal per-finding attribution and integration remain separate work.
 
 Future execution and measurement records go to a separate **Maxwell history** issue marked
 `<!-- maxwell:history:v1 -->`. Assessments remain on their finding issues. Legacy generated execution and measurement comments on the status issue are removed; they are not migrated. Pending
