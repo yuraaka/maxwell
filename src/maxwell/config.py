@@ -227,12 +227,6 @@ class Config(Settings):
                 errors.append(f"{label}.api_key: set an API key or an existing provider home")
         if not any(secret.get_secret_value().strip() for secret in self.github_tokens()):
             errors.append("github: set github.token or a github.accounts token in config.yaml")
-        if not self.providers and self.provider.home is None:
-            if not self.provider.model.strip():
-                errors.append("provider.model: set a nonempty model identifier")
-            for field in ("input_usd_per_mtok", "output_usd_per_mtok"):
-                if getattr(self.provider, field) is None:
-                    errors.append(f"provider.{field}: set the model price")
         return errors
 
     def all_providers(self):

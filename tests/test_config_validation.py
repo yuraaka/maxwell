@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from maxwell.cli import execute, parser
-from maxwell.config import Paths
+from maxwell.config import Config, Paths
 from maxwell.config_validation import validate_config
 from maxwell.store import Store
 
@@ -128,12 +128,46 @@ def test_missing_settings_are_reported_together(home, github_requests, capsys, m
         "provider.executable",
         "github",
         "provider.api_key",
-        "provider.model",
-        "provider.input_usd_per_mtok",
-        "provider.output_usd_per_mtok",
     ):
         assert field in message
     assert github_requests[0] == []
+
+
+@pytest.mark.parametrize(
+    "provider,requested_model,model,expected_price",
+    [
+        ({"api_key": "provider-token"}, "explicit-unpriced", "explicit-unpriced", None),
+        (
+            {"api_key": "provider-token", "models": ["catalog-unpriced"]},
+            None,
+            "catalog-unpriced",
+            None,
+        ),
+        (
+            {
+                "api_key": "provider-token",
+                "models": {
+                    "catalog-priced": {
+                        "input_usd_per_mtok": 2,
+                        "output_usd_per_mtok": 8,
+                    }
+                },
+            },
+            "catalog-priced",
+            "catalog-priced",
+            2,
+        ),
+    ],
+)
+def test_singleton_api_key_provider_allows_unpriced_and_catalog_models(
+    monkeypatch, provider, requested_model, model, expected_price
+):
+    monkeypatch.setattr("maxwell.config.shutil.which", lambda executable: "/usr/bin/found")
+    config = Config(github={"token": "github-token"}, provider=provider)
+
+    assert config.readiness_errors() == []
+    assert config.route(model=requested_model) == {"provider": "default", "model": model}
+    assert config.provider.for_model(model).input_usd_per_mtok == expected_price
 
 
 @pytest.mark.parametrize(
