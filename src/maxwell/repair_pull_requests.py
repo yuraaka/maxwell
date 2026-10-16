@@ -113,6 +113,7 @@ async def publish_prepared(reporter, repo):
             if pending["data"]:
                 link = RECORD_ADAPTER.validate_json(pending["data"])
             else:
+                expected_head = None
                 if repair.previous_id:
                     previous = next(
                         (
@@ -124,12 +125,13 @@ async def publish_prepared(reporter, repo):
                     )
                     if not previous:
                         raise ValueError("Repair amendment requires its existing PR association")
+                    expected_head = repair.previous_head_sha or repair.parent_sha
                     pull = await reporter.call(reporter.github.pull, repo, previous.number)
                     check_pull(pull, repo, repair.branch, previous.base_branch, authors)
                     if not pull["draft"]:
                         await reporter.call(reporter.github.set_draft, pull, True)
                     if pull["state"] != "open" or pull["head"]["sha"] not in (
-                        repair.parent_sha,
+                        expected_head,
                         repair.commit,
                     ):
                         raise ValueError("PR changed before amendment publication")
@@ -149,7 +151,7 @@ async def publish_prepared(reporter, repo):
                     repair.branch,
                     repair.commit,
                     token,
-                    repair.parent_sha if repair.previous_id else None,
+                    expected_head,
                 )
                 if pull is None:
                     with reporter.store.db:
@@ -495,7 +497,9 @@ async def feedback(reporter, repo, *, auto_merge=True):
         completed = [record for record in current if record.state == "completed"]
         outcomes = {record.outcome for record in completed}
         verdict = (
-            next(iter(outcomes))
+            "conflicted"
+            if any(record.requires_rebase for record in current)
+            else next(iter(outcomes))
             if len(outcomes) == 1
             else "inconclusive"
             if outcomes
@@ -519,7 +523,7 @@ async def feedback(reporter, repo, *, auto_merge=True):
         current_head = (pull["head"]["sha"], pull["base"]["sha"])
         if current_head != (link.head_sha, link.base_sha):
             verdict = "stale"
-        if completed and verdict != "stale" and len(outcomes) == 1:
+        if completed and verdict not in ("stale", "conflicted") and len(outcomes) == 1:
             selected = completed[0]
             for record in completed:
                 await publish_review(reporter, repo, link, pull, record)
@@ -529,7 +533,8 @@ async def feedback(reporter, repo, *, auto_merge=True):
                 "<!-- maxwell:validation-summary:v1 -->",
             )
         else:
-            body = f"<!-- maxwell:validation-summary:v1 -->\n### Validation — {verdict}\n\nCurrent PR head: `{pull['head']['sha']}`; target base: `{pull['base']['sha']}`. Run `maxwell scan {repo} --stage validate --issue {link.finding_issue}`.\n"
+            stage = "repair" if verdict == "conflicted" else "validate"
+            body = f"<!-- maxwell:validation-summary:v1 -->\n### Validation — {verdict}\n\nCurrent PR head: `{pull['head']['sha']}`; target base: `{pull['base']['sha']}`. Run `maxwell scan {repo} --stage {stage} --issue {link.finding_issue}`.\n"
         await summary_matches(reporter, repo, number)
         refreshed = await reporter.call(reporter.github.pull, repo, number)
         if (refreshed["head"]["sha"], refreshed["base"]["sha"]) != current_head:

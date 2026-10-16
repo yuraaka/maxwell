@@ -3,6 +3,7 @@ import hashlib
 import json
 from types import SimpleNamespace as Namespace
 
+import httpx
 import pytest
 import yaml
 from pydantic import ValidationError
@@ -10,9 +11,8 @@ from test_repair import repairable as repairable_fixture
 from test_validation import prepared as prepared_fixture
 from test_validation import validate
 
-from maxwell.auto_merge import evidence_blocker, github_blocker, try_auto_merge
+from maxwell.auto_merge import evidence_blocker, github_blocker, merge_error_message, try_auto_merge
 from maxwell.config import AutoMergeSettings, Config
-from maxwell.github import GitHub
 from maxwell.manual import run_scans
 from maxwell.repair_pull_requests import active_validations, records
 
@@ -99,62 +99,50 @@ def test_uncertain_or_stale_evidence_never_qualifies(votes, change, reason):
     assert reason in evidence_blocker(*votes)
 
 
+@pytest.mark.parametrize("state", ["clean", "unstable", "has_hooks"])
+def test_mergeable_pr_needs_no_ci_or_protection_read_access(state):
+    async def call(*args):
+        pytest.fail("Merge eligibility must not require protection or CI inspection")
+
+    reporter = Namespace(call=call, github=Namespace(request=None))
+    pull = {"mergeable": True, "mergeable_state": state, "base": {"ref": "main"}}
+    assert asyncio.run(github_blocker(reporter, "acme/repo", pull)) is None
+
+
 @pytest.mark.parametrize(
-    "condition,reason",
+    "mergeable,state,reason",
     [
-        ("pending", "pending"),
-        ("failed", "unsuccessful"),
-        ("missing", "not reported"),
-        ("checks_pending", "pending"),
-        ("unprotected", "protection"),
-        ("not_strict", "up-to-date"),
-        ("admin_bypass", "administrators"),
-        ("wrong_app", "not reported"),
-        ("unknown_mergeability", "mergeability"),
-        ("no_required_checks", "no required"),
+        (False, "dirty", "conflicts"),
+        (None, "unknown", "calculating"),
+        (True, "blocked", "required checks"),
+        (True, "behind", "Update"),
+        (True, "unknown", "calculating"),
     ],
 )
-def test_github_rules_and_checks_fail_closed(home, github, condition, reason):
-    pull = {
-        "mergeable": True,
-        "mergeable_state": "clean",
-        "head": {"sha": "a" * 40},
-        "base": {"ref": "main"},
-    }
-    if condition in ("pending", "failed"):
-        github["statuses"][0]["state"] = "pending" if condition == "pending" else "failure"
-    elif condition == "missing":
-        github["statuses"] = []
-    elif condition == "checks_pending":
-        github["check_runs"] = [{"name": "lint", "status": "in_progress", "conclusion": None}]
-    elif condition == "unprotected":
-        github["protection"] = None
-    elif condition == "not_strict":
-        github["protection"]["required_status_checks"]["strict"] = False
-    elif condition == "admin_bypass":
-        github["protection"]["enforce_admins"]["enabled"] = False
-    elif condition == "wrong_app":
-        github["protection"]["required_status_checks"]["checks"] = [
-            {"context": "tests", "app_id": 42}
-        ]
-        github["check_runs"] = [
-            {"name": "tests", "status": "completed", "conclusion": "success", "app": {"id": 7}}
-        ]
-    elif condition == "unknown_mergeability":
-        pull["mergeable"] = None
-    elif condition == "no_required_checks":
-        github["protection"]["required_status_checks"]["contexts"] = []
-    client = GitHub(home.load().github)
+def test_actual_github_merge_blockers_have_instructions(mergeable, state, reason):
+    pull = {"number": 60, "mergeable": mergeable, "mergeable_state": state}
+    blocker = asyncio.run(github_blocker(None, "acme/repo", pull))
+    assert reason in blocker
+    assert "https://github.com/acme/repo/pull/60" in blocker
 
-    async def call(function, *args, **kwargs):
-        return function(*args, **kwargs)
 
-    try:
-        reporter = Namespace(github=client, call=call)
-        assert reason in asyncio.run(github_blocker(reporter, "acme/repo", pull))
-        assert not github["merges"]
-    finally:
-        client.close()
+@pytest.mark.parametrize(
+    "status,instruction",
+    [
+        (401, "Replace"),
+        (403, "Contents and Pull requests write"),
+        (404, "access"),
+        (405, "merge queue"),
+        (409, "fresh validation"),
+        (422, "repair.auto_merge.merge_method"),
+    ],
+)
+def test_merge_api_errors_keep_github_reason_and_next_action(status, instruction):
+    response = httpx.Response(status, json={"message": "Repository policy rejected this merge"})
+    message = merge_error_message(response, "acme/repo", 60, "squash")
+    assert f"HTTP {status}" in message and instruction in message
+    assert "Repository policy rejected this merge" in message
+    assert "https://github.com/acme/repo/pull/60" in message
 
 
 def enable(home, reporter):
@@ -172,12 +160,17 @@ def summary(github, number):
     )
 
 
-def test_one_required_validation_can_merge(home, prepared, repairable, github):
+@pytest.mark.parametrize("protected", [True, False])
+def test_one_required_validation_can_merge(home, prepared, repairable, github, protected):
     _, _, reporter, _, _, issue = repairable
     enable(home, reporter)
     data = yaml.safe_load(home.config.read_text())
     data["repair"]["auto_merge"]["required_validations"] = 1
     home.config.write_text(yaml.safe_dump(data))
+    if not protected:
+        github["protection"] = None
+        github["statuses"] = []
+        github["check_runs"] = []
     result = validate(home)
     assert result["valid"], result
     assert len(result["scans"]) == 1
@@ -299,7 +292,7 @@ def test_merge_response_reconciliation_never_blindly_retries(
         )
 
 
-@pytest.mark.parametrize("movement", ["head", "base"])
+@pytest.mark.parametrize("movement", ["head", "base", "rules"])
 def test_revision_movement_during_checks_prevents_merge(
     home, prepared, repairable, github, monkeypatch, movement
 ):
@@ -313,17 +306,21 @@ def test_revision_movement_during_checks_prevents_merge(
     assert result["valid"], result
     github["statuses"][0]["state"] = "success"
     pull = next(iter(github["pulls"].values()))
-    original = reporter.github.check_runs
+    original = github_blocker
 
-    def moved(*args):
-        checks = list(original(*args))
-        pull[movement]["sha"] = "f" * 40
-        return iter(checks)
+    async def moved(*args):
+        result = await original(*args)
+        if movement == "rules":
+            pull["mergeable_state"] = "blocked"
+        else:
+            pull[movement]["sha"] = "f" * 40
+        return result
 
-    monkeypatch.setattr(reporter.github, "check_runs", moved)
+    monkeypatch.setattr("maxwell.auto_merge.github_blocker", moved)
     link = records(store, "acme/repo", "pull_request")[0]
     status = asyncio.run(try_auto_merge(reporter, "acme/repo", link, "accepted"))
-    assert "changed before merge" in status and not github["merges"]
+    assert ("required checks" if movement == "rules" else "changed before merge") in status
+    assert not github["merges"]
 
 
 def test_forced_revalidation_cannot_merge_using_old_votes(

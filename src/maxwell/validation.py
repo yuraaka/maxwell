@@ -34,7 +34,7 @@ from maxwell.records import (
 )
 from maxwell.repair import RepairTarget, file_digests, recover_check, run_checks
 from maxwell.reporting import Reporter
-from maxwell.repositories import Repository, git
+from maxwell.repositories import RepairMergeConflict, Repository, git
 
 
 class ValidationTarget(RepairTarget):
@@ -698,6 +698,8 @@ async def execute_validation(engine, job, on_progress=None):
     except asyncio.CancelledError:
         state, error, summary = "cancelled", "Cancelled", "Validation cancelled; repair retained."
     except Exception as exc:
+        if isinstance(exc, RepairMergeConflict) and public:
+            public = public.model_copy(update={"merge_conflicts": exc.paths})
         error = (engine.config.redact(str(exc)).strip() or type(exc).__name__)[:2000]
         summary = f"Validation failed: {error}"
         engine.log.warning("Validation %s failed: %s", job["id"], error)

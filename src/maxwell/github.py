@@ -229,6 +229,7 @@ class GitHub:
                 for state, color in (
                     ("pending", "fbca04"),
                     ("stale", "fbca04"),
+                    ("conflicted", "d73a4a"),
                     ("accepted", "0e8a16"),
                     ("rejected", "d73a4a"),
                     ("inconclusive", "fbca04"),
@@ -318,6 +319,88 @@ class GitHub:
             if len(batch) < 100:
                 return
         raise ValueError("GitHub check pagination limit reached; auto-merge evidence incomplete")
+
+    def failed_required_checks(self, repo, number, head, base):
+        query = """query MaxwellRepairChecks($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              headRefOid baseRefOid
+              commits(last: 1) { nodes { commit { statusCheckRollup {
+                contexts(first: 100, after: $cursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    ... on CheckRun {
+                      databaseId name status conclusion detailsUrl summary text
+                      isRequired(pullRequestNumber: $number)
+                    }
+                    ... on StatusContext {
+                      context state description targetUrl
+                      isRequired(pullRequestNumber: $number)
+                    }
+                  }
+                }
+              } } } }
+            }
+          }
+        }"""
+        owner, name = repo.split("/", 1)
+        cursor, failures = None, []
+        for _ in range(100):
+            response = self.request(
+                "POST",
+                "graphql",
+                json={
+                    "query": query,
+                    "variables": {"owner": owner, "name": name, "number": number, "cursor": cursor},
+                },
+            )
+            if response.get("errors"):
+                raise ValueError(
+                    "Cannot read required CI checks: "
+                    + str(response["errors"][0].get("message", "GraphQL error"))
+                )
+            try:
+                pull = response["data"]["repository"]["pullRequest"]
+                if (pull["headRefOid"], pull["baseRefOid"]) != (head, base):
+                    raise ValueError(
+                        "PR moved while reading required checks; synchronize and retry"
+                    )
+                rollup = pull["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                if rollup is None:
+                    return []
+                contexts = rollup["contexts"]
+                for check in contexts["nodes"]:
+                    if not check or not check.get("isRequired"):
+                        continue
+                    failed = (
+                        check.get("status") == "COMPLETED"
+                        and check.get("conclusion") in ("FAILURE", "TIMED_OUT", "STARTUP_FAILURE")
+                    ) or check.get("state") in ("FAILURE", "ERROR")
+                    if failed and len(failures) < 20:
+                        failures.append(
+                            {
+                                "id": check.get("databaseId"),
+                                "name": str(check.get("name") or check.get("context"))[:200],
+                                "state": check.get("conclusion") or check.get("state"),
+                                "url": str(check.get("detailsUrl") or check.get("targetUrl") or "")[
+                                    :1000
+                                ],
+                                "summary": str(
+                                    check.get("summary") or check.get("description") or ""
+                                )[:800],
+                                "text": str(check.get("text") or "")[:2000],
+                            }
+                        )
+                page = contexts["pageInfo"]
+                if not page["hasNextPage"]:
+                    return sorted(failures, key=lambda item: (item["name"], str(item["id"])))
+                following = page["endCursor"]
+                if not following or following == cursor:
+                    raise ValueError("Required-check pagination did not advance")
+                cursor = following
+            except (KeyError, IndexError, TypeError) as exc:
+                raise ValueError("GitHub returned incomplete required-check evidence") from exc
+        raise ValueError("Required-check pagination limit reached")
 
     def find_pull(self, repo, marker, branch):
         matches = list(

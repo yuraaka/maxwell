@@ -104,6 +104,67 @@ def test_offline_check_does_not_access_network_or_create_database(home, github_r
     assert github_requests[0] == []
 
 
+@pytest.mark.parametrize(
+    "overrides,expected,valid",
+    [
+        ({"permissions": {"push": False}}, "grant Write access", False),
+        ({"archived": True}, "unarchive", False),
+        ({"disabled": True}, "GitHub Support", False),
+        ({"has_issues": False}, "enable Issues", False),
+        ({"allow_squash_merge": False}, "repair.auto_merge.merge_method to merge", False),
+        ({"permissions": {}}, "did not report write permissions", True),
+        ({"allow_squash_merge": None}, "did not report allowed merge methods", True),
+        ({"allow_auto_merge": False}, "Repository allows squash merges", True),
+    ],
+)
+def test_apply_checks_merge_configuration_without_ci_or_protection(
+    home, github_requests, capsys, overrides, expected, valid
+):
+    update_config(home, lambda data: data.update(repair={"auto_merge": {"enabled": True}}))
+    store = Store(home.db)
+    store.register("yuraaka/maxwell", "/unused", "main")
+    store.close()
+    github_requests[1][("/repos/yuraaka/maxwell", "Bearer fake-github-secret")] = httpx.Response(
+        200,
+        json={
+            "full_name": "yuraaka/maxwell",
+            "permissions": {"push": True},
+            "allow_squash_merge": True,
+            "allow_merge_commit": True,
+            "allow_rebase_merge": False,
+            **overrides,
+        },
+    )
+    code, report = command(home, capsys)
+    assert report["valid"] is valid
+    assert code == (0 if valid else 1)
+    assert expected in json.dumps(report)
+    assert {request.url.path for request in github_requests[0]} == {
+        "/user",
+        "/repos/yuraaka/maxwell",
+    }
+    assert all(request.method == "GET" for request in github_requests[0])
+
+
+def test_apply_does_not_require_merge_access_when_auto_merge_disabled(
+    home, github_requests, capsys
+):
+    store = Store(home.db)
+    store.register("yuraaka/maxwell", "/unused", "main")
+    store.close()
+    github_requests[1][("/repos/yuraaka/maxwell", "Bearer fake-github-secret")] = httpx.Response(
+        200,
+        json={
+            "full_name": "yuraaka/maxwell",
+            "permissions": {"push": False},
+            "allow_squash_merge": False,
+        },
+    )
+    code, report = command(home, capsys)
+    assert code == 0 and report["valid"]
+    assert not any("merge_access" in check["name"] for check in report["checks"])
+
+
 def test_publication_limit_above_twenty_passes_config_validation(home):
     update_config(home, lambda data: data["limits"].update(max_findings_per_scan=200))
     report = validate_config(home, online=False)

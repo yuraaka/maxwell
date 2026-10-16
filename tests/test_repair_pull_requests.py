@@ -241,11 +241,13 @@ def test_head_movement_during_validation_is_not_accepted(
     assert selection_evidence(repairable[0], "acme/repo", "fixer") == {}
 
 
-def test_merge_conflict_records_inconclusive_without_starting_validator(
-    home, source, prepared, repairable, github
+@pytest.mark.parametrize("concurrent_edit", [False, True])
+def test_merge_conflict_returns_pr_to_fixer_on_current_base(
+    home, source, prepared, repairable, github, monkeypatch, concurrent_edit
 ):
     (source / "app.py").write_text("def average(values):\n    return 42\n")
-    git("add", "app.py", cwd=source)
+    (source / "unrelated.txt").write_text("preserve maintained-branch changes\n")
+    git("add", "app.py", "unrelated.txt", cwd=source)
     git(
         "-c",
         "user.name=Test",
@@ -266,8 +268,60 @@ def test_merge_conflict_records_inconclusive_without_starting_validator(
     assert not result["valid"]
     record = result["scans"][0]["validations"][0]
     assert record["outcome"] == "inconclusive" and record["state"] == "failed"
+    assert record["merge_conflicts"] == ["app.py"]
     assert not result["scans"][0]["usage"]["reported"]
     assert pull["draft"] and github["issues"][1]["state"] == "open"
+    from maxwell.repair import collect_repair_targets
+
+    targets = asyncio.run(collect_repair_targets(repairable[2], "acme/repo"))
+    assert len(targets) == 1, "A merge conflict must return the existing PR to the fixer"
+    assert targets[0].feedback[0].model_copy(update={"merge_conflicts": []}).requires_rebase
+    assert (
+        not targets[0]
+        .feedback[0]
+        .model_copy(
+            update={
+                "merge_conflicts": [],
+                "summary": "Validation failed: provider unavailable",
+            }
+        )
+        .requires_rebase
+    )
+    from maxwell.pipeline import load_snapshot
+
+    snapshot = asyncio.run(load_snapshot(repairable[2], "acme/repo"))
+    assert snapshot.items[0].stage == "repair"
+    assert "maxwell:validation:conflicted" in {label["name"] for label in pull["labels"]}
+    if concurrent_edit:
+        original = Repository.push_repair
+
+        def moved(repository, branch, commit, token, expected=None):
+            assert expected == prepared["commit"]
+            github["branches"][branch] = "f" * 40
+            pull["head"]["sha"] = "f" * 40
+            return original(repository, branch, commit, token, expected)
+
+        monkeypatch.setattr(Repository, "push_repair", moved)
+    repaired = run(home)
+    if concurrent_edit:
+        assert not repaired["valid"]
+        assert pull["head"]["sha"] == "f" * 40
+        assert github["branches"][prepared["branch"]] == "f" * 40
+        assert "refusing to overwrite" in json.dumps(repaired)
+        return
+    assert repaired["valid"], json.dumps(repaired, indent=2)
+    revision = repaired["scans"][0]["repairs"][0]
+    assert revision["parent_sha"] == base
+    assert revision["previous_head_sha"] == prepared["commit"]
+    assert revision["previous_id"] == prepared["id"]
+    assert revision["branch"] == prepared["branch"]
+    assert len(github["pulls"]) == 1 and pull["head"]["sha"] == revision["commit"]
+    assert (Path(revision["worktree"]) / "unrelated.txt").read_text() == (
+        "preserve maintained-branch changes\n"
+    )
+    validated = validate(home)
+    assert validated["valid"], json.dumps(validated, indent=2)
+    assert validated["scans"][0]["validations"][0]["outcome"] == "accepted"
 
 
 def test_failed_pr_push_is_retried_without_repeating_fixer(home, repairable, monkeypatch):
@@ -349,3 +403,74 @@ def test_pr_returning_to_previous_revision_gets_new_movement_record(
     result = validate(home)
     assert result["valid"], result
     assert result["scans"][0]["validations"][0]["pr_id"] == returned.id
+
+
+@pytest.mark.parametrize("kind", ["checks", "behind", "conflicts"])
+def test_merge_blocker_routes_to_fixer_and_updates_same_pr(
+    home, prepared, repairable, github, source, executable, kind
+):
+    from maxwell.pipeline import load_snapshot
+    from maxwell.repair import collect_repair_targets
+
+    pull = next(iter(github["pulls"].values()))
+    if kind == "checks":
+        github["statuses"][0].update(
+            state="failure", description="tests/test_app.py: expected floating-point zero"
+        )
+    else:
+        (source / "unrelated.txt").write_text("keep current main\n")
+        if kind == "conflicts":
+            (source / "app.py").write_text("def average(values):\n    return 42\n")
+        git("add", ".", cwd=source)
+        git(
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "advance main",
+            cwd=source,
+        )
+        base = git("rev-parse", "HEAD", cwd=source)
+        github["branches"]["main"] = base
+        pull["base"]["sha"] = base
+        pull["mergeable_state"] = "behind" if kind == "behind" else "dirty"
+        pull["mergeable"] = kind != "conflicts"
+    targets = asyncio.run(collect_repair_targets(repairable[2], "acme/repo"))
+    assert len(targets) == 1 and targets[0].merge_problem.kind == kind
+    if kind == "checks":
+        assert "expected floating-point zero" in targets[0].merge_problem.checks[0]["summary"]
+    snapshot = asyncio.run(load_snapshot(repairable[2], "acme/repo"))
+    assert snapshot.items[0].stage == "repair"
+    executable.write_text(executable.read_text().replace("if values else 0", "if values else 0.0"))
+    result = run(home)
+    assert result["valid"], json.dumps(result, indent=2)
+    revision = result["scans"][0]["repairs"][0]
+    assert revision["previous_head_sha"] == prepared["commit"]
+    assert revision["parent_sha"] == (prepared["commit"] if kind == "checks" else base)
+    assert len(github["pulls"]) == 1 and pull["head"]["sha"] == revision["commit"]
+    prompt = (home.root / "artifacts" / result["scans"][0]["id"] / "prompt.txt").read_text()
+    assert "Current GitHub merge blocker:" in prompt and '"kind":"' + kind + '"' in prompt
+    if kind != "checks":
+        assert (Path(revision["worktree"]) / "unrelated.txt").read_text() == "keep current main\n"
+    github["statuses"][0]["state"] = "success"
+    pull.update(mergeable=True, mergeable_state="clean")
+    validated = validate(home)
+    assert validated["valid"], json.dumps(validated, indent=2)
+    assert validated["scans"][0]["validations"][0]["outcome"] == "accepted"
+
+
+@pytest.mark.parametrize("state", ["pending", "optional_failure", "review_required"])
+def test_non_code_merge_blockers_do_not_start_fixer(home, prepared, repairable, github, state):
+    from maxwell.repair import collect_repair_targets
+
+    pull = next(iter(github["pulls"].values()))
+    pull["mergeable_state"] = "blocked"
+    if state == "pending":
+        github["statuses"][0]["state"] = "pending"
+    elif state == "optional_failure":
+        github["statuses"].append({"context": "optional", "state": "failure"})
+    assert asyncio.run(collect_repair_targets(repairable[2], "acme/repo")) == []

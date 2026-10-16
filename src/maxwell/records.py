@@ -148,11 +148,14 @@ class RepairRecord(Record):
     concerns: list[str] = Field(default_factory=list, max_length=50)
     availability: Literal["local-only"] = "local-only"
     parent_sha: Revision | None = None
+    previous_head_sha: Revision | None = None
     previous_id: Identifier | None = None
     lineage_id: Identifier | None = None
 
     @model_validator(mode="after")
     def check_prepared(self):
+        if self.previous_head_sha and not self.previous_id:
+            raise ValueError("A previous PR head requires a repair predecessor")
         if bool(self.previous_id) != bool(self.parent_sha) or bool(self.previous_id) != bool(
             self.lineage_id
         ):
@@ -286,6 +289,20 @@ class ValidationRecord(Record):
     pr_base: Revision | None = None
     tested_sha: Revision | None = None
     comparison_base_sha: Revision | None = None
+    merge_conflicts: list[str] = Field(default_factory=list)
+
+    @property
+    def requires_rebase(self):
+        return (
+            self.type == "validation"
+            and self.state == "failed"
+            and (
+                bool(self.merge_conflicts)
+                or self.summary.startswith(
+                    "Validation failed: Repair conflicts with target base in: "
+                )
+            )
+        )
 
     @model_validator(mode="after")
     def check_validation(self):
@@ -399,6 +416,8 @@ def record_digest(record):
     if isinstance(record, ExecutionRecord) and values["usage"]["spending"] is None:
         values["usage"].pop("spending")
     if isinstance(record, ValidationRecord):
+        if not values["merge_conflicts"]:
+            del values["merge_conflicts"]
         for name in ("before", "after"):
             if values[name] and values[name]["spending"] is None:
                 values[name].pop("spending")
@@ -423,7 +442,7 @@ def record_digest(record):
             if values[key] is None or values[key] == {}:
                 del values[key]
     if isinstance(record, RepairRecord):
-        for key in ("parent_sha", "previous_id", "lineage_id"):
+        for key in ("parent_sha", "previous_head_sha", "previous_id", "lineage_id"):
             if values[key] is None:
                 del values[key]
     if isinstance(record, ValidationRecord):

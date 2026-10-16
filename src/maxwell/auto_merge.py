@@ -1,5 +1,3 @@
-from urllib.parse import quote
-
 import httpx
 
 from maxwell.github import PublicationUncertain
@@ -48,50 +46,36 @@ def evidence_blocker(policy, link, finding, repair, validations, assessments):
 
 
 async def github_blocker(reporter, repo, pull):
-    if pull.get("mergeable") is not True or pull.get("mergeable_state") != "clean":
-        return "GitHub mergeability or repository rules are not satisfied yet"
-    path = f"repos/{repo}/branches/{quote(pull['base']['ref'], safe='')}/protection"
-    try:
-        protection = await reporter.call(reporter.github.request, "GET", path)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code in (403, 404):
-            return "cannot verify target branch protection; enable up-to-date required checks enforced for administrators"
-        raise
-    required = protection.get("required_status_checks") or {}
-    if not required.get("strict") or not (protection.get("enforce_admins") or {}).get("enabled"):
-        return (
-            "target branch must require up-to-date checks and enforce protection for administrators"
-        )
-    contexts = set(required.get("contexts") or [])
-    requirements = required.get("checks") or []
-    if not contexts and not requirements:
-        return "target branch has no required GitHub checks"
-    head = pull["head"]["sha"]
-    statuses = await reporter.call(
-        reporter.github.request, "GET", f"repos/{repo}/commits/{head}/status"
-    )
-    checks = await reporter.call(lambda: list(reporter.github.check_runs(repo, head)))
-    statuses = statuses.get("statuses", [])
-    if any(status.get("state") != "success" for status in statuses) or any(
-        check.get("status") != "completed" or check.get("conclusion") != "success"
-        for check in checks
-    ):
-        return "GitHub checks are pending or unsuccessful"
-    successful = {status["context"] for status in statuses} | {check["name"] for check in checks}
-    if not contexts <= successful or any(
-        requirement["context"] not in successful
-        or (
-            requirement.get("app_id") not in (None, -1)
-            and not any(
-                check["name"] == requirement["context"]
-                and check.get("app", {}).get("id") == requirement["app_id"]
-                for check in checks
-            )
-        )
-        for requirement in requirements
-    ):
-        return "required GitHub checks have not reported success for the current head"
+    url = pull.get("html_url") or f"https://github.com/{repo}/pull/{pull.get('number', '')}"
+    state = pull.get("mergeable_state")
+    if pull.get("mergeable") is False or state == "dirty":
+        return f"PR has merge conflicts; update the repair against its target branch: {url}"
+    if pull.get("mergeable") is None or state in (None, "unknown"):
+        return f"GitHub is calculating mergeability; Maxwell will recheck: {url}"
+    if state == "behind":
+        return f"Update the PR branch to satisfy GitHub's up-to-date requirement, then revalidate: {url}"
+    if state == "blocked":
+        return f"GitHub blocks merging; resolve pending or failed required checks, required reviews, or repository rules: {url}"
+    if state not in ("clean", "unstable", "has_hooks"):
+        return f"GitHub reports merge state {state!r}; inspect the PR's merge requirements: {url}"
     return None
+
+
+def merge_error_message(response, repo, number, method):
+    try:
+        detail = response.json().get("message") or "GitHub returned no reason"
+    except (ValueError, AttributeError):
+        detail = "GitHub returned no reason"
+    instructions = {
+        401: "Replace the expired or invalid GitHub token and run maxwell config apply",
+        403: "Check repository write access, token Contents and Pull requests write permissions, SSO authorization, and organization rules; run maxwell config apply",
+        404: "Check that this token can access the repository and PR; run maxwell config apply",
+        405: "Resolve the required checks, reviews, merge queue, or branch rules shown on the PR",
+        409: "The PR head changed; synchronize and run fresh validation",
+        422: f"Check that {method!r} merging is enabled in Settings > General > Pull Requests, or change repair.auto_merge.merge_method and run maxwell config apply",
+    }
+    advice = instructions.get(response.status_code, "Inspect the PR's merge requirements")
+    return f"GitHub denied the merge (HTTP {response.status_code}): {detail}. {advice}. https://github.com/{repo}/pull/{number}"
 
 
 def save_action(reporter, repo, identity, state, error=None):
@@ -227,6 +211,9 @@ async def try_auto_merge(reporter, repo, link, verdict):
         or (final["head"]["sha"], final["base"]["sha"]) != (link.head_sha, link.base_sha)
     ):
         return "PR changed before merge; fresh validation required"
+    blocker = await github_blocker(reporter, repo, final)
+    if blocker:
+        return blocker
     blocker = await integration_pool_blocker(reporter, repo)
     if blocker:
         return blocker
@@ -256,12 +243,17 @@ async def try_auto_merge(reporter, repo, link, verdict):
         return "merge response lost; waiting for GitHub reconciliation, without retrying the merge"
     except httpx.HTTPStatusError as exc:
         save_action(reporter, repo, identity, "blocked", f"HTTP {exc.response.status_code}")
-        if exc.response.status_code in (403, 405, 409, 422):
-            return f"GitHub denied the merge (HTTP {exc.response.status_code}); permissions, checks or repository rules block it"
+        if exc.response.status_code in (401, 403, 404, 405, 409, 422):
+            return reporter.config.redact(
+                merge_error_message(exc.response, repo, link.number, policy.merge_method)
+            )[:2000]
         raise
     if not result.get("merged"):
         save_action(reporter, repo, identity, "blocked", "GitHub did not merge the PR")
-        return "GitHub did not merge the PR; checks or repository rules block it"
+        detail = reporter.config.redact(str(result.get("message") or "GitHub returned no reason"))[
+            :600
+        ]
+        return f"GitHub did not merge the PR: {detail}. Inspect required checks, reviews and repository rules: https://github.com/{repo}/pull/{link.number}"
     actual = await reporter.call(reporter.github.pull, repo, link.number)
     if not actual.get("merged") or not actual.get("merge_commit_sha"):
         save_action(reporter, repo, identity, "uncertain", "Merge response awaits PR confirmation")

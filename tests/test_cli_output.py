@@ -440,6 +440,37 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
     assert not display.spending
 
 
+def test_pipeline_counts_preparation_failures_without_inventing_agent_spending():
+    display = ScanDisplay(io.StringIO())
+    stages = ["repair", "validate"]
+    display(
+        {"repository": "acme/repo", "state": "plan", "stages": stages, "pipeline": "repair-all"}
+    )
+    for index in range(4):
+        display(
+            {
+                "state": "completed" if index == 0 else "failed",
+                "id": str(index),
+                "executed": int(index == 0),
+                "usage": {"spending": {"micros": 1000, "complete": True}} if index == 0 else {},
+            }
+        )
+    event = {
+        "repository": "acme/repo",
+        "state": "pools",
+        "pools": {},
+        "capacities": {},
+        "counts": {"validate": 3, "repair": 1},
+    }
+    display(event)
+    display(event)
+    panel = "\n".join(display.panel("1:00"))
+    assert "4 executions" in panel and "$0.0010 USD" in panel
+    assert not display.unknown_spending
+    display({**event, "repository": "acme/other", "counts": {"repair": 2}})
+    assert display.execution_count == 6
+
+
 def test_batch_summary_uses_dashboard_without_per_execution_link_wall():
     result = {
         "pipeline": "repair-all",

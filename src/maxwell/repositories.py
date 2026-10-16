@@ -8,6 +8,12 @@ import subprocess
 from pathlib import Path
 
 
+class RepairMergeConflict(ValueError):
+    def __init__(self, paths):
+        self.paths = paths
+        super().__init__("Repair conflicts with target base in: " + ", ".join(paths))
+
+
 def git(*args, cwd=None, token=None, strip=True):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -280,9 +286,7 @@ class Repository:
             conflicts = git("diff", "--name-only", "--diff-filter=U", cwd=worktree)
             self.cleanup(worktree)
             if conflicts:
-                raise ValueError(
-                    "Repair conflicts with target base in: " + ", ".join(conflicts.splitlines())
-                ) from exc
+                raise RepairMergeConflict(conflicts.splitlines()) from exc
             raise
 
     def unchanged(self, worktree, sha):

@@ -34,6 +34,7 @@ class ScanDisplay:
         self.backlog = {}
         self.capacities = {}
         self.execution_count = 0
+        self.pipeline_counts = {}
         self.settled_spending = None
         self.unknown_spending = False
         self.status_url = None
@@ -60,6 +61,7 @@ class ScanDisplay:
             self.backlog = {}
             self.capacities = {}
             self.execution_count = 0
+            self.pipeline_counts = {}
             self.status_url = None
             self.settled_spending = None
             self.unknown_spending = False
@@ -106,6 +108,9 @@ class ScanDisplay:
             self.repository = event["repository"]
             self.pools, self.capacities = event["pools"], event["capacities"]
             self.backlog = event.get("backlog", {})
+            if "counts" in event:
+                self.pipeline_counts[event["repository"]] = sum(event["counts"].values())
+                self.execution_count = sum(self.pipeline_counts.values())
             self.status_url = event.get("status_url")
             self.statuses = {}
             self.stage = None

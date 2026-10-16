@@ -89,7 +89,7 @@ def test_validation_notes_are_advisory_and_blockers_are_inconclusive(
     from maxwell.records import record_digest
 
     legacy = record.model_copy(update={"result": record.result.model_copy(update={"notes": []})})
-    values = legacy.model_dump(mode="json")
+    values = legacy.model_dump(mode="json", exclude={"merge_conflicts"})
     values.pop("spending", None)
     for name in ("before", "after"):
         if values.get(name):

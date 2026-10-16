@@ -220,7 +220,11 @@ def validate_config(
             if identity is not None:
                 for repository, account in repositories:
                     if account == name:
-                        github_check(client, f"repos/{repository}", f"repository:{repository}", add)
+                        metadata = github_check(
+                            client, f"repos/{repository}", f"repository:{repository}", add
+                        )
+                        if metadata is not None:
+                            repository_checks(metadata, repository, config.repair.auto_merge, add)
         finally:
             client.close()
     for check in checks:
@@ -266,6 +270,77 @@ def provider_check(config, name, model, label, add, effort=None, unrestricted=Fa
         add(label, "ok", "Authenticated request succeeded; model access verified")
 
 
+def repository_checks(metadata, repository, policy, add):
+    label = f"repository:{repository}"
+    if metadata.get("archived"):
+        add(
+            label + ":writes",
+            "error",
+            "Repository is archived and read-only; unarchive it in Settings > General or remove it from Maxwell",
+        )
+    if metadata.get("disabled"):
+        add(
+            label + ":writes",
+            "error",
+            "GitHub has disabled this repository; ask its owner or GitHub Support to restore access",
+        )
+    if metadata.get("has_issues") is False:
+        add(
+            label + ":findings",
+            "error",
+            "GitHub Issues are disabled; enable Issues in Settings > General > Features to publish Maxwell findings",
+        )
+    if not policy.enabled:
+        return
+    permission = (metadata.get("permissions") or {}).get("push")
+    if permission is False:
+        add(
+            label + ":merge_access",
+            "error",
+            "GitHub reports no repository write access for this account; grant Write access and token Contents and Pull requests write permissions, authorize SSO if needed, then rerun maxwell config apply",
+        )
+    else:
+        add(
+            label + ":merge_access",
+            "ok" if permission else "skipped",
+            "Repository write access is reported; token-specific write grants and PR rules are checked when merging"
+            if permission
+            else "GitHub did not report write permissions; ensure token Contents and Pull requests write access. Actual merge authorization is checked when merging",
+        )
+    method_flags = {
+        "merge": "allow_merge_commit",
+        "squash": "allow_squash_merge",
+        "rebase": "allow_rebase_merge",
+    }
+    allowed = metadata.get(method_flags[policy.merge_method])
+    if allowed is False:
+        alternatives = [
+            method for method, flag in method_flags.items() if metadata.get(flag) is True
+        ]
+        advice = (
+            f"set repair.auto_merge.merge_method to {', '.join(alternatives)}"
+            if alternatives
+            else "enable a merge method in Settings > General > Pull Requests"
+        )
+        add(
+            label + ":merge_method",
+            "error",
+            f"Repository disables {policy.merge_method} merging; {advice}, then rerun maxwell config apply",
+        )
+    elif allowed is True:
+        add(
+            label + ":merge_method",
+            "ok",
+            f"Repository allows {policy.merge_method} merges; CI and branch protection are not required by Maxwell",
+        )
+    else:
+        add(
+            label + ":merge_method",
+            "skipped",
+            "GitHub did not report allowed merge methods; the merge API will verify the configured method",
+        )
+
+
 def github_check(client, path, label, add):
     try:
         result = client.request("GET", path)
@@ -273,7 +348,7 @@ def github_check(client, path, label, add):
         code = exc.response.status_code
         messages = {
             401: "GitHub rejected the token; check whether it is invalid or expired",
-            403: "GitHub denied access; check permissions, organization authorization, or rate limits",
+            403: "GitHub denied access; grant the token access to this repository, authorize organization SSO if required, and check token permissions or organization policy",
             404: "Repository does not exist or this account cannot access it",
         }
         add(

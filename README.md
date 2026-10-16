@@ -133,8 +133,12 @@ Invalid YAML or configuration changes during apply preserve the previous stored 
 top-level `init` command have been removed. `maxwell --help` displays a command tree;
 subcommand help shows the detailed options.
 
-GitHub checks verify identity and repository read access; write permissions are not
-tested.
+GitHub checks verify identity and repository read access. `config apply` also reports
+archived/disabled repositories and disabled Issues with instructions. When automatic
+merging is enabled, it checks reported repository write access and whether the configured
+merge method is enabled. These checks reuse repository metadata; they do not create a PR
+or require access to branch-protection settings. Missing permission metadata is reported
+as unverified. Token-specific write grants and PR-specific rules are enforced at runtime.
 
 During one command or daemon lifetime, GitHub reads reuse a bounded, account-specific
 ETag cache. Every reuse is revalidated with GitHub; authenticated `304 Not Modified`
@@ -456,8 +460,8 @@ attempts repair at most once per finding; a later run can amend rejected PRs.
 The progress panel shows pool occupancy, current activity, and cumulative estimated
 spending. The final batch summary links to the main status issue.
 
-For automatic merges, enable `repair.auto_merge` below and satisfy the existing
-GitHub protection/check requirements. Otherwise PRs wait for manual merge; the next
+For automatic merges, enable `repair.auto_merge` below and satisfy any merge requirements
+configured by the repository. Otherwise PRs wait for manual merge; the next
 reconciliation picks up their integration verification. New automated repairs require
 an actionable audit or human decision; previously prepared PRs can resume using their
 original valid assessment inputs.
@@ -502,6 +506,16 @@ Publication retries reconcile existing branches and PR markers without rerunning
 A rejected PR is amended on the **same branch and PR**. `--force` revises an existing open
 PR even without rejection. The remote push uses an exact lease and refuses to overwrite
 unexpected changes. Amendment records preserve predecessor, parent revision, and lineage.
+Merge conflicts, outdated branches, and failed required CI checks return the PR to the fixer
+automatically in batch and continuous pipelines. For conflicts and outdated branches, the
+fixer rebuilds the repair on the current target base, preserving unrelated base changes.
+For failed required checks, it receives bounded check output tied to the current PR revision.
+Reading this evidence needs token Checks and Commit statuses read access. The fixer updates
+the same PR with an exact lease before fresh independent validation. A validation that finds
+conflicts applies `maxwell:validation:conflicted`. Pending checks, required human approvals,
+and access restrictions wait with diagnostics. A fixer reporting blocked or failed host checks
+waits for changed inputs or an explicit `--force` retry; operational failures remain retryable.
+Generic validation failures remain validation work; they do not trigger a rewrite of the repair.
 `--limit` is rejected for repair.
 
 ### Independently validate a repair PR
@@ -579,16 +593,21 @@ or inconclusive verdict blocks merging. Use `--force` to replace current validat
 collect the independent votes again. Unresolved source concerns, failed host checks, and
 missing original-defect regression evidence for bugs also block auto-merge.
 
-Maxwell checks GitHub rules and all reported checks for the current head. The target branch
-must have required status checks with **Require branches to be up to date before merging**
-and **Do not allow bypassing the above settings** enabled (the branch-protection API must
-report `strict: true` and `enforce_admins.enabled: true`). The token needs permission to
-read protection/checks and merge PRs. Equivalent ruleset-only configurations are not yet
-recognized and remain blocked. Maxwell does not change protection or bypass approvals.
+Maxwell uses GitHub's mergeability result and merge API to respect the repository's
+configured requirements, including branch protection and rulesets. CI, required checks,
+administrator enforcement, and GitHub's **Allow auto-merge** setting are not prerequisites:
+Maxwell sends an ordinary merge request after its own validation passes. Non-required
+checks do not introduce extra Maxwell merge restrictions. Repositories without CI or
+protection can merge normally. The token needs repository access with Contents and
+Pull requests write permissions; administration-read permission is not required.
+Maxwell does not change repository rules or request an administrative bypass.
 
-Head and base must still match the validated revision. The merge request pins the head;
-server-enforced up-to-date protection guards against a concurrent base change. Pending
-checks or protection/permission failures leave the PR waiting, with the reason in its
+Head and base must still match the validated revision at the final check. The merge
+request pins the head; GitHub does not offer an expected-base parameter, so without
+server-enforced up-to-date rules a concurrent base change is detected during independent
+integration verification. Failed required checks and conflicts route back to repair. Pending
+checks, reviews, merge queues, or permission failures leave the PR waiting, with GitHub's
+reason and corrective instructions in its
 single updated validation summary. Later GitHub syncs recheck eligibility without rerunning
 completed validators. After a lost response, Maxwell reconciles the PR's merged state and
 does not resend an uncertain merge. If GitHub still reports it open, the uncertainty remains

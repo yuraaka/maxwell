@@ -6,6 +6,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+import httpx
+
 from maxwell.assessment import active_assessments, collect_targets, finding_assessments
 from maxwell.contracts import micros
 from maxwell.github import GitHub
@@ -14,7 +16,7 @@ from maxwell.measurement import projected_measurements
 from maxwell.measurement_runner import measure_one
 from maxwell.progress import ScanProgress
 from maxwell.records import RECORD_ADAPTER
-from maxwell.repair import collect_repair_targets
+from maxwell.repair import collect_repair_targets, merge_repair_problem
 from maxwell.repair_pull_requests import active_validations, records
 from maxwell.reporting import Reporter
 from maxwell.validation import collect_validation_targets
@@ -85,6 +87,8 @@ def classify_item(
             record.id for record in input_assessments(finding, assessments)
         }:
             return item("repair", reason="repair assessment inputs changed")
+        if any(record.state == "failed" and record.requires_rebase for record in votes):
+            return item("repair", "repair")
         completed = [record for record in votes if record.state == "completed"]
         if any(record.outcome == "rejected" for record in completed):
             return item("repair", "repair")
@@ -183,7 +187,24 @@ async def load_snapshot(reporter, repository):
             commit["sha"],
             reporter.config.repair.auto_merge,
         )
-        if item.pool == "validate" and link and link.number in reporter.merge_statuses:
+        if link and (item.stage in ("repair", "validate") or item.pool == "validate"):
+            try:
+                problem = await merge_repair_problem(reporter, repository, pull)
+            except (httpx.HTTPError, ValueError) as exc:
+                item.stage = None
+                item.reason = (
+                    "Cannot inspect PR merge blocker; check token Checks/Commit statuses read access or retry: "
+                    + reporter.config.redact(str(exc))
+                )
+            else:
+                if problem:
+                    item.pool, item.stage, item.reason = "repair", "repair", ""
+        if (
+            item.pool == "validate"
+            and link
+            and link.number in reporter.merge_statuses
+            and not item.reason.startswith("Cannot inspect")
+        ):
             item.reason = f"PR #{link.number}: auto-merge {reporter.merge_statuses[link.number]}"
         items.append(item)
     known = {item.identity for item in items}
@@ -608,12 +629,20 @@ async def run_pipeline(
                                 message = result.get("error") or "; ".join(
                                     result["publication_errors"]
                                 )
+                                needs_evidence = (
+                                    stage == "repair"
+                                    and not result["publication_errors"]
+                                    and any(
+                                        repair["outcome"] in ("blocked", "checks_failed")
+                                        for repair in result.get("repairs", [])
+                                    )
+                                )
                                 ledger.save(
                                     repository,
                                     stage,
                                     subject,
                                     identity,
-                                    "completed" if success else "failed",
+                                    "completed" if success or needs_evidence else "failed",
                                     message,
                                 )
                                 context.counts[stage] += 1

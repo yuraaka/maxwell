@@ -202,7 +202,15 @@ def github():
                         else []
                     )
                 elif len(parts) == 5 and parts[-2] == "pulls":
-                    data = state["pulls"][int(parts[-1])]
+                    data = dict(state["pulls"][int(parts[-1])])
+                    required = (
+                        (state["protection"] or {}).get("required_status_checks") or {}
+                    ).get("contexts", [])
+                    passed = {
+                        item["context"] for item in state["statuses"] if item["state"] == "success"
+                    }
+                    if data.get("mergeable_state") == "clean" and not set(required) <= passed:
+                        data["mergeable_state"] = "blocked"
                 elif len(parts) == 6 and parts[-1] == "reviews":
                     data = state["reviews"].get(int(parts[-2]), []) if page == 1 else []
                 elif len(parts) == 4 and parts[-1] == "issues":
@@ -232,6 +240,64 @@ def github():
             parts = urlparse(self.path).path.strip("/").split("/")
             with lock:
                 if parts == ["graphql"]:
+                    if "query MaxwellRepairChecks" in data["query"]:
+                        number = data["variables"]["number"]
+                        pull = state["pulls"][number]
+                        required = (
+                            (state["protection"] or {}).get("required_status_checks") or {}
+                        ).get("contexts", [])
+                        nodes = [
+                            {
+                                "context": item["context"],
+                                "state": item["state"].upper(),
+                                "description": item.get("description", ""),
+                                "targetUrl": item.get("target_url"),
+                                "isRequired": item["context"] in required,
+                            }
+                            for item in state["statuses"]
+                        ] + [
+                            {
+                                "databaseId": item.get("id"),
+                                "name": item["name"],
+                                "status": item["status"].upper(),
+                                "conclusion": str(item.get("conclusion", "")).upper(),
+                                "detailsUrl": item.get("details_url"),
+                                "summary": item.get("output", {}).get("summary"),
+                                "text": item.get("output", {}).get("text"),
+                                "isRequired": item["name"] in required,
+                            }
+                            for item in state["check_runs"]
+                        ]
+                        return self.respond(
+                            200,
+                            {
+                                "data": {
+                                    "repository": {
+                                        "pullRequest": {
+                                            "headRefOid": pull["head"]["sha"],
+                                            "baseRefOid": pull["base"]["sha"],
+                                            "commits": {
+                                                "nodes": [
+                                                    {
+                                                        "commit": {
+                                                            "statusCheckRollup": {
+                                                                "contexts": {
+                                                                    "nodes": nodes,
+                                                                    "pageInfo": {
+                                                                        "hasNextPage": False,
+                                                                        "endCursor": None,
+                                                                    },
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                        }
+                                    }
+                                }
+                            },
+                        )
                     number = int(data["variables"]["id"].split("-")[-1])
                     state["pulls"][number]["draft"] = "convertPullRequestToDraft" in data["query"]
                     self.respond(200, {"data": {"ok": True}})

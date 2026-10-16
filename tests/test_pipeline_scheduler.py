@@ -403,6 +403,31 @@ def test_snapshot_batch_continues_past_failure_and_excludes_new_findings(schedul
     assert report["pipeline_repositories"][0]["remaining"] == 1
 
 
+@pytest.mark.parametrize("outcome", ["blocked", "checks_failed"])
+def test_unsuccessful_amendment_waits_for_new_evidence_after_cooldown(
+    scheduler, monkeypatch, outcome
+):
+    scheduler.state.clear()
+    scheduler.state[1] = ("repair", "repair")
+    now = [1000.0]
+    monkeypatch.setattr("maxwell.pipeline.time.time", lambda: now[0])
+
+    async def execute(*args, stage, **kwargs):
+        scheduler.executions.append(stage)
+        return {**scheduler.result(stage, outcome), "repairs": [{"outcome": outcome}]}
+
+    report = asyncio.run(scheduler.run(execute))
+    assert not report["valid"]
+    assert scheduler.executions == ["repair"]
+    attempt = scheduler.store.one("SELECT * FROM pipeline_attempts")
+    now[0] += scheduler.config.pipeline.retry_seconds * 2
+    ledger = AttemptLedger(scheduler.store, scheduler.config, True)
+    assert "waiting for new evidence" in ledger.blocker(
+        "acme/repo", "repair", attempt["subject"], attempt["fingerprint"]
+    )
+    assert ledger.blocker("acme/repo", "repair", attempt["subject"], "new-check-run") is None
+
+
 def test_scheduler_drains_downstream_before_admitting_upstream(scheduler):
     scheduler.config.pipeline.pools.review = 1
     scheduler.state[2] = ("review", "audit")

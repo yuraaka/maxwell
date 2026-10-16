@@ -221,6 +221,7 @@ def test_label_setup_creates_only_missing_labels(home, github):
     client = GitHub(home.load().github)
     try:
         client.ensure_labels("acme/repo")
+        assert "maxwell:validation:conflicted" in github["labels"]
         writes = sum(method == "POST" for method, _, _ in github["requests"])
         assert writes > 0
         client.ensure_labels("acme/repo")
