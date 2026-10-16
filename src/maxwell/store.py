@@ -4,12 +4,25 @@ import time
 import uuid
 from datetime import UTC, datetime
 
+from maxwell.records import (
+    RECORD_ADAPTER,
+    AssessmentRecord,
+    IntegrationRecord,
+    RepairPullRequestRecord,
+    RepairRecord,
+    StageExecution,
+    ValidationRecord,
+    record_digest,
+)
+
+SCHEMA_VERSION = 13
+
 
 class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path, timeout=10)
         self.db.row_factory = sqlite3.Row
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 6:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             self.db.close()
             raise ValueError("State database was created by a newer Maxwell version")
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -39,15 +52,31 @@ class Store:
                 repository TEXT PRIMARY KEY, issue INTEGER, url TEXT,
                 state TEXT NOT NULL DEFAULT 'pending', error TEXT
             );
+            CREATE TABLE IF NOT EXISTS histories (
+                repository TEXT PRIMARY KEY, issue INTEGER, url TEXT,
+                state TEXT NOT NULL DEFAULT 'pending', error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS repair_publications (
+                repository TEXT NOT NULL, repair_id TEXT NOT NULL, finding_issue INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', number INTEGER, data TEXT, error TEXT,
+                PRIMARY KEY(repository,repair_id)
+            );
+            CREATE TABLE IF NOT EXISTS pr_actions (
+                repository TEXT NOT NULL, id TEXT NOT NULL, action TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', error TEXT,
+                PRIMARY KEY(repository,id,action)
+            );
+            CREATE TABLE IF NOT EXISTS pipeline_attempts (
+                repository TEXT NOT NULL REFERENCES repositories(name),
+                stage TEXT NOT NULL, subject TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                attempted REAL NOT NULL, state TEXT NOT NULL, error TEXT,
+                PRIMARY KEY(repository,stage,subject,fingerprint)
+            );
             CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY, created REAL NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS scans_ready ON scans(state, priority, created);
-            CREATE TABLE IF NOT EXISTS repository_stage_routes (
-                repository TEXT NOT NULL REFERENCES repositories(name), stage TEXT NOT NULL,
-                provider TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY(repository,stage)
-            );
             CREATE TABLE IF NOT EXISTS finding_observations (
                 finding_id TEXT NOT NULL REFERENCES findings(id),
                 scan_id TEXT NOT NULL REFERENCES scans(id), data TEXT NOT NULL,
@@ -59,6 +88,35 @@ class Store:
             CREATE TABLE IF NOT EXISTS config_application (
                 id INTEGER PRIMARY KEY CHECK(id=1), config_digest TEXT NOT NULL,
                 checked_at REAL NOT NULL, valid INTEGER NOT NULL, checks TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS github_records (
+                repository TEXT NOT NULL REFERENCES repositories(name),
+                type TEXT NOT NULL, id TEXT NOT NULL, issue INTEGER NOT NULL,
+                comment INTEGER NOT NULL DEFAULT 0, author TEXT NOT NULL,
+                data TEXT NOT NULL, digest TEXT NOT NULL, source_digest TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'current', observed REAL NOT NULL,
+                PRIMARY KEY(repository,type,id), UNIQUE(repository,issue,comment)
+            );
+            CREATE TABLE IF NOT EXISTS github_record_history (
+                repository TEXT NOT NULL REFERENCES repositories(name),
+                issue INTEGER NOT NULL, comment INTEGER NOT NULL,
+                source_digest TEXT NOT NULL, author TEXT NOT NULL, data TEXT NOT NULL,
+                observed REAL NOT NULL, PRIMARY KEY(repository,issue,comment,source_digest)
+            );
+            CREATE TABLE IF NOT EXISTS record_publications (
+                repository TEXT NOT NULL REFERENCES repositories(name),
+                type TEXT NOT NULL, id TEXT NOT NULL, issue INTEGER NOT NULL,
+                data TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', error TEXT,
+                PRIMARY KEY(repository,type,id)
+            );
+            CREATE TABLE IF NOT EXISTS stage_executions (
+                id TEXT PRIMARY KEY, repository TEXT NOT NULL REFERENCES repositories(name),
+                state TEXT NOT NULL, data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS measurements (
+                id TEXT PRIMARY KEY, repository TEXT NOT NULL REFERENCES repositories(name),
+                state TEXT NOT NULL, created REAL NOT NULL, finished REAL, sha TEXT,
+                artifact TEXT, data TEXT, error TEXT
             );
         """)
         with self.db:
@@ -79,17 +137,14 @@ class Store:
                 ("execution", "TEXT"),
                 ("accounting", "TEXT NOT NULL DEFAULT 'usd'"),
                 ("executed", "INTEGER NOT NULL DEFAULT 0"),
+                ("selection", "TEXT"),
             ):
                 if name not in scan_columns:
                     self.db.execute(f"ALTER TABLE scans ADD COLUMN {name} {definition}")
             if "executed" not in scan_columns:
                 self.db.execute("UPDATE scans SET executed=1 WHERE started IS NOT NULL")
-            route_columns = {
-                row["name"] for row in self.db.execute("PRAGMA table_info(repository_stage_routes)")
-            }
-            if "effort" not in route_columns:
-                self.db.execute("ALTER TABLE repository_stage_routes ADD COLUMN effort TEXT")
-            self.db.execute("PRAGMA user_version=6")
+            self.db.execute("DROP TABLE IF EXISTS repository_stage_routes")
+            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def close(self):
         self.db.close()
@@ -107,19 +162,326 @@ class Store:
             (time.time(), kind, json.dumps(data)),
         )
 
-    def apply_models(self, report, digest):
+    def project_record(self, record, issue, comment, author, source_digest):
+        record = RECORD_ADAPTER.validate_python(record)
+        if (
+            isinstance(record, AssessmentRecord)
+            and record.role == "human"
+            and record.actor != author
+        ):
+            raise ValueError("Human assessment actor does not match GitHub author")
+        data, digest = record.model_dump_json(), record_digest(record)
+        with self.db:
+            existing = self.one(
+                "SELECT * FROM github_records WHERE repository=? AND type=? AND id=?",
+                (record.repository, record.type, record.id),
+            )
+            source = self.one(
+                "SELECT * FROM github_records WHERE repository=? AND issue=? AND comment=?",
+                (record.repository, issue, comment),
+            )
+            if source and (source["id"], source["type"]) != (record.id, record.type):
+                raise ValueError("A GitHub source cannot change record identity")
+            if existing and (existing["issue"], existing["comment"]) != (issue, comment):
+                raise ValueError("Record identity already belongs to another GitHub source")
+            if isinstance(record, RepairPullRequestRecord):
+                repair_row = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='repair' AND id=? AND status='current'",
+                    (record.repository, issue, record.repair_id),
+                )
+                if not repair_row or issue != record.finding_issue:
+                    raise ValueError("PR association requires its repair on the finding issue")
+                if record.previous_id:
+                    prior_row = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND id=? AND status='current'",
+                        (record.repository, record.previous_id),
+                    )
+                    if not prior_row:
+                        raise ValueError("PR revision predecessor is missing")
+                    prior = RECORD_ADAPTER.validate_json(prior_row["data"])
+                    if (
+                        prior.number,
+                        prior.finding_id,
+                        prior.finding_issue,
+                        prior.branch,
+                        prior.base_branch,
+                    ) != (
+                        record.number,
+                        record.finding_id,
+                        record.finding_issue,
+                        record.branch,
+                        record.base_branch,
+                    ):
+                        raise ValueError("PR revision predecessor belongs to a different PR")
+                repair = RECORD_ADAPTER.validate_json(repair_row["data"])
+                if (
+                    repair.finding_id != record.finding_id
+                    or repair.sha != record.sha
+                    or repair.branch != record.branch
+                    or (record.provenance == "fixer" and repair.commit != record.head_sha)
+                ):
+                    raise ValueError("PR association does not match its repair")
+            if isinstance(record, ValidationRecord):
+                subject_issue = issue
+                association = None
+                if record.pr_id:
+                    link = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND id=? AND status='current'",
+                        (record.repository, record.pr_id),
+                    )
+                    if not link:
+                        raise ValueError("Validation requires its PR association")
+                    association = RECORD_ADAPTER.validate_json(link["data"])
+                    subject_issue = association.finding_issue
+                    if not isinstance(record, IntegrationRecord) and record.sha != record.pr_head:
+                        raise ValueError("PR validation must identify its exact head revision")
+                    if (
+                        association.number != issue
+                        or association.repair_id != record.repair_id
+                        or association.finding_id != record.finding_id
+                        or association.head_sha != record.pr_head
+                        or association.base_sha != record.pr_base
+                    ):
+                        raise ValueError("Validation belongs to a different PR revision")
+                repair_row = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='repair' AND id=? AND status='current'",
+                    (record.repository, subject_issue, record.repair_id),
+                )
+                if not repair_row:
+                    raise ValueError("Validation requires its current repair record")
+                repair = RECORD_ADAPTER.validate_json(repair_row["data"])
+                if (
+                    repair.finding_id != record.finding_id
+                    or repair.sha != record.base_sha
+                    or (not association and repair.commit != record.sha)
+                    or repair.outcome != "prepared"
+                    or set(repair.references) != set(record.references)
+                    or (repair.agent.adapter, repair.agent.model)
+                    == (record.agent.adapter, record.agent.model)
+                ):
+                    raise ValueError(
+                        "Validation provenance or independent agent does not match repair"
+                    )
+                finding_row = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='finding' AND status='current'",
+                    (record.repository, subject_issue),
+                )
+                if not finding_row:
+                    raise ValueError("Validation requires its current finding")
+                subject = RECORD_ADAPTER.validate_json(finding_row["data"])
+                if subject.id != record.finding_id or subject.sha != record.base_sha:
+                    raise ValueError("Validation targets a different finding or revision")
+                if (
+                    record.outcome == "accepted"
+                    and subject.finding.kind == "bug"
+                    and (
+                        not record.replay
+                        or record.replay.state != "failed"
+                        or record.replay.returncode != 1
+                        or not record.failures
+                        or any(item.get("phase") != "call" for item in record.failures)
+                        or record.result.reproduction != "reproduced"
+                    )
+                ):
+                    raise ValueError(
+                        "Accepted bug validation requires original-defect reproduction"
+                    )
+                for reference in record.supersedes:
+                    previous = self.one(
+                        "SELECT issue,data FROM github_records WHERE repository=? AND type=? AND id=?",
+                        (record.repository, record.type, reference),
+                    )
+                    if not previous:
+                        raise ValueError("Superseded validation is missing")
+                    prior = RECORD_ADAPTER.validate_json(previous["data"])
+                    if (
+                        previous["issue"] != issue
+                        or prior.repair_id != record.repair_id
+                        or prior.sha != record.sha
+                        or prior.pr_id != record.pr_id
+                        or prior.pr_head != record.pr_head
+                        or prior.pr_base != record.pr_base
+                    ):
+                        raise ValueError("Validation supersedes a different repair")
+            if isinstance(record, RepairRecord):
+                finding = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND issue=? "
+                    "AND type='finding' AND status='current'",
+                    (record.repository, issue),
+                )
+                if not finding:
+                    raise ValueError("Repair requires its current finding record")
+                if record.previous_id:
+                    prior_row = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND issue=? AND type='repair' AND id=? AND status='current'",
+                        (record.repository, issue, record.previous_id),
+                    )
+                    if not prior_row:
+                        raise ValueError("Repair amendment predecessor is missing")
+                    prior = RECORD_ADAPTER.validate_json(prior_row["data"])
+                    if (
+                        prior.branch != record.branch
+                        or (prior.lineage_id or prior.execution_id) != record.lineage_id
+                        or prior.finding_id != record.finding_id
+                    ):
+                        raise ValueError("Repair amendment belongs to a different lineage")
+                subject = RECORD_ADAPTER.validate_json(finding["data"])
+                if subject.id != record.finding_id or subject.sha != record.sha:
+                    raise ValueError("Repair targets a different finding or revision")
+            if isinstance(record, (AssessmentRecord, RepairRecord, ValidationRecord)):
+                for reference in [
+                    *record.references,
+                    *(
+                        [record.supersedes]
+                        if isinstance(record, AssessmentRecord) and record.supersedes
+                        else []
+                    ),
+                ]:
+                    target = self.one(
+                        "SELECT data FROM github_records WHERE repository=? AND type='assessment' AND id=?",
+                        (record.repository, reference),
+                    )
+                    if not target and isinstance(record, ValidationRecord):
+                        raise ValueError("Validation assessment reference is missing")
+                    if target:
+                        assessment = RECORD_ADAPTER.validate_json(target["data"])
+                        if assessment.finding_id != record.finding_id or assessment.sha != (
+                            record.base_sha if isinstance(record, ValidationRecord) else record.sha
+                        ):
+                            raise ValueError(
+                                "Assessment references a different finding or revision"
+                            )
+            self.db.execute(
+                "INSERT OR IGNORE INTO github_record_history "
+                "(repository,issue,comment,source_digest,author,data,observed) VALUES(?,?,?,?,?,?,?)",
+                (record.repository, issue, comment, source_digest, author, data, time.time()),
+            )
+            status = (
+                "changed"
+                if existing and (existing["digest"] != digest or existing["author"] != author)
+                else "current"
+            )
+            self.db.execute(
+                "INSERT INTO github_records "
+                "(repository,type,id,issue,comment,author,data,digest,source_digest,status,observed) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(repository,type,id) DO UPDATE SET "
+                "source_digest=excluded.source_digest,status=excluded.status,observed=excluded.observed",
+                (
+                    record.repository,
+                    record.type,
+                    record.id,
+                    issue,
+                    comment,
+                    author,
+                    data,
+                    digest,
+                    source_digest,
+                    status,
+                    time.time(),
+                ),
+            )
+        return status
+
+    def reconcile_records(self, repository, issue, seen):
+        with self.db:
+            for row in self.rows(
+                "SELECT comment FROM github_records WHERE repository=? AND issue=?",
+                (repository, issue),
+            ):
+                if row["comment"] not in seen:
+                    self.db.execute(
+                        "UPDATE github_records SET status='missing' "
+                        "WHERE repository=? AND issue=? AND comment=?",
+                        (repository, issue, row["comment"]),
+                    )
+
+    def queue_record(self, record, issue):
+        with self.db:
+            self._queue_record(record, issue)
+
+    def _queue_record(self, record, issue):
+        record = RECORD_ADAPTER.validate_python(record)
+        if record.type == "finding":
+            raise ValueError("Findings are published as issues, not comments")
+        if isinstance(
+            record, (AssessmentRecord, RepairRecord, ValidationRecord, RepairPullRequestRecord)
+        ):
+            destination = issue
+            if isinstance(record, ValidationRecord) and record.pr_id:
+                link = self.one(
+                    "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND id=? AND status='current'",
+                    (record.repository, record.pr_id),
+                )
+                if not link or RECORD_ADAPTER.validate_json(link["data"]).number != issue:
+                    raise ValueError("Validation must be published on its associated PR")
+                destination = RECORD_ADAPTER.validate_json(link["data"]).finding_issue
+            finding = self.one(
+                "SELECT id FROM findings WHERE repository=? AND issue=? "
+                "UNION SELECT id FROM github_records WHERE repository=? AND issue=? AND type='finding'",
+                (record.repository, destination, record.repository, destination),
+            )
+            if not finding or finding["id"] != record.finding_id:
+                raise ValueError("Assessment or repair must be published on its finding issue")
+        data = record.model_dump_json()
+        existing = self.one(
+            "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",
+            (record.repository, record.type, record.id),
+        )
+        if existing and (
+            existing["issue"] != issue
+            or record_digest(RECORD_ADAPTER.validate_json(existing["data"]))
+            != record_digest(record)
+        ):
+            raise ValueError("Published records are immutable; use a new superseding record")
+        self.db.execute(
+            "INSERT OR IGNORE INTO record_publications(repository,type,id,issue,data) "
+            "VALUES(?,?,?,?,?)",
+            (record.repository, record.type, record.id, issue, data),
+        )
+
+    def save_stage_execution(self, execution):
+        execution = StageExecution.model_validate(execution)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            existing = self.one("SELECT data FROM stage_executions WHERE id=?", (execution.id,))
+            if existing:
+                previous = StageExecution.model_validate_json(existing["data"])
+                for field in (
+                    "repository",
+                    "provider",
+                    "agent",
+                    "sha",
+                    "finding_id",
+                    "created",
+                    "input_record_ids",
+                ):
+                    if getattr(previous, field) != getattr(execution, field):
+                        raise ValueError("Execution identity and inputs cannot change")
+                if previous.state not in ("queued", "running") and previous != execution:
+                    raise ValueError("Finished executions cannot change")
+                if previous.state == "running" and (
+                    execution.state == "queued"
+                    or execution.lease != previous.lease
+                    or execution.started != previous.started
+                ):
+                    raise ValueError("Stale stage execution")
+            self.db.execute(
+                "INSERT INTO stage_executions(id,repository,state,data) VALUES(?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET state=excluded.state,data=excluded.data",
+                (execution.id, execution.repository, execution.state, execution.model_dump_json()),
+            )
+
+    def apply_models(self, report, digest, *, reused_providers=()):
         checked_at = time.time()
         with self.db:
             self.db.execute("DELETE FROM model_catalogs")
             for catalog in report["providers"]:
-                catalog["checked_at"] = checked_at
+                if catalog["provider"] not in reused_providers:
+                    catalog["checked_at"] = checked_at
                 stored_catalog = {
                     **catalog,
                     "models": [
-                        model
-                        for model in catalog["models"]
-                        if (model.get("efforts") or model.get("default_effort"))
-                        and model["access"] != "unavailable"
+                        model for model in catalog["models"] if model["access"] != "unavailable"
                     ],
                 }
                 self.db.execute(
@@ -147,7 +509,7 @@ class Store:
             ).fetchone():
                 raise ValueError("Run `maxwell config apply` to discover and check models first")
             application = connection.execute(
-                "SELECT checked_at,valid FROM config_application WHERE id=1"
+                "SELECT checked_at,valid,config_digest FROM config_application WHERE id=1"
             ).fetchone()
             if not application:
                 raise ValueError("Run `maxwell config apply` to discover and check models first")
@@ -165,6 +527,7 @@ class Store:
                 "providers": [json.loads(row[0]) for row in rows],
                 "checked_at": application[0],
                 "valid": bool(application[1]),
+                "config_digest": application[2],
             }
         finally:
             connection.close()
@@ -177,7 +540,6 @@ class Store:
         source_kind="local",
         github_account="default",
         directory=None,
-        route=None,
     ):
         with self.db:
             self.db.execute(
@@ -185,53 +547,14 @@ class Store:
                 "VALUES(?,?,?,?,?,?)",
                 (name, source, ref, source_kind, github_account, directory),
             )
-            if route is not None:
-                self.write_route(name, "discovery", route)
             self.event("repository_registered", {"repository": name})
 
-    def saved_route(self, repository, stage="discovery"):
-        route = self.one(
-            "SELECT provider,model,effort FROM repository_stage_routes WHERE repository=? AND stage=?",
-            (repository, stage),
-        )
-        if route and route["effort"] is None:
-            del route["effort"]
-        return route
-
-    def write_route(self, repository, stage, route):
-        self.db.execute(
-            "INSERT INTO repository_stage_routes(repository,stage,provider,model,effort) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(repository,stage) DO UPDATE SET provider=excluded.provider,model=excluded.model,effort=excluded.effort",
-            (repository, stage, route["provider"], route["model"], route.get("effort")),
-        )
-
-    def ensure_route(self, repository, config):
-        route = self.saved_route(repository)
-        if route is None:
-            route = config.route()
-            with self.db:
-                self.write_route(repository, "discovery", route)
-        return config.route(current=route)
-
     def repository(self, name):
-        record = self.one("SELECT * FROM repositories WHERE name=?", (name,))
-        if record:
-            record["stages"] = {
-                row["stage"]: {
-                    "provider": row["provider"],
-                    "model": row["model"],
-                    **({"effort": row["effort"]} if row["effort"] else {}),
-                }
-                for row in self.rows(
-                    "SELECT * FROM repository_stage_routes WHERE repository=? ORDER BY stage",
-                    (name,),
-                )
-            }
-        return record
+        return self.one("SELECT * FROM repositories WHERE name=?", (name,))
 
-    def change_repository(self, repository, changes, stage="discovery", route=None):
+    def change_repository(self, repository, changes):
         allowed = {"source", "source_kind", "directory", "ref", "github_account"}
-        if (not changes and route is None) or changes.keys() - allowed:
+        if not changes or changes.keys() - allowed:
             raise ValueError("Invalid repository settings")
         with self.db:
             assignments = ",".join(f"{key}=?" for key in changes)
@@ -243,8 +566,6 @@ class Store:
             )
             if not cursor.rowcount:
                 raise ValueError("Unknown repository")
-            if route is not None:
-                self.write_route(repository, stage, route)
             self.event("repository_changed", {"repository": repository, "changes": changes})
             return self.repository(repository)
 
@@ -330,7 +651,71 @@ class Store:
             "(started IS NOT NULL AND cost IS NULL))",
             (start.timestamp(),),
         )
-        return row["amount"]
+        stages = self.one(
+            "SELECT COALESCE(SUM(COALESCE(json_extract(data,'$.cost_micros'),"
+            "json_extract(data,'$.reserved_micros'))),0) AS amount FROM stage_executions "
+            "WHERE json_extract(data,'$.accounting')='usd' AND "
+            "(json_extract(data,'$.started')>=? OR (json_extract(data,'$.started') IS NOT NULL "
+            "AND json_extract(data,'$.cost_micros') IS NULL))",
+            (start.timestamp(),),
+        )
+        return row["amount"] + stages["amount"]
+
+    def unpriced_started_today(self):
+        start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        scans = self.one(
+            "SELECT COUNT(*) AS n FROM scans WHERE accounting='unpriced' "
+            "AND started>=? AND (executed=1 OR state='running')",
+            (start,),
+        )["n"]
+        stages = self.one(
+            "SELECT COUNT(*) AS n FROM stage_executions "
+            "WHERE json_extract(data,'$.accounting')='unpriced' "
+            "AND json_extract(data,'$.started')>=?",
+            (start,),
+        )["n"]
+        return scans + stages
+
+    def admission_blockers(self, identifier, daily_limit, reservation, queue_max, daily_scan_limit):
+        job = self.one("SELECT repository,accounting,stage FROM scans WHERE id=?", (identifier,))
+        return self.execution_blockers(
+            job["repository"],
+            job["stage"],
+            job["accounting"],
+            daily_limit,
+            reservation,
+            queue_max,
+            daily_scan_limit,
+        )
+
+    def execution_blockers(
+        self, repository, stage, accounting, daily_limit, reservation, queue_max, daily_scan_limit
+    ):
+        pending = self.one(
+            "SELECT COUNT(*) AS n FROM findings WHERE repository=? "
+            "AND state NOT IN ('closed','confirmed','rejected')",
+            (repository,),
+        )["n"]
+        reasons = []
+        if stage == "discovery" and pending >= queue_max:
+            reasons.append(
+                f"Human review queue is full: {pending}/{queue_max} unresolved findings. "
+                "Close reviewed finding issues on GitHub, or increase limits.human_queue_max"
+            )
+        if accounting == "usd":
+            if self.committed_today() + reservation > daily_limit:
+                reasons.append(
+                    "Daily budget cannot cover another scan reservation. "
+                    "Check limits.daily_budget_usd and limits.scan_reservation_usd"
+                )
+        else:
+            started = self.unpriced_started_today()
+            if started >= daily_scan_limit:
+                reasons.append(
+                    f"Daily scan limit reached: {started}/{daily_scan_limit} executions today (UTC). "
+                    "Wait until the next UTC day or increase limits.daily_scan_limit"
+                )
+        return reasons
 
     def claim(
         self,
@@ -350,19 +735,14 @@ class Store:
                 SELECT s.* FROM scans s JOIN repositories r ON r.name=s.repository
                 WHERE s.state='queued' AND (? OR r.paused=0) AND
                   (? IS NULL OR s.id=?) AND
-                  (SELECT COUNT(*) FROM findings f WHERE f.repository=r.name
-                   AND f.state NOT IN ('closed','rejected','confirmed')) < ?
+                  (s.stage!='discovery' OR (SELECT COUNT(*) FROM findings f WHERE f.repository=r.name
+                   AND f.state NOT IN ('closed','rejected','confirmed')) < ?)
                 ORDER BY CASE WHEN priority=0 THEN -1000 ELSE
                     priority - MIN(3, (?-created)/86400.0) END, created
             """,
                 (manual, scan_id, scan_id, queue_max, time.time()),
             )
-            start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-            unpriced = self.one(
-                "SELECT COUNT(*) AS n FROM scans WHERE accounting='unpriced' "
-                "AND started>=? AND (executed=1 OR state='running')",
-                (start,),
-            )["n"]
+            unpriced = self.unpriced_started_today()
             committed = self.committed_today()
             job = next(
                 (
@@ -401,11 +781,26 @@ class Store:
             )
             self.event("scan_blocked", {"id": identifier, "error": error})
 
-    def finish(self, job, state, summary, usage, cost, findings=(), error=None):
+    def finish(
+        self,
+        job,
+        state,
+        summary,
+        usage,
+        cost,
+        findings=(),
+        error=None,
+        *,
+        selection=None,
+        publications=(),
+    ):
         with self.db:
             current = self.one("SELECT state,lease FROM scans WHERE id=?", (job["id"],))
             if current != {"state": "running", "lease": job["lease"]}:
                 raise ValueError("Stale scan result")
+            for record, issue in publications:
+                record = record.model_copy(update={"spending": usage.spending})
+                self._queue_record(record, issue)
             admitted = []
             for finding in findings:
                 identity = finding.identity(job["repository"])
@@ -428,7 +823,7 @@ class Store:
                     )
             self.db.execute(
                 "UPDATE scans SET state=?,finished=?,cost=?,usage=?,summary=?,error=?,"
-                "admitted=?,allocated=?,pid=NULL WHERE id=?",
+                "admitted=?,allocated=?,selection=?,pid=NULL WHERE id=?",
                 (
                     state,
                     time.time(),
@@ -438,10 +833,11 @@ class Store:
                     error,
                     len(admitted),
                     cost if admitted and cost is not None else 0,
+                    selection.model_dump_json() if selection is not None else None,
                     job["id"],
                 ),
             )
-            if state == "completed":
+            if state == "completed" and job.get("stage", "discovery") == "discovery":
                 self.db.execute(
                     "UPDATE repositories SET last_sha=(SELECT sha FROM scans WHERE id=?) WHERE name=?",
                     (job["id"], job["repository"]),
@@ -471,14 +867,14 @@ class Store:
                 "FROM scans ORDER BY created DESC LIMIT 20"
             ),
             "budget_committed_usd": self.committed_today() / 1_000_000,
-            "stage_routes": self.rows(
-                "SELECT * FROM repository_stage_routes ORDER BY repository,stage"
-            ),
             "publication_problems": self.rows(
                 "SELECT id,state,error FROM findings WHERE error IS NOT NULL OR state='uncertain'"
             ),
             "dashboard_problems": self.rows(
                 "SELECT repository,state,error FROM dashboards WHERE error IS NOT NULL OR state='uncertain'"
+            ),
+            "history_problems": self.rows(
+                "SELECT repository,state,error FROM histories WHERE error IS NOT NULL OR state='uncertain'"
             ),
             "hunter_rating": "unrated; requires independently assessed outcomes",
             "entropy": "unavailable; requires a complete measurement baseline",

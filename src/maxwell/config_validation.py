@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 
 from maxwell.config import Paths
-from maxwell.github import GitHub
+from maxwell.github import GitHub, rate_limit_message
 from maxwell.model_discovery import discover_models, redact_metadata
 from maxwell.provider import create_provider
 from maxwell.provider_runtime import native_errors
@@ -27,27 +27,9 @@ def registered_repositories(paths):
         connection.close()
 
 
-def registered_routes(paths):
-    if not paths.db.exists():
-        return []
-    connection = sqlite3.connect(paths.db.as_uri() + "?mode=ro", uri=True)
-    try:
-        if not connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='repository_stage_routes'"
-        ).fetchone():
-            return []
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(repository_stage_routes)")
-        }
-        effort = "effort" if "effort" in columns else "NULL"
-        return connection.execute(
-            f"SELECT repository,stage,provider,model,{effort} FROM repository_stage_routes ORDER BY repository,stage"
-        ).fetchall()
-    finally:
-        connection.close()
-
-
-def validate_config(paths, online=True, on_check=None, discover=False):
+def validate_config(
+    paths, online=True, on_check=None, discover=False, check_models=True, cached_catalogs=None
+):
     checks = []
     catalogs = []
     config = None
@@ -100,37 +82,7 @@ def validate_config(paths, online=True, on_check=None, discover=False):
         elif not profiles[account].token.get_secret_value().strip():
             add(f"repository:{repository}", "error", f"GitHub account {account!r} has no token")
 
-    try:
-        routes = registered_routes(paths)
-    except sqlite3.Error:
-        add("stage_routes", "error", "Cannot read saved provider/model assignments")
-        routes = []
-    assigned = set()
     pairs = set()
-    for repository, stage, provider, model, effort in routes:
-        if stage == "discovery":
-            assigned.add(repository)
-        try:
-            route = config.route(provider, model, effort=effort)
-            selected = config.with_effort(
-                config.all_providers()[provider].for_model(model), route.get("effort")
-            )
-            pairs.add((provider, model, selected.effort))
-            add(
-                f"stage:{repository}:{stage}",
-                "ok",
-                "Saved provider, model, and effort are configured",
-            )
-        except ValueError as exc:
-            add(f"stage:{repository}:{stage}", "error", str(exc))
-    for repository, _ in repositories:
-        if repository not in assigned:
-            try:
-                route = config.route()
-                selected = config.all_providers()[route["provider"]].for_model(route["model"])
-                pairs.add((route["provider"], route["model"], selected.effort))
-            except ValueError as exc:
-                add(f"stage:{repository}:discovery", "error", str(exc))
     for name, settings in config.all_providers().items():
         errors = []
         if not shutil.which(settings.executable):
@@ -146,27 +98,25 @@ def validate_config(paths, online=True, on_check=None, discover=False):
             if errors
             else "Provider configuration and dependencies are available",
         )
+        if discover and cached_catalogs and name in cached_catalogs:
+            catalogs.append(cached_catalogs[name])
+            add(
+                f"models:{name}",
+                "skipped",
+                "Reusing saved model metadata and access checks; use --force to refresh",
+            )
+            continue
+        if not check_models:
+            if discover:
+                add(
+                    f"models:{name}",
+                    "error",
+                    "No saved model catalog; run `maxwell config apply` without --skip-model-checks",
+                )
+            continue
         catalog = None
         if discover:
             catalog = asyncio.run(discover_models(config, name))["providers"][0]
-            known = {entry["model"] for entry in catalog["models"]}
-            for provider, model, effort in pairs:
-                if provider == name and model and model not in known:
-                    catalog["models"].append(
-                        {
-                            "model": model,
-                            "name": model,
-                            "efforts": None,
-                            "default_effort": effort,
-                            "resolved_model": None,
-                            "source": "stage",
-                            "access": "unverified",
-                            "selectable": not settings.models or model in settings.models,
-                            "configured": False,
-                        }
-                    )
-                    known.add(model)
-            catalog["models"].sort(key=lambda entry: entry["model"])
             catalogs.append(catalog)
             add(
                 f"models:{name}",
@@ -189,7 +139,7 @@ def validate_config(paths, online=True, on_check=None, discover=False):
                         add(
                             f"provider:{name}:model",
                             "error" if online else "skipped",
-                            "Set a provider model, model catalog, or repository stage model to verify access",
+                            "Set a provider model or model catalog to verify access",
                         )
         for model in models:
             try:
@@ -251,7 +201,17 @@ def validate_config(paths, online=True, on_check=None, discover=False):
             add(label, "skipped", "Token is configured; authentication was not checked offline")
             continue
         try:
-            client = GitHub(settings)
+            client = GitHub(
+                settings,
+                account=name,
+                on_status=(
+                    lambda message: on_check(
+                        {"name": label, "status": "waiting", "message": config.redact(message)}
+                    )
+                )
+                if on_check
+                else None,
+            )
         except (httpx.InvalidURL, ValueError):
             add(label, "error", "Cannot create the GitHub client; check github.api_url")
             continue
@@ -316,7 +276,11 @@ def github_check(client, path, label, add):
             403: "GitHub denied access; check permissions, organization authorization, or rate limits",
             404: "Repository does not exist or this account cannot access it",
         }
-        add(label, "error", messages.get(code, f"GitHub returned HTTP {code}"))
+        add(
+            label,
+            "error",
+            rate_limit_message(exc.response) or messages.get(code, f"GitHub returned HTTP {code}"),
+        )
         return None
     except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         add(label, "error", "Could not complete the GitHub check; check the API URL and connection")

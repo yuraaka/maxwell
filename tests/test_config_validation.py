@@ -8,8 +8,9 @@ import pytest
 import yaml
 
 from maxwell.cli import execute, parser
-from maxwell.config import Paths
+from maxwell.config import Limits, Paths
 from maxwell.config_validation import validate_config
+from maxwell.github import GitHub
 from maxwell.store import Store
 
 
@@ -103,6 +104,38 @@ def test_offline_check_does_not_access_network_or_create_database(home, github_r
     assert github_requests[0] == []
 
 
+def test_publication_limit_above_twenty_passes_config_validation(home):
+    update_config(home, lambda data: data["limits"].update(max_findings_per_scan=200))
+    report = validate_config(home, online=False)
+    assert report["valid"], report
+    assert home.load().limits.max_findings_per_scan == 200
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1.5])
+def test_invalid_publication_limits_are_reported(home, limit):
+    update_config(home, lambda data: data["limits"].update(max_findings_per_scan=limit))
+    report = validate_config(home, online=False)
+    assert not report["valid"]
+    assert "limits.max_findings_per_scan" in json.dumps(report)
+
+
+@pytest.mark.parametrize("setting", ["max_reviews_per_scan", "max_audits_per_scan"])
+def test_stage_limit_defaults_and_config_validation(home, setting):
+    assert getattr(Limits(), setting) == 1
+    update_config(home, lambda data: data["limits"].update({setting: 50}))
+    assert validate_config(home, online=False)["valid"]
+    assert getattr(home.load().limits, setting) == 50
+
+
+@pytest.mark.parametrize("setting", ["max_reviews_per_scan", "max_audits_per_scan"])
+@pytest.mark.parametrize("limit", [0, -1, 1.5])
+def test_invalid_stage_limits_are_reported(home, setting, limit):
+    update_config(home, lambda data: data["limits"].update({setting: limit}))
+    report = validate_config(home, online=False)
+    assert not report["valid"]
+    assert f"limits.{setting}" in json.dumps(report)
+
+
 def test_missing_config_has_nonzero_exit_and_does_not_initialize(directory):
     home = directory / "missing"
     result = subprocess.run(
@@ -147,6 +180,18 @@ def test_missing_settings_are_reported_together(home, github_requests, capsys, m
             "github.accounts.<key>.token",
         ),
         ("provider: {api_key: [secret-value]}", "provider.api_key"),
+        (
+            "repair: {auto_merge: {required_validations: 0}}",
+            "repair.auto_merge.required_validations: Input should be greater than or equal to 1",
+        ),
+        (
+            "repair: {auto_merge: {merge_method: secret-value}}",
+            "repair.auto_merge.merge_method",
+        ),
+        (
+            "repair: {auto_merge: {secret-value: secret-value}}",
+            "repair.auto_merge.<key>",
+        ),
         ("github: {api_url: 'https://secret-value@github.com'}", "github.api_url"),
         ("false", "Invalid config.yaml"),
         ("[]", "Invalid config.yaml"),
@@ -269,3 +314,36 @@ def test_secret_redaction_cannot_corrupt_report_types(home, github_requests, cap
     code, report = command(home, capsys)
     assert code == 0 and report["valid"] is True
     assert any("[REDACTED]" in check["message"] for check in report["checks"])
+
+
+def test_apply_waits_for_github_quota_and_reports_status_without_failing(home, monkeypatch):
+    send = httpx.Client.send
+    waits, checks = [], []
+    rejected = False
+
+    def limited(client, request, **kwargs):
+        nonlocal rejected
+        if request.url.path == "/user" and not rejected:
+            rejected = True
+            return httpx.Response(429, headers={"retry-after": "60"}, request=request)
+        return send(client, request, **kwargs)
+
+    def wait(client, response, delay):
+        waits.append(delay)
+        client.on_status("waiting for GitHub quota; job retained")
+
+    monkeypatch.setattr(httpx.Client, "send", limited)
+    monkeypatch.setattr(GitHub, "wait_for_quota", wait)
+    report = validate_config(home, on_check=checks.append)
+    assert report["valid"]
+    assert waits == [60]
+    assert any(check["status"] == "waiting" for check in checks)
+    assert not any(check["status"] == "waiting" for check in report["checks"])
+
+
+def test_pipeline_pool_validation_names_the_exact_yaml_key(home):
+    update_config(home, lambda data: data.update(pipeline={"pools": {"validate": -1}}))
+    with pytest.raises(
+        ValueError, match=r"pipeline.pools.validate: Input should be greater than or equal to 0"
+    ):
+        home.load(detailed=True)

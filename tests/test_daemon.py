@@ -158,7 +158,7 @@ def test_ambiguous_issue_creation_is_reconciled(home, registered, github):
         reporter = Reporter(registered, client, home.load(), home)
         finding = registered.one("SELECT * FROM findings")
         asyncio.run(reporter.publish_finding(finding))
-        assert registered.one("SELECT state FROM findings")["state"] == "uncertain"
+        assert registered.one("SELECT state FROM findings")["state"] == "published"
         asyncio.run(reporter.publish_finding(registered.one("SELECT * FROM findings")))
         assert registered.one("SELECT state FROM findings")["state"] == "published"
         assert github["creates"] == 1
@@ -235,4 +235,24 @@ def test_timeout_retains_unknown_spending_and_cleans_workspace(home, registered,
     assert record["state"] == "failed"
     assert record["cost"] is None
     assert registered.committed_today() == 1_000_000
+    assert not list((home.root / "repos").glob("*/worktrees/*"))
+
+
+@pytest.mark.parametrize("exception", [RuntimeError(), ValueError("   ")])
+def test_scan_failure_without_message_retains_exception_type(
+    home, registered, monkeypatch, exception
+):
+    async def fail(*args, **kwargs):
+        raise exception
+
+    monkeypatch.setattr("maxwell.provider.CodexProvider.scan", fail)
+    registered.enqueue("acme/repo")
+    job = registered.claim(20_000_000, 1_000_000, 6, "test-profile")
+    daemon = Daemon(home, home.load())
+    daemon.store = registered
+    asyncio.run(daemon.scan(job))
+    record = registered.one("SELECT * FROM scans WHERE id=?", (job["id"],))
+    assert record["state"] == "failed"
+    assert record["error"] == type(exception).__name__
+    assert record["summary"] == f"Discovery failed: {type(exception).__name__}"
     assert not list((home.root / "repos").glob("*/worktrees/*"))

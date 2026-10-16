@@ -299,6 +299,51 @@ def test_v2_registration_migrates_without_enabling_checkout_management(directory
             assert record["github_account"] == "work"
             assert record["paused"] == 1
             assert record["last_sha"] == "existing-sha"
-            assert store.db.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert store.db.execute("PRAGMA user_version").fetchone()[0] == 13
         finally:
             store.close()
+
+
+def test_pull_fetch_uses_pinned_base_when_target_branch_has_advanced(home, source, monkeypatch):
+    import maxwell.repositories as repositories
+
+    original = repositories.git("rev-parse", "HEAD", cwd=source)
+    (source / "next.txt").write_text("advanced maintained branch")
+    repositories.git("add", "next.txt", cwd=source)
+    repositories.git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@localhost",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "advance maintained branch",
+        cwd=source,
+    )
+    head = repositories.git("rev-parse", "HEAD", cwd=source)
+    calls, real_git = [], repositories.git
+
+    def local_transport(*args, **kwargs):
+        if "https://github.com/acme/repo.git" in args:
+            calls.append(args)
+            args = tuple(
+                str(source)
+                if value == "https://github.com/acme/repo.git"
+                else "refs/heads/main"
+                if value == "refs/pull/12/head"
+                else value
+                for value in args
+            )
+            kwargs.pop("token", None)
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(repositories, "git", local_transport)
+    repository = repositories.Repository(
+        home, {"name": "acme/repo", "source": str(source), "ref": "main"}
+    )
+    repository.fetch_pull(12, head, "main", original, "test-token")
+    assert [call[-1] for call in calls] == [original, "refs/pull/12/head"]
+    assert real_git("-C", str(repository.mirror), "rev-parse", "FETCH_HEAD") == head
+    real_git("-C", str(repository.mirror), "cat-file", "-e", original)

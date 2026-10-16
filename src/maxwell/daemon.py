@@ -6,14 +6,22 @@ import logging
 import os
 import signal
 import time
+import uuid
+from pathlib import Path
 
+from maxwell.assessment import AssessmentTarget, assessment_prompt
 from maxwell.config import Limits, ProviderSettings
 from maxwell.contracts import Usage, estimate_cost, micros
 from maxwell.github import GitHub
+from maxwell.hunt_context import build_hunt_context, measurement_context
 from maxwell.provider import create_provider, discovery_prompt
+from maxwell.records import AssessmentRecord, RepairRecord, public_agent
+from maxwell.repair import execute_repair, recover_check, write_manifest
 from maxwell.reporting import Reporter, hunter_ratings, scan_report
-from maxwell.repositories import Repository, stop_orphan
+from maxwell.repositories import Repository, git, stop_orphan
+from maxwell.selection import select_candidates
 from maxwell.store import Store
+from maxwell.validation import execute_validation, recover_validation
 
 
 async def request(paths, command, **arguments):
@@ -103,7 +111,6 @@ class Daemon:
                         self.config.route(
                             data.get("provider"),
                             data["model"],
-                            self.store.saved_route(record["name"]),
                             effort=data.get("effort"),
                         ),
                         record,
@@ -131,6 +138,34 @@ class Daemon:
     def recover(self):
         for job in self.store.rows("SELECT * FROM scans WHERE state='running'"):
             stop_orphan(job["pid"], job["artifact"])
+            publications = []
+            if job["stage"] == "repair" and job["artifact"]:
+                recover_check(job["artifact"])
+                artifact = Path(job["artifact"])
+                try:
+                    manifest = json.loads((artifact / "repair.json").read_text())
+                    if manifest.get("record"):
+                        public = RepairRecord.model_validate(manifest["record"]).model_copy(
+                            update={
+                                "outcome": "interrupted",
+                                "summary": "Repair interrupted; local worktree retained.",
+                            }
+                        )
+                        if manifest.get("state") == "committing" and not public.commit:
+                            worktree = Path(public.worktree)
+                            head = git("rev-parse", "HEAD", cwd=worktree)
+                            if head != (public.parent_sha or public.sha) and git(
+                                "show", "--no-patch", "--format=%P", "HEAD", cwd=worktree
+                            ) == (public.parent_sha or public.sha):
+                                public = public.model_copy(update={"commit": head})
+                        manifest["record"] = public.model_dump(mode="json")
+                        publications = [(public, manifest["target"]["issue"])]
+                    manifest["state"] = "interrupted"
+                    write_manifest(artifact, manifest)
+                except (OSError, ValueError, KeyError):
+                    pass
+            if job["stage"] in ("validate", "integrate"):
+                publications = recover_validation(self.paths, self.store, job)
             self.store.finish(
                 job,
                 "interrupted",
@@ -138,12 +173,22 @@ class Daemon:
                 Usage(),
                 None,
                 error="Interrupted; explicit rescan is allowed",
+                publications=publications,
             )
             self.log.warning(
                 "Recovered interrupted scan %s; retained budget reservation", job["id"]
             )
 
-    async def scan(self, job):
+    async def scan(self, job, on_progress=None):
+        if job.get("stage") in ("validate", "integrate"):
+            return await execute_validation(self, job, on_progress)
+        if job.get("stage") == "repair":
+            return await execute_repair(self, job, on_progress)
+
+        def progress(phase):
+            if on_progress:
+                on_progress(phase)
+
         settings = self.config.provider
         artifact = self.paths.root / "artifacts" / job["id"]
         artifact.mkdir(parents=True, exist_ok=True)
@@ -151,16 +196,29 @@ class Daemon:
         worktree = None
         state, summary, error, findings, cost = "failed", "Discovery failed.", None, [], None
         usage = Usage()
+        selection = None
+        publications = []
+        stage_label = (
+            "Discovery" if job.get("stage", "discovery") == "discovery" else job["stage"].title()
+        )
         try:
             if not job.get("execution"):
                 record = self.store.one(
                     "SELECT * FROM repositories WHERE name=?", (job["repository"],)
                 )
-                route = self.store.ensure_route(job["repository"], self.config)
+                route = self.config.route()
                 job = self.store.bind_execution(job["id"], self.config.execution(route, record))
             execution = json.loads(job["execution"])
-            if execution["stage"] != "discovery":
-                raise ValueError("Only discovery execution is implemented")
+            stage = execution["stage"]
+            if stage not in ("discovery", "review", "audit"):
+                raise ValueError("Only hunt, review, and audit execution are implemented")
+            target = (
+                AssessmentTarget.model_validate(execution["target"])
+                if stage != "discovery"
+                else None
+            )
+            if target and target.finding.repository != job["repository"]:
+                raise ValueError("Assessment input belongs to a different repository")
             record = execution["repository"]
             settings = ProviderSettings.model_validate(execution["settings"])
             name = self.config.provider_name(execution["provider"])
@@ -173,6 +231,9 @@ class Daemon:
             )
             repository = Repository(self.paths, record)
             provider = self.provider_factory(self.paths, scan_config)
+            provider.on_usage = lambda usage: progress(
+                {"phase": "agent running", "usage": usage.model_dump()}
+            )
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE scans SET artifact=? WHERE id=?", (str(artifact), job["id"])
@@ -183,7 +244,15 @@ class Daemon:
                 raise ValueError(
                     f"Configure a token for GitHub account {record['github_account']!r}"
                 )
-            sha, worktree = await asyncio.to_thread(repository.prepare, job["id"], token)
+            progress("preparing repository")
+            if target:
+                sha, worktree = await asyncio.to_thread(
+                    repository.prepare, job["id"], token, revision=target.finding.sha
+                )
+                target.finding.finding.validate_location(worktree)
+            else:
+                sha, worktree = await asyncio.to_thread(repository.prepare, job["id"], token)
+            progress(f"source ready at {sha[:12]}")
             with self.store.db:
                 self.store.db.execute("UPDATE scans SET sha=? WHERE id=?", (sha, job["id"]))
             previous = self.store.one(
@@ -194,16 +263,38 @@ class Daemon:
             if previous and not job["forced"]:
                 state, summary, cost = "skipped", "Revision already scanned; no model call.", 0
             else:
-                known = [
-                    json.loads(row["data"])["title"]
-                    for row in self.store.rows(
-                        "SELECT data FROM findings WHERE repository=? ORDER BY rowid DESC LIMIT 100",
-                        (job["repository"],),
+                if target:
+                    context = measurement_context(
+                        self.store, job["repository"], sha, self.config.measurement
                     )
-                ]
-                prompt = discovery_prompt(
-                    job["repository"], sha, scan_config.limits.max_findings_per_scan, known
-                )
+                    (artifact / "assessment-context.json").write_text(
+                        self.config.redact(json.dumps(context, indent=2))
+                    )
+                    prompt = assessment_prompt(job["repository"], stage, target, context)
+                else:
+                    progress("loading existing issues from GitHub")
+                    client = GitHub(access, on_status=progress, account=record["github_account"])
+                    try:
+                        known, remote_identities = await Reporter(
+                            self.store, client, self.config, self.paths
+                        ).discovery_context(job["repository"])
+                    finally:
+                        client.close()
+                    progress("loading measurement and change context")
+                    hunt_context = await build_hunt_context(
+                        self.store, job["repository"], sha, worktree, scan_config
+                    )
+                    (artifact / "hunt-context.json").write_text(
+                        self.config.redact(json.dumps(hunt_context, indent=2))
+                    )
+                    prompt = discovery_prompt(
+                        job["repository"],
+                        sha,
+                        scan_config.limits.max_findings_per_scan,
+                        known,
+                        candidate_limit=scan_config.limits.max_candidates_per_scan,
+                        hunt_context=hunt_context,
+                    )
                 (artifact / "prompt.txt").write_text(self.config.redact(prompt))
                 policy = execution or self.config.model_dump(mode="json")
                 (artifact / "policy.json").write_text(
@@ -218,44 +309,86 @@ class Daemon:
                         self.store.db.execute(
                             "UPDATE scans SET pid=?,executed=1 WHERE id=?", (pid, job["id"])
                         )
+                    progress("agent running")
 
-                result = await provider.scan(worktree, artifact, prompt, started)
-                if not await asyncio.to_thread(repository.unchanged, worktree, sha):
-                    raise ValueError("Discovery modified its worktree; findings rejected")
-                slots = (
-                    scan_config.limits.human_queue_max
-                    - self.store.one(
-                        "SELECT COUNT(*) AS n FROM findings WHERE repository=? AND state NOT IN ('closed','confirmed','rejected')",
-                        (job["repository"],),
-                    )["n"]
+                progress("starting agent")
+                run = provider.assess if target else provider.scan
+                result = await run(worktree, artifact, prompt, started)
+                if not target and len(result.findings) > scan_config.limits.max_candidates_per_scan:
+                    raise ValueError("Provider exceeded limits.max_candidates_per_scan")
+                progress(
+                    "validating assessment"
+                    if target
+                    else f"validating {len(result.findings)} candidate findings"
                 )
-                seen = set()
-                new_findings = 0
-                for finding in sorted(
-                    result.findings, key=lambda item: (item.priority, -item.confidence)
-                ):
-                    finding.validate_location(worktree)
-                    if finding.confidence < scan_config.limits.minimum_confidence:
-                        continue
-                    identity = finding.identity(job["repository"])
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    existing = self.store.one("SELECT id FROM findings WHERE id=?", (identity,))
-                    if existing or new_findings < min(
-                        slots, scan_config.limits.max_findings_per_scan
-                    ):
-                        findings.append(finding)
-                        if not existing:
-                            new_findings += 1
+                if not await asyncio.to_thread(repository.unchanged, worktree, sha):
+                    raise ValueError(f"{stage_label} modified its worktree; results rejected")
+                if target:
+                    assessment = AssessmentRecord(
+                        id=uuid.uuid4().hex,
+                        repository=job["repository"],
+                        finding_id=target.finding.id,
+                        sha=sha,
+                        role="reviewer" if stage == "review" else "auditor",
+                        agent=public_agent(job),
+                        execution_id=job["id"],
+                        verdict=result.verdict,
+                        actionability=result.actionability,
+                        priority=result.priority,
+                        evidence=result.evidence,
+                        factors=result.factors,
+                        repair=result.repair,
+                        supersedes=target.previous.id if target.previous else None,
+                        references=[review.id for review in target.reviews],
+                    )
+                    publications = [(assessment, target.issue)]
+                else:
+                    slots = (
+                        scan_config.limits.human_queue_max
+                        - self.store.one(
+                            "SELECT COUNT(*) AS n FROM findings WHERE repository=? AND state NOT IN ('closed','confirmed','rejected')",
+                            (job["repository"],),
+                        )["n"]
+                    )
+                    if execution.get("publication_slots") is not None:
+                        slots = min(slots, execution["publication_slots"])
+                    progress(f"ranking {len(result.findings)} candidates")
+                    selected, observations, selection = select_candidates(
+                        result.findings,
+                        job["repository"],
+                        worktree,
+                        publication_limit=scan_config.limits.max_findings_per_scan,
+                        slots=slots,
+                        minimum_confidence=scan_config.limits.minimum_confidence,
+                        local_ids={
+                            row["id"]
+                            for row in self.store.rows(
+                                "SELECT id FROM findings WHERE repository=?", (job["repository"],)
+                            )
+                        },
+                        remote_ids=remote_identities,
+                    )
+                    findings = selected + observations
+                    progress(
+                        f"selected {selection.selected} candidates; skipped {selection.skipped}"
+                    )
                 state, summary = "completed", result.summary
+                if target:
+                    summary = (
+                        f"Verdict: **{result.verdict}**; actionability: {result.actionability}.\n\n"
+                        + result.summary
+                    )[:6000]
         except asyncio.CancelledError:
-            state, summary, error = "cancelled", "Discovery cancelled during shutdown.", "Cancelled"
+            state, summary, error = (
+                "cancelled",
+                f"{stage_label} cancelled during shutdown.",
+                "Cancelled",
+            )
             findings = []
         except Exception as exc:
             findings = []
-            error = self.config.redact(str(exc))[:2000]
-            summary = f"Discovery failed: {error}"
+            error = (self.config.redact(str(exc)).strip() or type(exc).__name__)[:2000]
+            summary = f"{stage_label} failed: {error}"
             self.log.warning("Scan %s failed: %s", job["id"], error)
         finally:
             if provider is not None and provider.started:
@@ -265,7 +398,17 @@ class Daemon:
                 cost = 0
             if job.get("accounting") == "unpriced" and provider is not None and provider.started:
                 cost = None
-            self.store.finish(job, state, self.config.redact(summary), usage, cost, findings, error)
+            self.store.finish(
+                job,
+                state,
+                self.config.redact(summary),
+                usage,
+                cost,
+                findings,
+                error,
+                selection=selection if state == "completed" else None,
+                publications=publications if state == "completed" else (),
+            )
             current = self.store.one("SELECT * FROM scans WHERE id=?", (job["id"],))
             (artifact / "summary.json").write_text(json.dumps(current, indent=2))
             (self.paths.root / "reports" / f"{job['id']}.md").write_text(
@@ -273,6 +416,7 @@ class Daemon:
             )
             if worktree:
                 try:
+                    progress("cleaning up worktree")
                     await asyncio.to_thread(repository.cleanup, worktree)
                 except Exception as exc:
                     self.log.warning(
@@ -292,7 +436,7 @@ class Daemon:
                     record = self.store.one(
                         "SELECT * FROM repositories WHERE name=?", (old["repository"],)
                     )
-                    route = self.store.ensure_route(old["repository"], self.config)
+                    route = self.config.route()
                     self.store.bind_execution(old["id"], self.config.execution(route, record))
                 except ValueError as exc:
                     self.log.warning(
@@ -302,7 +446,7 @@ class Daemon:
                 "SELECT * FROM repositories WHERE paused=0 AND next_scan<=?", (time.time(),)
             ):
                 try:
-                    route = self.store.ensure_route(repo["name"], self.config)
+                    route = self.config.route()
                     self.store.enqueue(
                         repo["name"], forced=False, execution=self.config.execution(route, repo)
                     )
@@ -350,7 +494,9 @@ class Daemon:
                     name, account = record["name"], record["github_account"]
                     try:
                         if account not in clients:
-                            clients[account] = GitHub(self.config.github.for_account(account))
+                            clients[account] = GitHub(
+                                self.config.github.for_account(account), account=account
+                            )
                         key = (name, account)
                         if key not in reporters:
                             reporters[key] = Reporter(

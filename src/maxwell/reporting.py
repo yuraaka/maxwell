@@ -1,53 +1,328 @@
 import asyncio
+import hashlib
 import json
 import re
 import shlex
 import time
+from urllib.parse import urlencode
 
+from maxwell.assessment import current_assessments, finding_factors
+from maxwell.contracts import DEFAULT_SCAN_CANDIDATES, FACTORS, SelectionStats
 from maxwell.github import PublicationUncertain
+from maxwell.impact import fix_queue, queue_report
+from maxwell.measurement import (
+    compatible,
+    measurement_contributions,
+    measurement_report,
+    measurement_score,
+    projected_measurements,
+    validation_changes,
+)
+from maxwell.pricing import cost_range, spending_summary
+from maxwell.records import (
+    RECORD_ADAPTER,
+    AgentSelection,
+    AssessmentRecord,
+    ExecutionRecord,
+    FindingRecord,
+    IntegrationRecord,
+    MeasurementRecord,
+    RepairPullRequestRecord,
+    RepairRecord,
+    ValidationRecord,
+    decode_record,
+    encode_record,
+    execution_record,
+    public_agent,
+    record_digest,
+)
+from maxwell.reputation import agent_reputation, reputation_report
 
 
-def money(amount):
-    return "unknown" if amount is None else f"${amount / 1_000_000:.6f} estimated"
-
-
-def scan_report(scan):
-    usage = json.loads(scan["usage"] or "{}")
+def token_summary(usage):
     if not usage.get("reported"):
-        usage = {"complete": False}
-    cost = (
-        "unpriced"
-        if scan.get("accounting") == "unpriced" and scan["cost"] is None
-        else money(scan["cost"])
+        return "Token usage unavailable"
+    total = usage["input_tokens"] + usage["output_tokens"]
+    return (
+        f"{total:,} tokens: input {usage['input_tokens']:,} "
+        f"(cached {usage.get('cached_input_tokens', 0):,}; "
+        f"cache writes {usage.get('cache_write_tokens', 0):,}), "
+        f"output {usage['output_tokens']:,}"
     )
-    accounting = (
-        "Unpriced usage is limited by the daily scan count; no dollar estimate is available."
-        if scan.get("accounting") == "unpriced"
-        else "Unknown spending retains its budget reservation; it is never recorded as zero."
+
+
+def agent_selection_report(value):
+    if not value:
+        return ""
+    decision = AgentSelection.model_validate(value)
+    basis = {
+        "explicit": "explicit model override",
+        "thompson-source-v1": "Thompson sampling from provisional source support or reviewer–auditor agreement",
+        "thompson-repair-v1": "Thompson sampling from independent repair validation",
+        "uniform-unrated-v1": "uniform sampling; quality is unrated",
+    }[decision.method]
+    body = f"\nAgent selection: {basis}; {decision.candidates} eligible public identities. Independence: {decision.independence}.\n"
+    if decision.method in ("thompson-source-v1", "thompson-repair-v1"):
+        body += f"Provisional observations: {decision.successes} positive, {decision.failures} negative. Beta prior: (2, 2); selected draw: {decision.draw:.6f}. These are source proxies, not validated accuracy.\n"
+    return body
+
+
+def scan_report(scan, finding_ids=(), *, record=None):
+    usage = json.loads(scan["usage"] or "{}")
+    tokens = token_summary(usage)
+    agent = public_agent(scan)
+    identity = agent.display() if agent else "Unknown legacy agent"
+    stage = scan.get("stage", "discovery")
+    label = "Discovery" if stage == "discovery" else stage.title()
+    role = (
+        "Integration validator" if stage == "integrate" else agent.role.title() if agent else label
     )
-    return f"""<!-- maxwell:scan:{scan["id"]} -->
-### Discovery scan `{scan["id"][:12]}` — {scan["state"]}
+    result = (
+        f"{scan['admitted']} new candidates"
+        if stage == "discovery"
+        else "Draft PR repair; awaiting independent validation"
+        if stage == "repair"
+        else "Independent PR repair validation; see validation record"
+        if stage == "validate"
+        else "Independent maintained-branch verification; see integration record"
+        if stage == "integrate"
+        else "Source assessment; not reproduced"
+    )
+    body = f"""<!-- maxwell:scan:{scan["id"]} -->
+### {role} · {scan["state"]}
 
 {scan["summary"] or ""}
 
+**{tokens}.**
+
+{spending_summary(record.spending if record else usage.get("spending"))}
+
+<details>
+<summary>Execution details</summary>
+
 Revision: `{scan["sha"] or "not resolved"}`  
-Profile: `{scan["profile"] or "not started"}`
-Provider: `{scan.get("provider") or "legacy"}`; model: `{scan.get("model") or "legacy"}`
+Agent: `{identity}`
 
-| Stage | Spending | Result |
+| Stage | Token usage | Result |
 | --- | --- | --- |
-| Discovery | {cost} | {scan["admitted"]} new candidates |
-| Reproduction | Not run | Later milestone |
-| Fixing | Not run | Later milestone |
-| Validation / integration | Not run | Later milestone |
+| {label} | {tokens} | {result} |
+| Reproduction | {"See validation record" if stage in ("validate", "integrate") else "Not run"} | {"Host regression replay" if stage in ("validate", "integrate") else "Later milestone"} |
+| Fixing | {"See repair record" if stage == "repair" else "Not run"} | {"Draft PR publication" if stage == "repair" else "Explicit repair stage"} |
+| Validation | {"See validation record" if stage in ("validate", "integrate") else "Not run"} | {"Independent model and host checks" if stage in ("validate", "integrate") else "Explicit validate stage"} |
+| Integration | {"See integration record" if stage == "integrate" else "Not run"} | {"Maintained-branch verification" if stage == "integrate" else "Merge then integrate stage"} |
 
-**Total: {cost}.** Includes the failed attempt, if any.
-Reported tokens: input {usage.get("input_tokens", "unknown")}, cached input
-{usage.get("cached_input_tokens", "unknown")}, output {usage.get("output_tokens", "unknown")}.
+**{tokens}.** Includes the failed attempt, if any.
 Usage complete: {usage.get("complete", False)}.
-Allocated to findings: {money(scan["allocated"])}; remaining known spending is discovery overhead.
-{accounting}
+Cached input and cache writes are included in input; total is input plus output.
+Missing usage is unknown, not zero. Tokens are recorded once per execution, not per finding.
 """
+    execution = json.loads(scan.get("execution") or "{}")
+    body += agent_selection_report(execution.get("agent_selection"))
+    if target := execution.get("target"):
+        body += f"\nFinding issue: #{target['issue']}; finding: `{target['finding']['id']}`.\n"
+        if target.get("reviews"):
+            body += (
+                "Referenced reviews: "
+                + ", ".join(f"`{item['id']}`" for item in target["reviews"])
+                + ".\n"
+            )
+    if scan.get("selection"):
+        selection = SelectionStats.model_validate_json(scan["selection"])
+        execution = json.loads(scan.get("execution") or "{}")
+        candidate_limit = execution.get("limits", {}).get(
+            "max_candidates_per_scan", DEFAULT_SCAN_CANDIDATES
+        )
+        body += f"""
+### Candidate selection
+
+Collected: **{selection.collected}**. Selected: **{selection.selected}** new candidates.
+Skipped: **{selection.skipped}**.
+
+| Skip reason | Candidates |
+| --- | --- |
+| Already known | {selection.already_known} |
+| Duplicate within this scan | {selection.duplicate} |
+| Below confidence threshold | {selection.below_confidence} |
+| Outside top publication limit | {selection.publication_limit} |
+| No review queue capacity | {selection.review_queue_limit} |
+
+Ranking: priority (P0 first), confidence (highest first), issue kind (bugs first
+when tied), then stable finding identity. Known findings do not consume publication slots.
+Skipped candidates are retained in the local provider result artifact; they are not queued
+for automatic publication on a later scan. Collection is bounded at {candidate_limit} candidates.
+"""
+        if selection.collected == candidate_limit:
+            body += "\nCollection reached the candidate ceiling; further issues may remain.\n"
+    body += "\n</details>\n"
+    if scan.get("finished") and scan["state"] in (
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "skipped",
+    ):
+        body += "\n" + encode_record(record or execution_record(scan, finding_ids)) + "\n"
+    return body
+
+
+def record_report(record):
+    marker = f"<!-- maxwell:{record.type}:{record.id} -->"
+    if isinstance(record, AssessmentRecord):
+        identity = f"{record.agent.adapter}/{record.agent.model}" if record.agent else record.actor
+        body = (
+            f"{marker}\n### {record.role.title()} · {record.verdict}\n\n"
+            f"Agent / actor: `{identity}`\n\n"
+            f"Verdict: **{record.verdict}**; actionability: {record.actionability}\n\n"
+            f"{record.evidence}\n"
+            "\n<details>\n<summary>Assessment details</summary>\n\n"
+            f"Finding: `{record.finding_id}`; revision: `{record.sha}`\n"
+            + (
+                f"\nAssessed factors: {', '.join(record.factors) or 'none established'}.\n"
+                if record.factors is not None
+                else ""
+            )
+        )
+        if record.repair:
+            repair = record.repair
+            body += (
+                f"\n#### Proposed repair (estimate, not observed)\n\n{repair.plan}\n\n"
+                f"Validation plan: {repair.validation}\n\n"
+                f"Effort: {repair.effort_hours.low:g}–{repair.effort_hours.high:g} engineer-hours; "
+                f"uncalibrated confidence: {repair.confidence:.0%}.\n\n"
+                f"Measurement: `{repair.measurement_id or 'unknown'}`; "
+                f"protocol: `{repair.protocol or 'unknown'}`.\n"
+            )
+            for projection in repair.projections:
+                scenarios = projection.architecture or projection.scenarios
+                body += (
+                    f"\n**{projection.factor}** counterfactual scenarios: "
+                    + json.dumps([item.model_dump() for item in scenarios])
+                    + f"\n\n{projection.evidence}\n\nAssumptions: {projection.assumptions}\n"
+                )
+            body += f"\nDeclared unchanged: {', '.join(repair.unchanged) or 'none'}.\n"
+            if repair.unchanged_evidence:
+                body += f"\n{repair.unchanged_evidence}\n"
+        if record.execution_id:
+            body += f"\nExecution: `{record.execution_id}`.\n"
+        if record.supersedes:
+            body += f"\nSupersedes: `{record.supersedes}`.\n"
+        if record.references:
+            body += "\nReferences: " + ", ".join(f"`{item}`" for item in record.references) + ".\n"
+        body += "\n</details>\n"
+    elif isinstance(record, RepairPullRequestRecord):
+        body = (
+            f"{marker}\n### Repair PR — #{record.number}\n\n"
+            f"[Open PR](https://github.com/{record.repository}/pull/{record.number}) · "
+            f"head `{record.head_sha}`; base `{record.base_sha}`.\n\n"
+            f"Repair: `{record.repair_id}`; provenance: {record.provenance}.\n"
+        )
+    elif isinstance(record, RepairRecord):
+        body = (
+            f"{marker}\n### Fixer · {record.outcome}\n\n"
+            f"Agent: `{record.agent.adapter}/{record.agent.model}`\n\n"
+            f"{record.summary}\n\n{record.explanation}\n\n"
+            "<details>\n<summary>Repair checks and provenance</summary>\n\n"
+            f"Base: `{record.sha}`\n\nLocal branch: `{record.branch}`\n\n"
+            f"Local worktree: `{record.worktree}`\n\n"
+            f"Commit: `{record.commit or 'none'}`. Prepared repairs are published as draft PRs.\n\n"
+            "Awaiting independent validation; no observed entropy reduction.\n\n"
+            f"Changed files: {', '.join(record.files) or 'none'}.\n\n"
+            f"Regression coverage claimed by fixer: {', '.join(record.regression_tests) or 'none'}.\n\n"
+            f"Execution: `{record.execution_id}`; assessment inputs: {', '.join(record.references)}.\n"
+        )
+        for check in record.checks:
+            body += (
+                f"\nHost check: **{check.state}**, exit {check.returncode}, {check.seconds:.2f}s.\n\n"
+                f"Command: `{json.dumps(check.command)}`\n\n{check.detail}\n"
+            )
+        for concern in record.concerns:
+            body += f"\n- {concern}\n"
+        body += "\n</details>\n"
+    elif isinstance(record, ValidationRecord):
+        changes = validation_changes(record)
+        role = "Integration validator" if isinstance(record, IntegrationRecord) else "Validator"
+        summary = (
+            record.result.summary
+            if record.state == "completed" and record.result
+            else record.summary
+        )
+        body = (
+            f"{marker}\n### {role} · {record.outcome}\n\n"
+            f"Agent: `{record.agent.adapter}/{record.agent.model}` · {record.state}\n\n"
+            f"{summary}\n"
+        )
+        if record.result:
+            body += f"\n{record.result.evidence}\n\nRegression: **{record.result.reproduction}**. {record.result.regression_evidence}\n"
+            for concern in record.result.concerns:
+                body += f"\n**Blocking concern:** {concern}\n"
+            for note in record.result.notes:
+                body += f"\n**Note:** {note}\n"
+        states = ", ".join(check.state for check in record.checks) or "unavailable"
+        body += f"\nHost checks: **{states}**.\n"
+        body += "\nObserved maintenance entropy reduction: "
+        body += (
+            f"**{changes['reduction']:+.2f} points**.\n"
+            if changes["reduction"] is not None
+            else "**unknown** — complete compatible evidence required.\n"
+        )
+        body += "\n<details>\n<summary>Evidence, measurements, and execution details</summary>\n\n"
+        body += (
+            f"Repair: `{record.repair_id}`; original: `{record.base_sha}`; repaired: `{record.sha}`.\n\n"
+            f"Execution: `{record.execution_id}`; assessment inputs: {', '.join(record.references)}.\n"
+        )
+        if record.result:
+            for comment in record.result.comments:
+                body += (
+                    f"\n- `{comment.path}:{comment.line}` ({comment.side}): {comment.explanation}\n"
+                )
+                if comment.suggestion:
+                    body += f"\n```suggestion\n{comment.suggestion}\n```\n"
+        for check in record.checks:
+            body += f"\nRepaired host check: **{check.state}**, exit {check.returncode}, {check.seconds:.2f}s. {check.detail}\n"
+        if record.replay:
+            body += f"\nOriginal-source regression replay: **{record.replay.state}**, exit {record.replay.returncode}. {record.replay.detail}\n"
+        first = measurement_contributions(record.before) if record.before else None
+        second = measurement_contributions(record.after) if record.after else None
+        if record.before and record.after:
+            old_score, new_score = measurement_score(record.before), measurement_score(record.after)
+            before_score = f"{old_score:.2f}/100" if old_score is not None else "unknown"
+            after_score = f"{new_score:.2f}/100" if new_score is not None else "unknown"
+            body += f"\nSnapshot scores: **{before_score} → {after_score}**. Measurements: `{record.before.id}` → `{record.after.id}`.\n"
+            before_tests = record.before.evidence.get("tests", {}).get("collected_tests", "unknown")
+            after_tests = record.after.evidence.get("tests", {}).get("collected_tests", "unknown")
+            body += f"Collected test population: {before_tests} → {after_tests}.\n"
+        body += "\n| Component | Before (points) | After (points) | Observed reduction (points) |\n| --- | --- | --- | --- |\n"
+        for name in FACTORS:
+            old, new = (first or {}).get(name), (second or {}).get(name)
+            value = changes["components"].get(name)
+            before_value = f"{old:.4f}" if old is not None else "unknown"
+            after_value = f"{new:.4f}" if new is not None else "unknown"
+            delta = f"{value:+.4f}" if value is not None else "unknown"
+            body += f"| {name} | {before_value} | {after_value} | {delta} |\n"
+        body += "\nPositive reductions mean lower measured burden. PR snapshot measurements do not replace the repository baseline; accepted integration publishes a new baseline.\n"
+        if record.supersedes:
+            body += "\nSupersedes: " + ", ".join(record.supersedes) + ".\n"
+        body += "\n</details>\n"
+    elif isinstance(record, ExecutionRecord):
+        identity = record.agent.display() if record.agent else "Unknown legacy agent"
+        role = record.agent.role.title() if record.agent else "Agent"
+        body = (
+            f"{marker}\n### {role} execution · {record.state}\n\n"
+            f"Agent: `{identity}`; revision: `{record.sha or 'not resolved'}`\n\n"
+            f"{record.summary}\n\n{token_summary(record.usage.model_dump())}.\n"
+            f"Usage complete: {record.usage.complete}.\n"
+        )
+        body += agent_selection_report(record.agent_selection)
+    else:
+        body = marker + measurement_report(record)
+    if isinstance(record, (AssessmentRecord, RepairRecord, ValidationRecord, ExecutionRecord)):
+        if not isinstance(record, AssessmentRecord) or record.role != "human":
+            cost = "\n" + spending_summary(record.spending) + "\n"
+            if "<details>" in body:
+                body = body.replace("<details>", cost + "\n<details>", 1)
+            else:
+                body += cost
+    return body + "\n" + encode_record(record) + "\n"
 
 
 def hunter_ratings(store, repo=None):
@@ -76,10 +351,51 @@ def hunter_ratings(store, repo=None):
     ]
 
 
+def component_dashboard(repository, measurement, baseline=None):
+    contributions = (measurement_contributions(measurement) or {}) if measurement else {}
+    body = f"Revision: `{measurement.sha}`.\n\n" if measurement else ""
+    score = measurement_score(measurement) if measurement else None
+    baseline_score = measurement_score(baseline) if baseline else None
+    if (
+        measurement
+        and baseline
+        and compatible(baseline, measurement)
+        and score is not None
+        and baseline_score is not None
+    ):
+        body += f"Change from baseline: **{score - baseline_score:+.2f} points**.\n\n"
+    body += "| Component | Entropy contribution |\n| --- | --- |\n"
+    for factor in FACTORS:
+        value = f"{contributions[factor]:.2f} points" if factor in contributions else "Unknown"
+        query = f'repo:{repository} is:issue is:open label:"maxwell:factor:{factor}" -label:"maxwell:state:rejected"'
+        url = "https://github.com/issues?" + urlencode({"q": query})
+        reason = ""
+        if factor not in contributions and measurement:
+            status = measurement.factor_status.get(factor, "Unavailable evidence")
+            if status == "measured":
+                status = "Incompatible analyzer or policy; remeasure"
+            reason = " — " + status.replace("|", " ").replace("\n", " ")
+        label = (
+            "Coupling / cohesion" if factor == "coupling" else factor.replace("_", " ").capitalize()
+        )
+        body += f"| {label} | [{value}]({url}){reason} |\n"
+    body += "\nContributions use policy weights; missing weights are not redistributed. Values are rounded to two decimals. Links show associated findings, not guaranteed reductions.\n"
+    if measurement:
+        body += (
+            "\n<details>\n<summary>Measurement evidence and calculation</summary>\n\n"
+            + measurement_report(measurement, baseline)
+            + "\n</details>\n"
+        )
+    return body
+
+
 class Reporter:
-    def __init__(self, store, github, config, paths):
+    def __init__(self, store, github, config, paths, *, merge_issues=None):
         self.store, self.github, self.config, self.paths = store, github, config, paths
         self.labels_ready = set()
+        self.author = None
+        self.merge_statuses = {}
+        self.merge_issues = merge_issues
 
     async def call(self, method, *args, **kwargs):
         return await asyncio.to_thread(method, *args, **kwargs)
@@ -89,11 +405,333 @@ class Reporter:
         with self.store.db:
             self.store.db.execute(f"UPDATE {table} SET error=? WHERE {key}=?", (text, value))
 
+    async def authorized_authors(self):
+        if self.author is None:
+            identity = await self.call(self.github.request, "GET", "user")
+            self.author = identity["login"]
+        return {self.author, *self.github.allowed_users}
+
+    async def project_issue_records(self, repo, issue):
+        authors = await self.authorized_authors()
+        comments = (
+            []
+            if issue.get("comments") == 0
+            else await self.call(self.github.comments, repo, issue["number"])
+        )
+        sources = [(0, issue), *((comment["id"], comment) for comment in comments)]
+        seen = set()
+        finding_id = None
+        match = re.search(r"<!-- maxwell:finding:([a-f0-9]{32}) -->", issue.get("body") or "")
+        if match:
+            finding_id = match[1]
+        if "pull_request" in issue:
+            match = re.search(
+                r"<!-- maxwell:repair-pr:([a-f0-9]{32}):[a-f0-9]{32} -->", issue.get("body") or ""
+            )
+            finding_id = match[1] if match else None
+        for comment_id, source in sources:
+            body = source.get("body") or ""
+            author = source.get("user", {}).get("login", "")
+            if author not in authors:
+                continue
+            try:
+                record = decode_record(body)
+                if record is None:
+                    continue
+                if record.repository != repo:
+                    raise ValueError("Record belongs to a different repository")
+                if "pull_request" in issue and not isinstance(record, ValidationRecord):
+                    raise ValueError("Only validation and integration records belong on repair PRs")
+                if isinstance(record, FindingRecord):
+                    if comment_id or record.id != finding_id:
+                        raise ValueError("Finding record must match its issue marker")
+                elif isinstance(
+                    record,
+                    (AssessmentRecord, RepairRecord, ValidationRecord, RepairPullRequestRecord),
+                ):
+                    if not comment_id or record.finding_id != finding_id:
+                        raise ValueError("Assessment belongs to a different finding")
+                elif not comment_id:
+                    raise ValueError("Execution and measurement records belong in comments")
+                if not isinstance(record, FindingRecord):
+                    marker = f"<!-- maxwell:{record.type}:{record.id} -->"
+                    scan_marker = f"<!-- maxwell:scan:{record.id} -->"
+                    if marker not in body and not (
+                        isinstance(record, ExecutionRecord) and scan_marker in body
+                    ):
+                        raise ValueError("Record does not match its publication marker")
+                self.store.project_record(
+                    record,
+                    issue["number"],
+                    comment_id,
+                    author,
+                    hashlib.sha256(body.encode()).hexdigest(),
+                )
+                seen.add(comment_id)
+            except ValueError:
+                with self.store.db:
+                    self.store.event(
+                        "github_record_invalid",
+                        {"repository": repo, "issue": issue["number"], "comment": comment_id},
+                    )
+        self.store.reconcile_records(repo, issue["number"], seen)
+
+    async def project_repository_records(self, repo):
+        issues = await self.call(
+            lambda: list(self.github.paginate(f"repos/{repo}/issues", {"state": "all"}))
+        )
+        seen = set()
+        for issue in issues:
+            if "pull_request" not in issue and (
+                "<!-- maxwell:finding:" in (issue.get("body") or "")
+                or "<!-- maxwell:dashboard:v1 -->" in (issue.get("body") or "")
+                or "<!-- maxwell:history:v1 -->" in (issue.get("body") or "")
+            ):
+                await self.project_issue_records(repo, issue)
+                seen.add(issue["number"])
+        for issue in issues:
+            if "pull_request" in issue and "<!-- maxwell:repair-pr:" in (issue.get("body") or ""):
+                await self.project_issue_records(repo, issue)
+                seen.add(issue["number"])
+        for row in self.store.rows(
+            "SELECT DISTINCT issue FROM github_records WHERE repository=?", (repo,)
+        ):
+            if row["issue"] not in seen:
+                self.store.reconcile_records(repo, row["issue"], set())
+        return issues
+
+    async def reconcile_assessment_labels(self, repo, issues):
+        remote = {issue["number"]: issue for issue in issues if "pull_request" not in issue}
+        managed_states = {
+            "maxwell:state:suspected",
+            "maxwell:state:reviewed",
+            "maxwell:state:audited",
+        }
+        updated = []
+        for row in self.store.rows(
+            "SELECT issue,data FROM github_records WHERE repository=? "
+            "AND type='finding' AND status='current'",
+            (repo,),
+        ):
+            issue = remote.get(row["issue"])
+            finding = RECORD_ADAPTER.validate_json(row["data"])
+            if not issue or finding.finding.identity(repo) != finding.id:
+                continue
+            reviews, audits = current_assessments(self.store, repo, row["issue"], finding)
+            assessment_labels = set()
+            for stage, records in (("review", reviews), ("audit", audits)):
+                if records:
+                    verdicts = {record.verdict for record in records}
+                    verdict = next(iter(verdicts)) if len(verdicts) == 1 else "inconclusive"
+                    assessment_labels.add(f"maxwell:{stage}:{verdict}")
+            state = "audited" if audits else "reviewed" if reviews else "suspected"
+
+            def desired_labels(source):
+                labels = {label["name"] for label in source.get("labels", [])}
+                retained = {
+                    label
+                    for label in labels
+                    if label not in managed_states
+                    and not label.startswith(
+                        ("maxwell:review:", "maxwell:audit:", "maxwell:factor:")
+                    )
+                }
+                if not retained.intersection(
+                    {"maxwell:state:human-confirmed", "maxwell:state:rejected"}
+                ):
+                    retained.add(f"maxwell:state:{state}")
+                factors = finding_factors(finding, reviews, audits)
+                if "maxwell:state:rejected" in retained:
+                    factors = []
+                return labels, retained | assessment_labels | {
+                    f"maxwell:factor:{factor}" for factor in factors
+                }
+
+            before, desired = desired_labels(issue)
+            if before == desired:
+                continue
+            current = await self.call(
+                self.github.request, "GET", f"repos/{repo}/issues/{row['issue']}"
+            )
+            if current.get("body") != issue.get("body"):
+                raise ValueError(
+                    "Finding changed during label reconciliation; retry synchronization"
+                )
+            before, desired = desired_labels(current)
+            if before == desired:
+                continue
+            if repo not in self.labels_ready:
+                await self.call(self.github.ensure_labels, repo)
+                self.labels_ready.add(repo)
+            await self.call(
+                self.github.request,
+                "PATCH",
+                f"repos/{repo}/issues/{row['issue']}",
+                json={"labels": sorted(desired)},
+            )
+            updated.append(row["issue"])
+        return updated
+
+    async def discovery_context(self, repo):
+        issues = await self.project_repository_records(repo)
+        authors = await self.authorized_authors()
+        context, identities = [], set()
+        for issue in issues:
+            if "pull_request" in issue or any(
+                marker in (issue.get("body") or "")
+                for marker in ("<!-- maxwell:dashboard:v1 -->", "<!-- maxwell:history:v1 -->")
+            ):
+                continue
+            entry = {
+                "issue": issue["number"],
+                "title": issue["title"][:180],
+                "state": issue["state"],
+            }
+            match = re.search(r"<!-- maxwell:finding:([a-f0-9]{32}) -->", issue.get("body") or "")
+            if match and issue.get("user", {}).get("login") in authors:
+                try:
+                    record = decode_record(issue.get("body"))
+                    if record is not None and (
+                        not isinstance(record, FindingRecord)
+                        or record.repository != repo
+                        or record.id != match[1]
+                        or record.finding.identity(repo) != record.id
+                    ):
+                        raise ValueError("Finding record does not match its identity")
+                except ValueError:
+                    record = None
+                else:
+                    identities.add(match[1])
+                    entry["finding_id"] = match[1]
+                    if record:
+                        entry.update(
+                            kind=record.finding.kind,
+                            path=record.finding.path,
+                            symbol=record.finding.symbol,
+                        )
+            if issue["state"] == "open" or "finding_id" in entry:
+                context.append(entry)
+        context.sort(key=lambda item: (item["state"] != "open", -item["issue"]))
+        return {
+            "issues": context[:100],
+            "total_issues": len(context),
+            "shown_issues": min(len(context), 100),
+        }, identities
+
+    async def record_comment(self, repo, issue, marker, record, authors):
+        comments = await self.call(self.github.comments, repo, issue)
+        existing = [item for item in comments if marker in (item.get("body") or "")]
+        if len(existing) > 1:
+            raise ValueError("Duplicate record markers require reconciliation")
+        if not existing:
+            return None
+        comment = existing[0]
+        remote = decode_record(comment["body"])
+        if (
+            comment.get("user", {}).get("login") not in authors
+            or remote is None
+            or record_digest(remote) != record_digest(record)
+        ):
+            raise ValueError("Existing record conflicts; publish a superseding record")
+        return comment
+
+    async def publish_records(self, repo):
+        authors = await self.authorized_authors()
+        for row in self.store.rows(
+            "SELECT * FROM record_publications WHERE repository=? AND state!='published'",
+            (repo,),
+        ):
+            try:
+                record = RECORD_ADAPTER.validate_json(row["data"])
+                if isinstance(record, AssessmentRecord) and record.role == "human":
+                    raise ValueError("Human assessments must be authored directly on GitHub")
+                scan = (
+                    self.store.one("SELECT * FROM scans WHERE id=?", (record.id,))
+                    if isinstance(record, ExecutionRecord)
+                    else None
+                )
+                rendered = (
+                    f"<!-- maxwell:execution:{record.id} -->\n"
+                    + scan_report(scan, record.finding_ids, record=record)
+                    if scan
+                    else record_report(record)
+                )
+                body = self.config.redact(rendered)
+                record = decode_record(body)
+                marker = f"<!-- maxwell:{record.type}:{record.id} -->"
+                comment = await self.record_comment(repo, row["issue"], marker, record, authors)
+                if (
+                    comment is None
+                    and row["state"] != "uncertain"
+                    and isinstance(record, (ExecutionRecord, MeasurementRecord))
+                ):
+                    dashboard = self.store.one(
+                        "SELECT issue FROM dashboards WHERE repository=?", (repo,)
+                    )
+                    if dashboard and row["issue"] == dashboard["issue"]:
+                        destination = await self.history(repo)
+                        with self.store.db:
+                            self.store.db.execute(
+                                "UPDATE record_publications SET issue=? WHERE repository=? AND type=? AND id=?",
+                                (destination, repo, record.type, record.id),
+                            )
+                        row = {**row, "issue": destination}
+                        comment = await self.record_comment(
+                            repo, destination, marker, record, authors
+                        )
+                if comment is None:
+                    if row["state"] == "uncertain":
+                        continue
+                    with self.store.db:
+                        self.store.db.execute(
+                            "UPDATE record_publications SET state='uncertain' "
+                            "WHERE repository=? AND type=? AND id=?",
+                            (repo, row["type"], row["id"]),
+                        )
+                    try:
+                        comment = await self.call(
+                            self.github.create_comment, repo, row["issue"], body
+                        )
+                    except PublicationUncertain:
+                        comment = await self.record_comment(
+                            repo, row["issue"], marker, record, authors
+                        )
+                        if comment is None:
+                            raise
+                    except Exception:
+                        with self.store.db:
+                            self.store.db.execute(
+                                "UPDATE record_publications SET state='pending' "
+                                "WHERE repository=? AND type=? AND id=?",
+                                (repo, row["type"], row["id"]),
+                            )
+                        raise
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE record_publications SET state='published',error=NULL "
+                        "WHERE repository=? AND type=? AND id=?",
+                        (repo, row["type"], row["id"]),
+                    )
+            except Exception as exc:
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE record_publications SET error=? WHERE repository=? AND type=? AND id=?",
+                        (self.config.redact(str(exc))[:1000], repo, row["type"], row["id"]),
+                    )
+        if self.store.one(
+            "SELECT id FROM record_publications WHERE repository=? "
+            "AND (error IS NOT NULL OR state='uncertain') LIMIT 1",
+            (repo,),
+        ):
+            raise ValueError("GitHub record publication requires reconciliation")
+
     async def publish_finding(self, finding):
         repo, identity = finding["repository"], finding["id"]
         marker = f"<!-- maxwell:finding:{identity} -->"
         try:
             issue = await self.call(self.github.find_issue, repo, marker)
+            if issue and issue.get("user", {}).get("login") not in await self.authorized_authors():
+                raise ValueError("Finding marker belongs to an unauthorized author")
             if not issue and finding["state"] == "uncertain":
                 return
             if not issue:
@@ -102,12 +740,17 @@ class Reporter:
                     self.labels_ready.add(repo)
                 data = json.loads(finding["data"])
                 scan = self.store.one("SELECT * FROM scans WHERE id=?", (finding["scan_id"],))
+                agent = public_agent(scan)
                 body = f"""{marker}
-**Suspected {data["kind"]}; not reproduced or independently validated.**
+### Hunter · suspected {data["kind"]}
+
+**Source inspection only; not reproduced or independently validated.**
 
 Scanned revision: `{scan["sha"]}`  
 Location: `{data["path"]}:{data["line"]}` (`{data["symbol"]}`)  
 Suggested priority: {data["priority"]}; hunter confidence: {data["confidence"]:.0%}
+Agent: `{agent.display() if agent else "Unknown legacy agent"}`
+Proposed factors: {", ".join(data.get("factors", [])) or "none established"}.
 
 ### Evidence
 {data["evidence"]}
@@ -115,13 +758,30 @@ Suggested priority: {data["priority"]}; hunter confidence: {data["confidence"]:.
 ### Expected behavior / benefit
 {data["expected"]}
 
-Discovery scan: `{finding["scan_id"]}`. Allocated discovery spending:
-**{money(finding["allocated"])}** (equal allocation across new findings).
+Discovery scan: `{finding["scan_id"]}`. Token usage is recorded on that execution;
+it is not counted again for this finding.
+{spending_summary(json.loads(scan["usage"] or "{}").get("spending"))}
+This is the shared hunter execution cost, not a separate charge for each finding.
 Reproduction, fixing, and validation: **not run**.
 
 Authorized users may comment `/maxwell confirm`, `/maxwell reject <reason>`,
 or `/maxwell priority P1`. Confirmation here is a human assessment, not a reproduced test.
 """
+                body += (
+                    "\n"
+                    + encode_record(
+                        FindingRecord(
+                            id=identity,
+                            repository=repo,
+                            sha=scan["sha"],
+                            execution_id=scan["id"],
+                            agent=agent,
+                            spending=json.loads(scan["usage"] or "{}").get("spending"),
+                            finding=data,
+                        )
+                    )
+                    + "\n"
+                )
                 # Persist uncertainty before crossing the external side-effect boundary.
                 with self.store.db:
                     self.store.db.execute(
@@ -137,16 +797,21 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
                             "maxwell",
                             "maxwell:state:suspected",
                             f"maxwell:priority:{data['priority']}",
+                            *[f"maxwell:factor:{factor}" for factor in data.get("factors", [])],
                         ],
                     )
                 except PublicationUncertain:
-                    raise
+                    issue = await self.call(self.github.find_issue, repo, marker)
+                    if issue is None:
+                        raise
                 except Exception:
                     with self.store.db:
                         self.store.db.execute(
                             "UPDATE findings SET state='pending' WHERE id=?", (identity,)
                         )
                     raise
+            if issue.get("user", {}).get("login") not in await self.authorized_authors():
+                raise ValueError("Finding marker belongs to an unauthorized author")
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE findings SET state=?,issue=?,url=?,error=NULL WHERE id=?",
@@ -161,80 +826,397 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
         except Exception as exc:
             self.error("findings", "id", identity, exc)
 
-    async def dashboard(self, repo):
+    async def publish_scan_reports(self, repo, issue, scans):
+        published = False
+        if any(scan["finished"] and not scan["report_sent"] for scan in scans):
+            await self.project_repository_records(repo)
+        for scan in scans:
+            if scan["finished"] and not scan["report_sent"]:
+                finding_ids = [
+                    row["finding_id"]
+                    for row in self.store.rows(
+                        "SELECT finding_id FROM finding_observations WHERE scan_id=? ORDER BY finding_id",
+                        (scan["id"],),
+                    )
+                ]
+                report = self.config.redact(scan_report(scan, finding_ids))
+                (self.paths.root / "reports" / f"{scan['id']}.md").write_text(report)
+                existing = self.store.one(
+                    "SELECT status FROM github_records WHERE repository=? AND type='execution' AND id=?",
+                    (repo, scan["id"]),
+                )
+                if existing and existing["status"] != "current":
+                    raise ValueError("Existing execution record requires reconciliation")
+                if not existing:
+                    publication = self.store.one(
+                        "SELECT id FROM record_publications WHERE repository=? AND type='execution' AND id=?",
+                        (repo, scan["id"]),
+                    )
+                    if not publication:
+                        self.store.queue_record(execution_record(scan, finding_ids), issue)
+                    await self.publish_records(repo)
+                    publication = self.store.one(
+                        "SELECT state FROM record_publications WHERE repository=? AND type='execution' AND id=?",
+                        (repo, scan["id"]),
+                    )
+                    if publication["state"] != "published":
+                        raise ValueError("Execution publication requires reconciliation")
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE scans SET report_sent=1 WHERE id=?", (scan["id"],)
+                    )
+                published = True
+        return published
+
+    async def channel_issue(self, repo, marker):
+        matches = await self.call(
+            lambda: [
+                item
+                for item in self.github.paginate(f"repos/{repo}/issues", {"state": "all"})
+                if "pull_request" not in item and marker in (item.get("body") or "")
+            ]
+        )
+        if len(matches) > 1:
+            raise ValueError("Duplicate channel markers require reconciliation")
+        issue = matches[0] if matches else None
+        if issue and issue.get("user", {}).get("login") not in await self.authorized_authors():
+            raise ValueError("Channel marker belongs to an unauthorized author")
+        return issue
+
+    async def channel(self, repo, table, marker, title):
         with self.store.db:
-            self.store.db.execute("INSERT OR IGNORE INTO dashboards(repository) VALUES(?)", (repo,))
-        record = self.store.one("SELECT * FROM dashboards WHERE repository=?", (repo,))
-        marker = "<!-- maxwell:dashboard:v1 -->"
+            self.store.db.execute(f"INSERT OR IGNORE INTO {table}(repository) VALUES(?)", (repo,))
+        record = self.store.one(f"SELECT * FROM {table} WHERE repository=?", (repo,))
         if not record["issue"]:
-            issue = await self.call(self.github.find_issue, repo, marker)
+            issue = await self.channel_issue(repo, marker)
             if not issue and record["state"] == "uncertain":
-                return None
+                raise ValueError("Issue creation is uncertain; reconciliation required")
             if not issue:
                 with self.store.db:
                     self.store.db.execute(
-                        "UPDATE dashboards SET state='uncertain' WHERE repository=?", (repo,)
+                        f"UPDATE {table} SET state='uncertain' WHERE repository=?", (repo,)
                     )
                 try:
-                    issue = await self.call(
-                        self.github.create_issue, repo, "Maxwell status", marker
-                    )
-                except PublicationUncertain:
-                    raise
+                    body = marker
+                    if table == "histories":
+                        body += "\n\nAppend-only execution and measurement records. Current entropy and component links are shown on the Maxwell status issue. Assessments remain on their finding issues.\n"
+                    issue = await self.call(self.github.create_issue, repo, title, body)
+                except PublicationUncertain as exc:
+                    issue = await self.channel_issue(repo, marker)
+                    if issue is None:
+                        self.error(table, "repository", repo, exc)
+                        raise
                 except Exception:
                     with self.store.db:
                         self.store.db.execute(
-                            "UPDATE dashboards SET state='pending' WHERE repository=?", (repo,)
+                            f"UPDATE {table} SET state='pending' WHERE repository=?", (repo,)
                         )
                     raise
             with self.store.db:
                 self.store.db.execute(
-                    "UPDATE dashboards SET issue=?,url=?,state='published',error=NULL "
-                    "WHERE repository=?",
+                    f"UPDATE {table} SET issue=?,url=?,state='published',error=NULL WHERE repository=?",
                     (issue["number"], issue["html_url"], repo),
                 )
-            record["issue"] = issue["number"]
+            record = self.store.one(f"SELECT * FROM {table} WHERE repository=?", (repo,))
+        else:
+            issue = await self.call(
+                self.github.request, "GET", f"repos/{repo}/issues/{record['issue']}"
+            )
+            if (
+                marker not in (issue.get("body") or "")
+                or issue.get("user", {}).get("login") not in await self.authorized_authors()
+            ):
+                raise ValueError("Channel identity changed; reconciliation required")
+        return record
+
+    async def history(self, repo):
+        record = await self.channel(
+            repo, "histories", "<!-- maxwell:history:v1 -->", "Maxwell history"
+        )
+        return record["issue"]
+
+    async def clear_status_reports(self, repo, issue):
+        authors = await self.authorized_authors()
+        comments = await self.call(self.github.comments, repo, issue)
+        removed = set()
+        for comment in comments:
+            if comment.get("user", {}).get("login") in authors and re.match(
+                r"<!-- maxwell:(?:scan|execution|measurement):[a-f0-9]{32} -->",
+                comment.get("body") or "",
+            ):
+                try:
+                    record = decode_record(comment.get("body") or "")
+                except ValueError:
+                    record = None
+                if (
+                    isinstance(record, (ExecutionRecord, MeasurementRecord))
+                    and record.repository == repo
+                ):
+                    publication = self.store.one(
+                        "SELECT issue,data FROM record_publications WHERE repository=? AND type=? AND id=?",
+                        (repo, record.type, record.id),
+                    )
+                    if not publication or (
+                        publication["issue"] == issue
+                        and record_digest(RECORD_ADAPTER.validate_json(publication["data"]))
+                        == record_digest(record)
+                    ):
+                        self.store.queue_record(record, issue)
+                        with self.store.db:
+                            self.store.db.execute(
+                                "UPDATE record_publications SET state='published',error=NULL WHERE repository=? AND type=? AND id=?",
+                                (repo, record.type, record.id),
+                            )
+                            if isinstance(record, ExecutionRecord):
+                                self.store.db.execute(
+                                    "UPDATE scans SET report_sent=1 WHERE id=? AND repository=?",
+                                    (record.id, repo),
+                                )
+                await self.call(
+                    self.github.request, "DELETE", f"repos/{repo}/issues/comments/{comment['id']}"
+                )
+                removed.add(comment["id"])
+        if removed:
+            self.store.reconcile_records(
+                repo, issue, {comment["id"] for comment in comments} - removed
+            )
+        return len(removed)
+
+    async def dashboard(self, repo):
+        marker = "<!-- maxwell:dashboard:v1 -->"
+        record = await self.channel(repo, "dashboards", marker, "Maxwell status")
+        history_issue = await self.history(repo)
         scans = self.store.rows(
             "SELECT * FROM scans WHERE repository=? ORDER BY created DESC", (repo,)
         )
+        if await self.publish_scan_reports(repo, history_issue, scans):
+            await self.project_repository_records(repo)
         findings = self.store.rows("SELECT * FROM findings WHERE repository=?", (repo,))
-        total = sum(scan["cost"] or 0 for scan in scans)
+        scan_history = {}
+        finding_ids = {finding["id"] for finding in findings}
+        for row in self.store.rows(
+            "SELECT data FROM github_records WHERE repository=? AND status='current' "
+            "AND type IN ('finding','execution')",
+            (repo,),
+        ):
+            public_record = RECORD_ADAPTER.validate_json(row["data"])
+            if isinstance(public_record, FindingRecord):
+                finding_ids.add(public_record.id)
+            else:
+                scan_history[public_record.id] = {
+                    "id": public_record.id,
+                    "state": public_record.state,
+                    "usage": public_record.usage.model_dump_json(),
+                    "executed": public_record.usage.reported
+                    or (public_record.started is not None and public_record.state != "skipped"),
+                    "created": public_record.started or public_record.finished,
+                    "agent": public_record.agent,
+                    "spending": (
+                        public_record.spending.model_dump() if public_record.spending else None
+                    ),
+                }
+        scan_history.update((scan["id"], scan) for scan in scans)
+        history = sorted(scan_history.values(), key=lambda scan: scan["created"], reverse=True)
+        usages = [json.loads(scan["usage"] or "{}") for scan in history]
+        totals = {
+            key: sum(usage.get(key, 0) for usage in usages if usage.get("reported"))
+            for key in (
+                "input_tokens",
+                "cached_input_tokens",
+                "cache_write_tokens",
+                "output_tokens",
+            )
+        }
         unknown = sum(
-            scan["accounting"] == "usd" and scan["cost"] is None and scan["started"] is not None
-            for scan in scans
+            bool(scan["executed"]) and not usage.get("reported")
+            for scan, usage in zip(history, usages, strict=True)
         )
-        unpriced = sum(scan["accounting"] == "unpriced" and scan["executed"] for scan in scans)
-        allocated = sum(scan["allocated"] for scan in scans)
-        ratings = hunter_ratings(self.store, repo)
+        incomplete = sum(
+            bool(scan["executed"]) and not usage.get("complete")
+            for scan, usage in zip(history, usages, strict=True)
+        )
+        spendings = [
+            usage.get("spending") or scan.get("spending")
+            for scan, usage in zip(history, usages, strict=True)
+        ]
+        cost_total = sum(value["micros"] for value in spendings if value is not None)
+        cost_upper = (
+            sum(
+                value["upper_micros"] if value.get("upper_micros") is not None else value["micros"]
+                for value in spendings
+                if value is not None
+            )
+            if any(
+                value is not None and value.get("upper_micros") is not None for value in spendings
+            )
+            else None
+        )
+        cost_unknown = sum(
+            bool(scan["executed"]) and value is None
+            for scan, value in zip(history, spendings, strict=True)
+        )
+        cost_partial = sum(value is not None and not value["complete"] for value in spendings)
+        reputation = reputation_report(agent_reputation(self.store, repo))
+        measurements = projected_measurements(self.store, repo)
+        measurement = measurements[-1] if measurements else None
+        entropy = "Unavailable — run `maxwell measure` to establish a baseline"
+        baseline = None
+        if measurement:
+            score = measurement_score(measurement)
+            entropy = (
+                f"{score:.2f}/100 (lower is better)"
+                if score is not None
+                else "Unknown — required measurements unavailable"
+            )
+            baseline = next(
+                (item for item in measurements if item.id == measurement.baseline_id), None
+            )
+        source_supported = human_confirmed = 0
+        issues = await self.call(
+            lambda: list(self.github.paginate(f"repos/{repo}/issues", {"state": "all"}))
+        )
+        remote = {item["number"]: item for item in issues if "pull_request" not in item}
+        measurement_body = component_dashboard(repo, measurement, baseline)
+        for row in self.store.rows(
+            "SELECT issue,data FROM github_records WHERE repository=? AND type='finding' AND status='current'",
+            (repo,),
+        ):
+            finding = RECORD_ADAPTER.validate_json(row["data"])
+            issue = remote.get(row["issue"])
+            if (
+                not issue
+                or issue["state"] != "open"
+                or finding.finding.kind != "bug"
+                or finding.finding.identity(repo) != finding.id
+            ):
+                continue
+            labels = {label["name"] for label in issue.get("labels", [])}
+            if "maxwell:state:rejected" in labels:
+                continue
+            if "maxwell:state:human-confirmed" in labels:
+                human_confirmed += 1
+            else:
+                reviews, audits = current_assessments(self.store, repo, row["issue"], finding)
+                decisions = audits or reviews
+                if decisions and all(record.verdict == "supported" for record in decisions):
+                    source_supported += 1
+        maintenance, bugs = fix_queue(self.store, repo, remote, measurements)
+        queue_body = queue_report(repo, maintenance, bugs)
+        validations = self.store.rows(
+            "SELECT issue,comment,data FROM github_records WHERE repository=? AND type='validation' AND status='current' ORDER BY comment DESC",
+            (repo,),
+        )
+        superseded = {
+            identity
+            for row in validations
+            for identity in RECORD_ADAPTER.validate_json(row["data"]).supersedes
+        }
+        repairs = self.store.rows(
+            "SELECT issue,comment,data FROM github_records WHERE repository=? "
+            "AND type='repair' AND status='current' ORDER BY observed DESC LIMIT 20",
+            (repo,),
+        )
+        if repairs:
+            queue_body += "\n### Repair pull requests\n\n"
+            for row in repairs:
+                repair = RECORD_ADAPTER.validate_json(row["data"])
+                url = (
+                    f"https://github.com/{repo}/issues/{row['issue']}#issuecomment-{row['comment']}"
+                )
+                decisions = {
+                    validation_record.outcome
+                    for item in validations
+                    if (validation_record := RECORD_ADAPTER.validate_json(item["data"])).repair_id
+                    == repair.id
+                    and validation_record.id not in superseded
+                }
+                status = (
+                    "awaiting validation"
+                    if not decisions
+                    else "validation "
+                    + (next(iter(decisions)) if len(decisions) == 1 else "conflicting")
+                )
+                link_row = self.store.one(
+                    "SELECT data FROM github_records WHERE repository=? AND type='pull_request' AND json_extract(data,'$.repair_id')=? AND status='current' ORDER BY comment DESC LIMIT 1",
+                    (repo, repair.id),
+                )
+                link = RECORD_ADAPTER.validate_json(link_row["data"]) if link_row else None
+                destination = f"https://github.com/{repo}/pull/{link.number}" if link else url
+                label = f"PR #{link.number}" if link else "publication pending"
+                queue_body += f"- [#{row['issue']}: {repair.outcome}]({destination}) · {label} · `{repair.branch}`; {status}.\n"
+        if validations:
+            queue_body += "\n### Independent repair validations\n\n"
+            for row in validations[:20]:
+                validation = RECORD_ADAPTER.validate_json(row["data"])
+                if validation.id in superseded:
+                    continue
+                url = (
+                    f"https://github.com/{repo}/issues/{row['issue']}#issuecomment-{row['comment']}"
+                )
+                reduction = validation_changes(validation)["reduction"]
+                delta = (
+                    f"{reduction:+.2f} points observed reduction"
+                    if reduction is not None
+                    else "observed reduction unknown"
+                )
+                queue_body += f"- [#{row['issue']}: {validation.outcome}]({url}) · {delta}; pinned snapshot.\n"
         body = f"""{marker}
 # Maxwell status
 
-Milestone 1: discovery only. Findings remain suspected until human assessment or future reproduction.
+**Repository entropy: {entropy}.**
+
+Recorded agent cost: **{cost_range(cost_total, cost_upper)} USD estimated**; {cost_unknown} executions
+with unknown cost, {cost_partial} with partial cost. API-equivalent usage, counted once per execution.
+
+Open bug burden: **{source_supported} source-supported**, **{human_confirmed} human-confirmed**.
+Reported separately from structural entropy; source support does not imply reproduction.
+
+{measurement_body}
+
+{queue_body}
+
+[Execution and measurement history](https://github.com/{repo}/issues/{history_issue}).
+
+<details>
+<summary>Activity, costs, tokens, and agent reputation</summary>
+
+Hunting, review, audit, repair, and independent validation use separate executions. Source assessments do not imply reproduction.
 
 | Metric | Value |
 | --- | --- |
-| Entropy | Unavailable — complete measurement baseline required |
-| Known discovery spending | {money(total)} |
-| Allocated discovery spending | {money(allocated)} |
-| Unallocated known overhead | {money(total - allocated)} |
-| Executions with unknown spending | {unknown} |
-| Unpriced executions | {unpriced} |
-| Findings | {len(findings)} |
-| Scans | {len(scans)} |
+| Entropy | {entropy} |
+| Recorded input tokens | {totals["input_tokens"]:,} |
+| Cached input tokens (included in input) | {totals["cached_input_tokens"]:,} |
+| Cache write tokens (included in input) | {totals["cache_write_tokens"]:,} |
+| Recorded output tokens | {totals["output_tokens"]:,} |
+| Recorded total tokens (input + output) | {totals["input_tokens"] + totals["output_tokens"]:,} |
+| Recorded API-equivalent cost (USD estimate) | {cost_range(cost_total, cost_upper)} |
+| Executions with unknown cost | {cost_unknown} |
+| Executions with partial cost | {cost_partial} |
+| Executions with unavailable token usage | {unknown} |
+| Executions with incomplete token usage | {incomplete} |
+| Findings | {len(finding_ids)} |
+| Scans | {len(history)} |
 
-### Hunter ratings
-{json.dumps(ratings) if ratings else "Unrated: no independent assessments yet."}
+Token totals include reported usage from failed attempts. Missing usage is unknown,
+not zero; totals may be partial when execution usage is unavailable or incomplete.
+Cost totals include recorded estimates once per execution and omit unknown amounts.
+API-equivalent estimates are not invoices or incremental subscription charges.
+
+{reputation}
 
 ### Recent scans
 """
-        for scan in scans[:10]:
-            cost = (
-                "unpriced"
-                if scan["accounting"] == "unpriced" and scan["cost"] is None
-                else money(scan["cost"])
-            )
-            body += f"- `{scan['id'][:12]}`: {scan['state']}, {cost}, {scan['provider'] or 'legacy'}/{scan['model'] or 'legacy'}\n"
-        body += "\nAuthorized commands: `/maxwell scan --model MODEL [--provider PROVIDER] [--effort EFFORT]`, `/maxwell pause`, `/maxwell resume`.\n"
+        for scan in history[:10]:
+            tokens = token_summary(json.loads(scan["usage"] or "{}"))
+            agent = scan.get("agent") or public_agent(scan)
+            identity = agent.display() if agent else "Unknown legacy agent"
+            counts = ""
+            if scan.get("selection"):
+                selection = SelectionStats.model_validate_json(scan["selection"])
+                counts = f", {selection.collected} collected, {selection.skipped} skipped"
+            body += f"- `{scan['id'][:12]}`: {scan['state']}, {tokens}, {identity}{counts}\n"
+        body += "\n</details>\n"
         body = self.config.redact(body)
         snapshot = self.paths.root / "reports" / (repo.replace("/", "--") + ".md")
         snapshot.write_text(body)
@@ -248,21 +1230,7 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                 f"repos/{repo}/issues/{record['issue']}",
                 json={"body": body},
             )
-        for scan in scans:
-            if scan["finished"] and not scan["report_sent"]:
-                report = self.config.redact(scan_report(scan))
-                (self.paths.root / "reports" / f"{scan['id']}.md").write_text(report)
-                await self.call(
-                    self.github.upsert_comment,
-                    repo,
-                    record["issue"],
-                    f"<!-- maxwell:scan:{scan['id']} -->",
-                    report,
-                )
-                with self.store.db:
-                    self.store.db.execute(
-                        "UPDATE scans SET report_sent=1 WHERE id=?", (scan["id"],)
-                    )
+        await self.clear_status_reports(repo, record["issue"])
         return record["issue"]
 
     async def commands(self, repo, issue, finding=None):
@@ -354,7 +1322,6 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                         route = self.config.route(
                             values.get("--provider"),
                             values["--model"],
-                            self.store.saved_route(repo),
                             effort=values.get("--effort"),
                         )
                         execution = self.config.execution(route, record)
@@ -398,15 +1365,18 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                         "publication_retry_authorized", {"finding": argument, "actor": actor}
                     )
 
-    async def refresh_findings(self, repository, *, process_commands=True):
+    async def refresh_findings(self, repository, *, process_commands=True, issues=None):
+        remote_issues = {issue["number"]: issue for issue in issues or []}
         for finding in self.store.rows(
             "SELECT * FROM findings WHERE repository=? AND issue IS NOT NULL", (repository,)
         ):
             if process_commands:
                 await self.commands(repository, finding["issue"], finding)
-            remote = await self.call(
-                self.github.request, "GET", f"repos/{repository}/issues/{finding['issue']}"
-            )
+            remote = remote_issues.get(finding["issue"]) if not process_commands else None
+            if remote is None:
+                remote = await self.call(
+                    self.github.request, "GET", f"repos/{repository}/issues/{finding['issue']}"
+                )
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE findings SET state='closed' WHERE id=? "
@@ -416,6 +1386,29 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
                 self.store.db.execute(
                     "UPDATE findings SET checked=? WHERE id=?", (time.time(), finding["id"])
                 )
+
+    async def sync_pull_requests(self, repo, *, auto_merge=True):
+        from maxwell.repair_pull_requests import (
+            feedback,
+            finish_integrations,
+            publish_prepared,
+            refresh_links,
+        )
+
+        await self.publish_records(repo)
+        issues = await self.project_repository_records(repo)
+        if not self.store.one(
+            "SELECT id FROM github_records WHERE repository=? AND type IN ('repair','pull_request') AND status='current' LIMIT 1",
+            (repo,),
+        ):
+            return issues
+        await publish_prepared(self, repo)
+        await self.project_repository_records(repo)
+        await refresh_links(self, repo)
+        await self.project_repository_records(repo)
+        await feedback(self, repo, auto_merge=auto_merge)
+        await finish_integrations(self, repo)
+        return await self.project_repository_records(repo)
 
     async def sync(self, repository=None, *, process_commands=True):
         for finding in self.store.rows(
@@ -428,11 +1421,19 @@ Milestone 1: discovery only. Findings remain suspected until human assessment or
             "SELECT name FROM repositories WHERE ? IS NULL OR name=?", (repository, repository)
         ):
             name = repo["name"]
+            with self.store.db:
+                self.store.db.execute(
+                    "INSERT OR IGNORE INTO dashboards(repository) VALUES(?)", (name,)
+                )
             try:
+                issues = await self.sync_pull_requests(name)
                 issue = await self.dashboard(name)
                 if issue and process_commands:
                     await self.commands(name, issue)
-                await self.refresh_findings(name, process_commands=process_commands)
+                await self.refresh_findings(name, process_commands=process_commands, issues=issues)
+                issues = await self.project_repository_records(name)
+                await self.reconcile_assessment_labels(name, issues)
+                await self.dashboard(name)
                 with self.store.db:
                     self.store.db.execute(
                         "UPDATE dashboards SET error=NULL WHERE repository=?", (name,)

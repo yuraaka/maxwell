@@ -34,6 +34,40 @@ limits:
   scan_timeout_seconds: 600
   scan_interval_seconds: 1800
   max_findings_per_scan: 3
+  max_candidates_per_scan: 100
+  max_hunt_diff_chars: 30000
+  max_hunt_changed_files: 200
+  max_reviews_per_scan: 1
+  max_audits_per_scan: 1
   human_queue_max: 6
   minimum_confidence: 0.8
   shutdown_grace_seconds: 10
+
+measurement:
+  complexity_threshold: 10
+  clone_tokens: 50
+  clone_lines: 5
+  max_tokens: 200000
+  max_file_bytes: 1000000
+  exclude: ["vendor/**", "generated/**", "**/*_pb2.py"]
+  source_roots: [src, "."]
+  architecture_exclude: ["tests/**", "**/tests/**", "test_*.py", "**/test_*.py", "conftest.py", "**/conftest.py"]
+  max_architecture_modules: 1000
+  max_cohesion_members: 500
+  auto_test_runtime_budget_seconds: 60
+  weights:
+    complexity: 0.2
+    duplication: 0.2
+    coupling: 0.2
+    test_runtime: 0.2
+    test_flakiness: 0.2
+  tests: {}
+  # Configure a pytest runner or use automatic detection with two measured runs.
+  # tests:
+  #   owner/repo:
+  #     command: [/absolute/path/to/venv/bin/python, -m, pytest, -q]
+  #     runs: 5
+  #     warmups: 1
+  #     timeout_seconds: 600
+  #     runtime_budget_seconds: 300
+  #     environment: {}

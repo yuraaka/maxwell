@@ -12,7 +12,7 @@ def color(text, code, stream=None):
 
 
 def check_line(check):
-    labels = {"ok": "OK", "error": "FAIL", "skipped": "SKIP"}
+    labels = {"ok": "OK", "error": "FAIL", "skipped": "SKIP", "waiting": "WAIT"}
     name = check["name"]
     parts = name.split(":", 2)
     if parts[0] == "provider" and len(parts) > 1:
@@ -35,30 +35,20 @@ def check_line(check):
         elif "blocked by" in message:
             message = "provider errors"
     message = message.replace("\n", "\n       ")
-    badge = color(f"[{labels[status]}]", {"ok": "32", "error": "31", "skipped": "33"}[status])
+    badge = color(
+        f"[{labels[status]}]",
+        {"ok": "32", "error": "31", "skipped": "33", "waiting": "36"}[status],
+    )
     suffix = f": {message}" if message else ""
     print(f"{badge} {name}{suffix}", flush=True)
 
 
-def scan_line(scan):
-    name = scan["repository"]
-    if scan["state"] == "running":
-        effort = f" / {scan['effort']}" if scan.get("effort") else ""
-        print(
-            f"{color('[RUN]', '36')} {name} / {scan['provider']} / {scan['model']}{effort}",
-            flush=True,
-        )
-    elif scan["state"] == "publishing":
-        print(f"{color('[PUB]', '36')} {name}: publishing results", flush=True)
-    else:
-        success = scan["state"] == "completed" and not scan["publication_errors"]
-        badge = color("[OK]" if success else "[FAIL]", "32" if success else "31")
-        detail = (
-            f"{scan['admitted']} new findings"
-            if success
-            else scan["error"] or "; ".join(scan["publication_errors"]) or scan["state"]
-        )
-        print(f"{badge} {name}: {detail}", flush=True)
+def measurement_line(item):
+    badge = "[WAIT]" if item["heartbeat"] else "[STEP]"
+    print(
+        f"{color(badge, '36')} {item['repository']}: {item['phase']} ({item['elapsed']}s elapsed)",
+        flush=True,
+    )
 
 
 def table(headers, rows, *, bordered=False, cell_style=None):
@@ -160,9 +150,6 @@ def repository_lines(record):
             lines.append(f"  {label}: {record[key]}")
     if "directory" in record:
         lines.append(f"  Local directory: {record['directory'] or 'none'}")
-    for stage, route in record.get("stages", {}).items():
-        effort = f" / {route['effort']}" if route.get("effort") else ""
-        lines.append(f"  {stage.capitalize()}: {route['provider']} / {route['model']}{effort}")
     return lines
 
 
@@ -195,16 +182,136 @@ def human_lines(value, command, repo_command=None):
         lines = repository_lines(value)
         lines[0] = f"{verb} {lines[0]}"
         return lines
+    if command == "scan" and value.get("pipeline"):
+        lines = []
+        for summary in value.get("pipeline_repositories", []):
+            repository = summary["repository"]
+            counts = ", ".join(
+                f"{stage}: {count}" for stage, count in summary["executions"].items()
+            )
+            lines.append(
+                f"{color(repository, '1;36')}: {summary['closed']} closed; {summary['rejected']} rejected; {summary['remaining']} remaining; {summary['failed']} failed executions"
+            )
+            if counts:
+                lines.append(counts)
+            for reason in summary["waiting"][:3]:
+                lines.append(f"[WAIT] {reason}")
+        for error in value.get("errors", [])[-3:]:
+            lines.append(f"[FAIL] {error['repository']} / {error['stage']}: {error['error']}")
+        for status in value.get("statuses", []):
+            lines.append(f"{color('Status:', '1;36')} {color(status['url'], '36;4')}")
+        return lines or ["No repositories to scan."]
     if command == "scan":
-        if not value["scans"]:
+        scans = value.get("scans", [])
+        measurements = value.get("measurements", [])
+        skipped = value.get("skipped", [])
+        errors = value.get("errors", [])
+        repositories = sorted(
+            {
+                item["repository"]
+                for item in [*scans, *measurements, *skipped, *errors, *value.get("statuses", [])]
+            }
+        )
+        if not repositories:
             return ["No repositories to scan."]
         lines = []
-        for scan in value["scans"]:
-            if scan["report"]:
-                lines.append(f"Report: {scan['report']}")
-            for finding in scan["findings"]:
-                if finding["url"]:
-                    lines.append(f"Finding: {finding['url']}")
+        for repository in repositories:
+            runs = [item for item in scans if item["repository"] == repository]
+            successful = [
+                item
+                for item in runs
+                if item["state"] == "completed" and not item["publication_errors"]
+            ]
+            parts = (
+                [
+                    f"{sum(item['admitted'] for item in successful if item['stage'] == 'hunt')} new findings"
+                ]
+                if any(item["stage"] == "hunt" for item in runs)
+                else []
+            )
+            for stage in ("review", "audit"):
+                verdicts = [
+                    assessment["verdict"]
+                    for item in successful
+                    if item["stage"] == stage
+                    for assessment in item.get("assessments", [])
+                ]
+                if verdicts:
+                    counts = [
+                        f"{verdicts.count(verdict)} {verdict}"
+                        for verdict in ("supported", "rejected", "inconclusive")
+                        if verdict in verdicts
+                    ]
+                    parts.append(f"{stage}: {', '.join(counts)}")
+            measurement = next(
+                (item for item in measurements if item["repository"] == repository), None
+            )
+            if measurement:
+                score = measurement.get("score")
+                parts.append(f"entropy {score:.2f}/100" if score is not None else "entropy unknown")
+            lines.append(f"{color(repository, '1;36')}: {'; '.join(parts) or 'scan finished'}")
+            failures = {}
+            for item in errors:
+                if item["repository"] == repository:
+                    key = (item["stage"], item["error"])
+                    failures[key] = failures.get(key, 0) + 1
+            for item in runs:
+                if item["state"] != "completed" or item["publication_errors"]:
+                    key = (
+                        item["stage"],
+                        item["error"] or "; ".join(item["publication_errors"]) or item["state"],
+                    )
+                    failures[key] = failures.get(key, 0) + 1
+            for (stage, message), count in failures.items():
+                suffix = f" ({count} executions)" if count > 1 else ""
+                lines.append(f"[FAIL] {repository} / {stage}: {message}{suffix}")
+            for item in skipped:
+                if item["repository"] == repository:
+                    lines.append(f"[SKIP] {repository} / {item['stage']}: {item['reason']}")
+            if measurement:
+                unknown = [
+                    f"{factor}: {status}"
+                    for factor, status in measurement.get("factor_status", {}).items()
+                    if status != "measured"
+                ]
+                if unknown:
+                    lines.append("Unknown factors: " + "; ".join(unknown))
+            for item in runs:
+                for validation in item.get("validations", []):
+                    from maxwell.measurement import validation_changes
+                    from maxwell.records import RECORD_ADAPTER
+
+                    reduction = validation_changes(
+                        RECORD_ADAPTER.validate_python(
+                            {
+                                key: value
+                                for key, value in validation.items()
+                                if key not in ("issue", "publication_state")
+                            }
+                        )
+                    )["reduction"]
+                    delta = (
+                        f"{reduction:+.2f} points observed reduction"
+                        if reduction is not None
+                        else "observed reduction unknown"
+                    )
+                    lines.append(f"Validation: {validation['outcome']} · {delta}")
+                for link in item.get("pull_requests", []):
+                    lines.append(
+                        f"Repair PR: https://github.com/{repository}/pull/{link['number']}"
+                    )
+                if not item.get("pull_requests"):
+                    for repair in item.get("repairs", []):
+                        lines.append(f"Repair: {repair['outcome']} · PR publication pending")
+            status = next(
+                (item for item in value.get("statuses", []) if item["repository"] == repository),
+                None,
+            )
+            lines.append(
+                f"{color('Status:', '1;36')} {color(status['url'], '36;4')}"
+                if status
+                else "Status: unavailable (not published to GitHub)"
+            )
         return lines
     return []
 

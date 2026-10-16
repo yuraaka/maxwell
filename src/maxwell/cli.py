@@ -1,20 +1,24 @@
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
+import argcomplete
 import httpx
 
 from maxwell import __version__
 from maxwell.cli_help import TreeParser
-from maxwell.cli_output import check_line, color, model_lines, output, scan_line
+from maxwell.cli_output import check_line, color, measurement_line, model_lines, output
+from maxwell.completion import bash_completion, configure_completion
 from maxwell.config import Paths
 from maxwell.config_apply import apply_config
 from maxwell.github import GitHub
 from maxwell.manual import run_scans
+from maxwell.measurement_runner import run_measurements
 from maxwell.repositories import (
     git,
     github_name,
@@ -23,6 +27,7 @@ from maxwell.repositories import (
     validate_branch,
     validate_ref,
 )
+from maxwell.scan_display import ScanDisplay
 from maxwell.store import Store
 
 
@@ -37,21 +42,52 @@ def add_command(commands, name, **options):
     return command
 
 
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("Use a positive integer")
+    return number
+
+
 def parser():
-    root = TreeParser(prog="maxwell", description="Manual repository discovery")
+    root = TreeParser(prog="maxwell", description="Manual repository hunting, review, and audit")
     root.add_argument("--version", action="version", version=f"maxwell {__version__}")
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     root.add_argument(
         "--json", action="store_true", help="Print JSON instead of human-readable output"
     )
     commands = root.add_subparsers(dest="command", required=True)
+    measure = add_command(commands, "measure", help="Measure source and test maintenance factors")
+    measure.add_argument("repository", nargs="?")
+    measure.add_argument("--revision", help="Pinned commit SHA (default: registered branch)")
+    measure.add_argument(
+        "--skip-stage",
+        action="append",
+        choices=["source", "tests"],
+        default=[],
+        help="Skip a stage and reuse its latest compatible GitHub measurement (repeatable)",
+    )
+    measure.add_argument("--tests", action="store_true", help=argparse.SUPPRESS)
+    completion = add_command(commands, "completion", help="Generate shell completion")
+    completion.add_argument("shell", choices=["bash"], nargs="?", default="bash")
     config = add_command(commands, "config", help="Initialize or apply configuration")
     config_commands = config.add_subparsers(dest="config_command", required=True)
     add_command(config_commands, "init", help="Create private configuration and runtime files")
-    add_command(
+    apply = add_command(
         config_commands,
         "apply",
-        help="Reload settings, discover models, verify access, and save metadata",
+        help="Reload settings and check models for providers without saved data",
+    )
+    refresh = apply.add_mutually_exclusive_group()
+    refresh.add_argument(
+        "--force",
+        action="store_true",
+        help="Rediscover and validate every provider's models, replacing saved checks",
+    )
+    refresh.add_argument(
+        "--skip-model-checks",
+        action="store_true",
+        help="Reuse saved model metadata without model discovery or access probes",
     )
     models = add_command(commands, "models", help="Show stored models and efforts")
     model_commands = models.add_subparsers(dest="models_command", required=True)
@@ -61,18 +97,15 @@ def parser():
     model_list.add_argument("--provider", help="List one configured provider/account")
     repo = add_command(commands, "repo", help="Register, change, or list repositories")
     repositories = repo.add_subparsers(dest="repo_command", required=True)
-    add = add_command(repositories, "add", help="Register a repository and discovery settings")
+    add = add_command(repositories, "add", help="Register a repository")
     add.add_argument("source", help="Local path, owner/repository, or GitHub repository URL")
     add.add_argument("--github", help="GitHub owner/repository; inferred from origin if possible")
     add.add_argument("--directory", help="Existing checkout to switch and update before scans")
     add.add_argument("--ref", default="main", help="Base branch to scan (default: main)")
-    add.add_argument("--provider", help="Configured provider/account for discovery")
-    add.add_argument("--model", help="Discovery model (otherwise use the native default)")
-    add.add_argument("--effort", help="Reasoning effort (otherwise use the provider default)")
     add.add_argument(
         "--account", default="default", help="GitHub credential profile from config.yaml"
     )
-    add_command(repositories, "list", help="Show repository settings and stage routes")
+    add_command(repositories, "list", help="Show repository settings")
     change = add_command(repositories, "change", help="Change a repository's settings")
     change.add_argument("repository")
     directory = change.add_mutually_exclusive_group()
@@ -84,24 +117,53 @@ def parser():
     )
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
-    change.add_argument(
-        "--stage",
-        choices=["discovery", "review", "reproduction", "fix", "validation"],
-        help="Stage whose provider/model settings should change",
+    scan = add_command(
+        commands, "scan", help="Run measure → hunt → review → audit, or select one agent stage"
     )
-    change.add_argument("--provider", help="Configured provider/account for the stage")
-    change.add_argument("--model", help="Model for the stage")
-    change.add_argument("--effort", help="Stage effort; use 'default' to reset")
-    scan = add_command(commands, "scan", help="Run discovery now and publish findings")
     scan.add_argument("repository", nargs="?")
+    pipeline = scan.add_mutually_exclusive_group()
+    pipeline.add_argument(
+        "--repair-all",
+        action="store_true",
+        help="Drain existing findings through review, audit, repair, validation and integration",
+    )
+    pipeline.add_argument(
+        "--infinite",
+        action="store_true",
+        help="Continuously hunt and process findings within configured stage pool sizes",
+    )
+    scan.add_argument(
+        "--stage",
+        choices=["hunt", "review", "audit", "repair", "validate", "integrate"],
+        help="Run only this agent stage (default: measure, hunt, review, audit, then pending validation/integration)",
+    )
+    scan.add_argument(
+        "--skip-stage",
+        action="append",
+        default=[],
+        choices=["source", "tests", "hunt", "review", "audit", "validate", "integrate"],
+        help="Disable a stage; source/tests reuse compatible GitHub history (repeatable)",
+    )
+    scan.add_argument(
+        "--issue", type=positive_int, help="Finding issue to review, audit, repair, or validate"
+    )
+    scan.add_argument(
+        "--limit",
+        type=positive_int,
+        help="Override the stage's configured assessment limit per repository",
+    )
+    scan.add_argument(
+        "--force",
+        action="store_true",
+        help="Reassess a finding, retry repair, or supersede its validation",
+    )
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
-    scan.add_argument("--model", required=True, help="Model to use for this manual discovery run")
+    scan.add_argument("--model", help="Pin a model (default: automatic sampling)")
     scan.add_argument(
         "--effort", help="Reasoning effort for this run; 'default' uses the provider default"
     )
-    scan.add_argument(
-        "--provider", help="Override the repository's saved discovery provider/account"
-    )
+    scan.add_argument("--provider", help="Constrain selection to this connection")
+    configure_completion(root)
     return root
 
 
@@ -113,7 +175,6 @@ def infer_github(path):
 
 
 def register_repository(args, paths, config):
-    route = config.route(args.provider, args.model, effort=args.effort)
     settings = config.github.for_account(args.account)
     local = Path(args.source).expanduser()
     ref = validate_ref(args.ref)
@@ -139,7 +200,7 @@ def register_repository(args, paths, config):
         source, kind = f"https://github.com/{name}.git", "github"
     store = Store(paths.db)
     try:
-        store.register(name, source, ref, kind, args.account, directory, route)
+        store.register(name, source, ref, kind, args.account, directory)
     finally:
         store.close()
     return {
@@ -149,7 +210,6 @@ def register_repository(args, paths, config):
         "ref": ref,
         "github_account": args.account,
         "directory": directory,
-        "stages": {"discovery": route},
     }
 
 
@@ -171,33 +231,37 @@ def change_repository(args, store, config):
         )
     elif args.no_directory:
         changes["directory"] = None
-    route = None
-    stage = args.stage or "discovery"
-    if args.provider is not None or args.model is not None or args.effort is not None:
-        route = config.route(
-            args.provider, args.model, store.saved_route(record["name"], stage), effort=args.effort
-        )
-    elif args.stage is not None:
-        raise ValueError("Specify --provider, --model, or --effort when changing a stage")
-    if not changes and route is None:
-        raise ValueError("Specify repository settings or --provider/--model/--effort")
+    if not changes:
+        raise ValueError("Specify --directory, --no-directory, --ref, or --account")
     updated = {**record, **changes}
     if updated["directory"] is not None:
         validate_branch(updated["ref"])
     elif "ref" in changes and updated["source_kind"] == "local":
         inspect_repository(updated["source"], updated["ref"])
-    return store.change_repository(record["name"], changes, stage, route)
+    return store.change_repository(record["name"], changes)
 
 
 def execute(args):
     def emit(value):
         output(value, args)
 
+    if args.command == "completion":
+        script = bash_completion()
+        if args.json:
+            print(json.dumps({"shell": args.shell, "script": script}))
+        else:
+            print(script, end="")
+        return
     paths = Paths(args.home)
     if args.command == "config" and args.config_command == "apply":
         if not args.json:
             print("Applying config...", flush=True)
-        report = apply_config(paths, on_check=None if args.json else check_line)
+        report = apply_config(
+            paths,
+            on_check=None if args.json else check_line,
+            force=args.force,
+            skip_model_checks=args.skip_model_checks,
+        )
         emit(report)
         if not report["valid"]:
             raise SystemExit(1)
@@ -237,19 +301,65 @@ def execute(args):
                 emit(change_repository(args, store, config))
         finally:
             store.close()
-    elif args.command == "scan":
+    elif args.command == "measure":
         report = asyncio.run(
-            run_scans(
+            run_measurements(
                 paths,
                 config,
                 args.repository,
-                args.model,
-                provider=args.provider,
-                effort=args.effort,
-                priority=int(args.priority[1]),
-                on_progress=None if args.json else scan_line,
+                revision=args.revision,
+                run_tests="tests" not in args.skip_stage,
+                skip_source="source" in args.skip_stage,
+                on_progress=None if args.json else measurement_line,
             )
         )
+        if args.json:
+            emit(report)
+        else:
+            for item in report["measurements"]:
+                if item["state"] == "completed":
+                    score = (
+                        f"{item['score']:.2f}/100"
+                        if item["score"] is not None
+                        else "unknown (incomplete evidence)"
+                    )
+                    print(
+                        f"[OK] {item['repository']}: entropy {score}; factor weight {item['coverage']:.0%}",
+                        flush=True,
+                    )
+                    print(f"Report: {item['report']}", flush=True)
+                    print(f"Status: {item['url']}", flush=True)
+                    if item["publication_error"]:
+                        print(f"[FAIL] publication: {item['publication_error']}", flush=True)
+                else:
+                    print(f"[FAIL] {item['repository']}: {item['error']}", flush=True)
+        if not report["valid"]:
+            raise SystemExit(1)
+    elif args.command == "scan":
+        display = None if args.json else ScanDisplay()
+        try:
+            report = asyncio.run(
+                run_scans(
+                    paths,
+                    config,
+                    args.repository,
+                    args.model,
+                    provider=args.provider,
+                    effort=args.effort,
+                    priority=int(args.priority[1]),
+                    stage=args.stage,
+                    issue=args.issue,
+                    limit=args.limit,
+                    force=args.force,
+                    skip_stages=args.skip_stage,
+                    repair_all=args.repair_all,
+                    infinite=args.infinite,
+                    on_progress=display,
+                )
+            )
+        finally:
+            if display:
+                display.finish()
         emit(report)
         if not report["valid"]:
             raise SystemExit(1)
@@ -257,12 +367,18 @@ def execute(args):
 
 def main():
     cli = parser()
+    argcomplete.autocomplete(cli)
     if len(sys.argv) == 1:
         cli.print_help()
         return
     args = cli.parse_args()
     try:
         execute(args)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        raise SystemExit(1)
     except KeyboardInterrupt:
         raise SystemExit(130)
     except asyncio.CancelledError:
