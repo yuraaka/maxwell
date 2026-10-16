@@ -7,6 +7,7 @@ import time
 
 from maxwell.cli_output import color
 from maxwell.pricing import cost_range
+from maxwell.stages import stage_name
 
 
 class ScanDisplay:
@@ -238,7 +239,7 @@ class ScanDisplay:
         mode = (
             " · continuous"
             if self.pipeline == "infinite"
-            else " · repair queue"
+            else " · fix queue"
             if self.pipeline
             else ""
         )
@@ -249,17 +250,9 @@ class ScanDisplay:
             + styled("─" * (width - 2 - len(title)) + "╮", "2")
         )
         stages = []
-        for index, stage in enumerate(self.stages):
-            if index:
-                stages.append((" › ", "2"))
+        for stage in self.stages:
             status = self.statuses.get(stage)
-            label = (
-                {"measure": "Meas", "hunt": "Hunt", "review": "Rev", "audit": "Aud"}.get(
-                    stage, stage.capitalize()
-                )
-                if content_width < 45
-                else stage.capitalize()
-            )
+            label = stage_name(stage)
             if status == "completed":
                 label, code = f"✓ {label}", "32"
             elif status == "failed":
@@ -270,25 +263,18 @@ class ScanDisplay:
                 code = {
                     "measure": "1;33",
                     "hunt": "1;36",
-                    "review": "1;35",
-                    "audit": "1;32",
-                    "repair": "1;34",
                     "validate": "1;35",
+                    "audit": "1;32",
+                    "fix": "1;34",
+                    "review": "1;35",
                     "integrate": "1;32",
                 }.get(stage, "1;36")
-                if stage in ("review", "audit") and self.total:
+                if stage in ("validate", "audit") and self.total:
                     label += f" {self.completed}/{self.total}"
             else:
                 code = "2"
             if self.pipeline:
-                label = {
-                    "hunt": "Hunt",
-                    "review": "Rev",
-                    "audit": "Aud",
-                    "repair": "Fix",
-                    "validate": "Val",
-                    "integrate": "Int",
-                }.get(stage, stage.capitalize())
+                label = stage_name(stage)
                 count, capacity = self.pools.get(stage, 0), self.capacities.get(stage, 0)
                 label += f" {count}/{capacity}"
                 if status != "running":
@@ -326,7 +312,7 @@ class ScanDisplay:
         elif len(self.statuses) == len(self.stages):
             activity = "Completed"
         else:
-            activity = f"{self.stage.capitalize()} complete"
+            activity = f"{stage_name(self.stage)} complete"
         activity = activity or "Preparing"
         if active:
             spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int((time.monotonic() - self.started) * 8) % 10]
@@ -338,7 +324,24 @@ class ScanDisplay:
             (" " * max(0, content_width - len(activity) - len(elapsed)), "2"),
             (elapsed, "2"),
         ]
-        lines = [top, row(stages), row(bar), row(detail)]
+        stage_rows, current, used = [], [], 0
+        for text, code in stages:
+            baseline = text in ("measure", "✓ measure", "✗ measure", "– measure")
+            if baseline:
+                if current:
+                    stage_rows.append(row(current))
+                    current, used = [], 0
+                stage_rows.append(row([("baseline · ", "2"), (text, code)]))
+                continue
+            separator = [(" › ", "2")] if current else []
+            if current and used + 3 + len(text) > content_width:
+                stage_rows.append(row(current))
+                current, used, separator = [], 0, []
+            current.extend([*separator, (text, code)])
+            used += (3 if separator else 0) + len(text)
+        if current:
+            stage_rows.append(row(current))
+        lines = [top, *stage_rows, row(bar), row(detail)]
         if self.pipeline:
             backlog = ", ".join(
                 f"{stage} {count}" for stage, count in self.backlog.items() if count
@@ -380,12 +383,12 @@ class ScanDisplay:
                 )
                 count = (
                     f" {self.completed}/{self.total}"
-                    if stage in ("review", "audit")
+                    if stage in ("validate", "audit")
                     and stage == self.stage
                     and self.total is not None
                     else ""
                 )
-                labels.append(f"{stage.capitalize()}{marker}{count}")
+                labels.append(f"{stage_name(stage)}{marker}{count}")
             self.write(
                 f"{self.repository} [{bar}] {'  '.join(labels)}  {self.cost_label()}  {elapsed}"
             )

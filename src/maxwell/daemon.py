@@ -17,9 +17,10 @@ from maxwell.hunt_context import build_hunt_context, measurement_context
 from maxwell.provider import create_provider, discovery_prompt
 from maxwell.records import AssessmentRecord, RepairRecord, public_agent
 from maxwell.repair import execute_repair, recover_check, write_manifest
-from maxwell.reporting import Reporter, hunter_ratings, scan_report
+from maxwell.reporting import Reporter, hunt_ratings, scan_report
 from maxwell.repositories import Repository, git, stop_orphan
 from maxwell.selection import select_candidates
+from maxwell.stages import stage_from_storage, stage_name
 from maxwell.store import Store
 from maxwell.validation import execute_validation, recover_validation
 
@@ -60,7 +61,7 @@ class Daemon:
                     "daemon": "stopping" if self.stopping.is_set() else "running",
                     "pid": os.getpid(),
                     **self.store.status(),
-                    "ratings": hunter_ratings(self.store),
+                    "ratings": hunt_ratings(self.store),
                 }
             elif command == "stop":
                 self.stopping.set()
@@ -139,7 +140,7 @@ class Daemon:
         for job in self.store.rows("SELECT * FROM scans WHERE state='running'"):
             stop_orphan(job["pid"], job["artifact"])
             publications = []
-            if job["stage"] == "repair" and job["artifact"]:
+            if job["stage"] in ("fix", "repair") and job["artifact"]:
                 recover_check(job["artifact"])
                 artifact = Path(job["artifact"])
                 try:
@@ -148,7 +149,7 @@ class Daemon:
                         public = RepairRecord.model_validate(manifest["record"]).model_copy(
                             update={
                                 "outcome": "interrupted",
-                                "summary": "Repair interrupted; local worktree retained.",
+                                "summary": "repair interrupted; local worktree retained.",
                             }
                         )
                         if manifest.get("state") == "committing" and not public.commit:
@@ -182,7 +183,7 @@ class Daemon:
     async def scan(self, job, on_progress=None):
         if job.get("stage") in ("validate", "integrate"):
             return await execute_validation(self, job, on_progress)
-        if job.get("stage") == "repair":
+        if job.get("stage") in ("fix", "repair"):
             return await execute_repair(self, job, on_progress)
 
         def progress(phase):
@@ -194,13 +195,11 @@ class Daemon:
         artifact.mkdir(parents=True, exist_ok=True)
         provider = None
         worktree = None
-        state, summary, error, findings, cost = "failed", "Discovery failed.", None, [], None
+        state, summary, error, findings, cost = "failed", "hunt failed.", None, [], None
         usage = Usage()
         selection = None
         publications = []
-        stage_label = (
-            "Discovery" if job.get("stage", "discovery") == "discovery" else job["stage"].title()
-        )
+        stage_label = stage_name(stage_from_storage(job.get("stage", "discovery")))
         try:
             if not job.get("execution"):
                 record = self.store.one(
@@ -209,13 +208,11 @@ class Daemon:
                 route = self.config.route()
                 job = self.store.bind_execution(job["id"], self.config.execution(route, record))
             execution = json.loads(job["execution"])
-            stage = execution["stage"]
-            if stage not in ("discovery", "review", "audit"):
-                raise ValueError("Only hunt, review, and audit execution are implemented")
+            stage = stage_from_storage(execution["stage"])
+            if stage not in ("hunt", "validate", "audit"):
+                raise ValueError("Expected a hunt, validate, or audit source execution")
             target = (
-                AssessmentTarget.model_validate(execution["target"])
-                if stage != "discovery"
-                else None
+                AssessmentTarget.model_validate(execution["target"]) if stage != "hunt" else None
             )
             if target and target.finding.repository != job["repository"]:
                 raise ValueError("Assessment input belongs to a different repository")
@@ -329,7 +326,7 @@ class Daemon:
                         repository=job["repository"],
                         finding_id=target.finding.id,
                         sha=sha,
-                        role="reviewer" if stage == "review" else "auditor",
+                        role="reviewer" if stage == "validate" else "auditor",
                         agent=public_agent(job),
                         execution_id=job["id"],
                         verdict=result.verdict,

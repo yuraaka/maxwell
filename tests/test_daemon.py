@@ -9,7 +9,7 @@ import pytest
 
 from maxwell.daemon import Daemon, request
 from maxwell.github import GitHub
-from maxwell.reporting import Reporter, hunter_ratings
+from maxwell.reporting import Reporter, hunt_ratings
 from maxwell.store import Store
 
 
@@ -82,7 +82,7 @@ def test_end_to_end_controls_issue_costs_dedup_and_human_commands(home, register
                 "report_sent"
             ]
         )
-        assert "Discovery" in next(iter(github["comments"].values()))[0]["body"]
+        assert "hunt" in next(iter(github["comments"].values()))[0]["body"]
         control(home, "pause", repository="acme/repo")
         queued = control(home, "scan", repository="acme/repo", priority=1, model="fake-model")[
             "scans"
@@ -104,7 +104,7 @@ def test_end_to_end_controls_issue_costs_dedup_and_human_commands(home, register
             ]
         )
         eventually(lambda: registered.one("SELECT state FROM findings")["state"] == "confirmed")
-        assert hunter_ratings(registered)[0]["assessments"] == 1
+        assert hunt_ratings(registered)[0]["assessments"] == 1
         assert not registered.one("SELECT id FROM comments WHERE id=9001")
         control(home, "stop")
         assert process.wait(timeout=10) == 0
@@ -254,5 +254,5 @@ def test_scan_failure_without_message_retains_exception_type(
     record = registered.one("SELECT * FROM scans WHERE id=?", (job["id"],))
     assert record["state"] == "failed"
     assert record["error"] == type(exception).__name__
-    assert record["summary"] == f"Discovery failed: {type(exception).__name__}"
+    assert record["summary"] == f"hunt failed: {type(exception).__name__}"
     assert not list((home.root / "repos").glob("*/worktrees/*"))

@@ -10,6 +10,7 @@ from maxwell.records import (
     RepairRecord,
     ValidationRecord,
 )
+from maxwell.stages import agent_name, stage_from_storage
 
 
 def consensus(records):
@@ -36,7 +37,7 @@ def agent_identity(agent):
     return (agent.adapter, agent.model, agent.effort) if agent else None
 
 
-def fixer_observations(records):
+def repair_observations(records):
     assessments = [record for _, record in records if isinstance(record, AssessmentRecord)]
     findings = {record.id: record for _, record in records if isinstance(record, FindingRecord)}
     repairs = {record.id: record for _, record in records if isinstance(record, RepairRecord)}
@@ -76,7 +77,7 @@ def selection_evidence(store, repository, role):
     records = current_reputation_records(store, repository)
     if role == "fixer":
         outcomes = defaultdict(lambda: [0, 0])
-        for identity, outcome in fixer_observations(records):
+        for identity, outcome in repair_observations(records):
             outcomes[identity][outcome == "rejected"] += 1
         return dict(outcomes)
     assessments = defaultdict(list)
@@ -220,7 +221,7 @@ def agent_reputation(store, repository):
             seen_validations.add(record.id)
             _, result = tally(record.agent, "validator")
             result[f"validation_{record.outcome}"] += 1
-    for identity, outcome in fixer_observations(records):
+    for identity, outcome in repair_observations(records):
         result = agents.get(("fixer", *identity))
         if result:
             result["fixer_failures" if outcome == "rejected" else "fixer_successes"] += 1
@@ -266,7 +267,7 @@ def reputation_report(rows):
 
     body = "### Agent reputation\n\nProvisional counts from current GitHub records; no numerical score.\n"
     for stage in ("review", "audit"):
-        body += f"\n#### Hunters: {stage} source support\n\n"
+        body += f"\n#### hunt agents: {stage_from_storage(stage)} source support\n\n"
         body += table(
             "hunter",
             ["Findings", "Supported", "Rejected", "Unresolved", "Unassessed"],
@@ -278,21 +279,21 @@ def reputation_report(rows):
                 ),
             ],
         )
-    body += "\n#### Reviewers: agreement with auditors\n\n"
+    body += "\n#### validate agents: agreement with audit agents\n\n"
     body += table(
         "reviewer",
         ["Assessments", "Agreement", "Disagreement", "Unresolved"],
         ["assessments", "agreement", "disagreement", "unresolved"],
     )
-    body += "\n#### Auditors\n\nQuality: unrated until independent validation.\n\n"
+    body += "\n#### audit agents\n\nQuality: unrated until independent validation.\n\n"
     body += table("auditor", ["Current assessments"], ["assessments"])
-    body += "\n#### Fixers: independent repair validation\n\n"
+    body += "\n#### fix agents: independent repair validation\n\n"
     body += table(
         "fixer",
         ["Attempts", "Accepted", "Rejected"],
         ["repairs", "fixer_successes", "fixer_failures"],
     )
-    body += "\n#### Validators\n\nQuality: unrated until separately adjudicated.\n\n"
+    body += "\n#### review agents\n\nQuality: unrated until separately adjudicated.\n\n"
     body += table(
         "validator",
         ["Accepted", "Rejected", "Inconclusive"],
@@ -312,15 +313,15 @@ def reputation_report(rows):
             "| "
             + identity(row)
             + " | "
-            + row["role"]
+            + agent_name(row["role"])
             + " | "
             + " | ".join(f"{value:,}" for value in values)
             + " |\n"
         )
     body += (
-        "\nCounts describe source support and reviewer–auditor agreement, not proven accuracy. "
+        "\nCounts describe source support and validate–audit agreement, not proven accuracy. "
         "Audits are selectively chosen and can share agent biases. Inconclusive or conflicting "
-        "verdicts remain unresolved. Missing audits are unresolved for reviewers. "
+        "verdicts remain unresolved. Missing audits are unresolved for validate agents. "
         "Each finding/revision/agent contributes at most one current observation; "
         "superseded or invalid evidence is excluded.\n\n"
         "Tokens include historical and failed executions, counted once per execution; "

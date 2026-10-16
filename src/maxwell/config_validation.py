@@ -224,7 +224,7 @@ def validate_config(
                             client, f"repos/{repository}", f"repository:{repository}", add
                         )
                         if metadata is not None:
-                            repository_checks(metadata, repository, config.repair.auto_merge, add)
+                            repository_checks(metadata, repository, config.fix.auto_merge, add)
         finally:
             client.close()
     for check in checks:
@@ -318,7 +318,7 @@ def repository_checks(metadata, repository, policy, add):
             method for method, flag in method_flags.items() if metadata.get(flag) is True
         ]
         advice = (
-            f"set repair.auto_merge.merge_method to {', '.join(alternatives)}"
+            f"set fix.auto_merge.merge_method to {', '.join(alternatives)}"
             if alternatives
             else "enable a merge method in Settings > General > Pull Requests"
         )

@@ -3,16 +3,8 @@ from collections import defaultdict
 
 from maxwell.config_apply import config_digest
 from maxwell.reputation import selection_evidence
+from maxwell.stages import STAGE_ROLES, canonical_stage
 from maxwell.store import Store
-
-ROLES = {
-    "hunt": "hunter",
-    "review": "reviewer",
-    "audit": "auditor",
-    "repair": "fixer",
-    "validate": "validator",
-    "integrate": "validator",
-}
 
 
 class AgentSelector:
@@ -70,6 +62,7 @@ class AgentSelector:
         self.routes[identity].append(route)
 
     def select(self, store, repository, stage, *, avoid=()):
+        stage = canonical_stage(stage)
         candidates = sorted(self.routes, key=lambda item: tuple(value or "" for value in item))
         avoided = set(avoid)
         distinct = [candidate for candidate in candidates if candidate[:2] not in avoided]
@@ -82,11 +75,11 @@ class AgentSelector:
             )
         elif distinct:
             candidates = distinct
-        evidence = self.evidence_provider(store, repository, ROLES[stage])
-        unrated_auditor = stage in ("audit", "repair", "validate", "integrate") and not any(
+        evidence = self.evidence_provider(store, repository, STAGE_ROLES[stage])
+        unrated_stage = stage in ("audit", "fix", "review", "integrate") and not any(
             sum(evidence.get(candidate, [0, 0])) for candidate in candidates
         )
-        if self.explicit or unrated_auditor:
+        if self.explicit or unrated_stage:
             identity = self.rng.choice(candidates)
             draw = None
             method = "explicit" if self.explicit else "uniform-unrated-v1"
@@ -99,7 +92,7 @@ class AgentSelector:
             }
             identity = max(draws, key=draws.get)
             draw = draws[identity]
-            method = "thompson-repair-v1" if stage == "repair" else "thompson-source-v1"
+            method = "thompson-repair-v1" if stage == "fix" else "thompson-source-v1"
         successes, failures = evidence.get(identity, [0, 0])
         return self.rng.choice(self.routes[identity]), {
             "method": method,

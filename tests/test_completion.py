@@ -110,8 +110,10 @@ def catalog(home, source):
         ("repo ", {"add", "change", "list"}),
         ("models ", {"list"}),
         ("completion ", {"bash"}),
-        ("scan --stage ", {"hunt", "review", "audit", "repair", "validate", "integrate"}),
-        ("scan --stage r", {"review", "repair"}),
+        ("scan --stage ", {"hunt", "validate", "audit", "fix", "review", "integrate"}),
+        ("scan --stage r", {"review"}),
+        ("scan --stage hunt-r", {"hunt-review"}),
+        ("scan --stage fix-", {"fix-", "fix-review", "fix-integrate"}),
         ("scan --stage=a", {"audit"}),
         ("scan --priority ", {"P0", "P1", "P2", "P3"}),
         ("scan --st", {"--stage"}),
@@ -177,10 +179,10 @@ def test_missing_or_invalid_config_does_not_leak_diagnostics(directory, home):
     assert complete(directory, command + " --provider ") == set()
     assert complete(directory, command + " --stage ") == {
         "hunt",
-        "review",
-        "audit",
-        "repair",
         "validate",
+        "audit",
+        "fix",
+        "review",
         "integrate",
     }
     assert not home.db.exists()

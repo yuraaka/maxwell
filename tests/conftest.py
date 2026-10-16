@@ -442,6 +442,7 @@ def home(directory, executable, github):
     paths = Paths(directory / "home")
     paths.initialize()
     data = {
+        "version": 2,
         "github": {
             "token": "fake-github-secret",
             "api_url": github["url"],

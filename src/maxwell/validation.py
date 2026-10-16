@@ -35,6 +35,7 @@ from maxwell.records import (
 from maxwell.repair import RepairTarget, file_digests, recover_check, run_checks
 from maxwell.reporting import Reporter
 from maxwell.repositories import RepairMergeConflict, Repository, git
+from maxwell.stages import agent_name, stage_from_storage
 
 
 class ValidationTarget(RepairTarget):
@@ -69,7 +70,7 @@ async def prepare_candidate(repository, identity, head, base):
 def verify_repair(repository, repair):
     branch = f"maxwell/repair/{repair.lineage_id or repair.execution_id}"
     if not repair.commit or repair.branch != branch:
-        raise ValueError("Repair branch does not match its execution")
+        raise ValueError("repair branch does not match its execution")
     local_branch = f"maxwell/repair/{repair.execution_id}"
     head = git(
         "-C",
@@ -164,7 +165,7 @@ async def collect_validation_targets(
         )
         if integrate:
             previous = [record for record in previous if record.sha == maintained]
-        policy = reporter.config.repair.auto_merge
+        policy = reporter.config.fix.auto_merge
         completed = [record for record in previous if record.state == "completed"]
         identities = {(record.agent.adapter, record.agent.model) for record in completed}
         additional = (
@@ -172,7 +173,7 @@ async def collect_validation_targets(
             and policy.enabled
             and completed
             and all(record.outcome == "accepted" for record in completed)
-            and len(identities) < policy.required_validations
+            and len(identities) < policy.required_reviews
         )
         if not force and completed and not additional:
             blockers.append(
@@ -425,7 +426,7 @@ def validation_prompt(target, diff, original, public):
     task = (
         "Verify the merged repair on the maintained branch"
         if target.maintained_sha
-        else "Validate this PR repair against its target branch"
+        else "validate this PR repair against its target branch"
     )
     return f"""{task}. Read source and callers; do not edit files,
 execute scripts, builds or tests, install dependencies, access credentials or external services.
@@ -450,6 +451,7 @@ Original-source test failures: {json.dumps(public.failures)}
 
 async def execute_validation(engine, job, on_progress=None):
     progress = on_progress or (lambda phase: None)
+    role_name = agent_name("validator", stage=stage_from_storage(job["stage"]))
     artifact = engine.paths.root / "artifacts" / job["id"]
     artifact.mkdir(parents=True, exist_ok=True)
     repository, worktree, provider, public = None, None, None, None
@@ -467,7 +469,7 @@ async def execute_validation(engine, job, on_progress=None):
         agent = public_agent(job)
         if (agent.adapter, agent.model) == (target.repair.agent.adapter, target.repair.agent.model):
             raise ValueError(
-                "Independent validation requires a different public adapter/model from the fixer"
+                "Independent validation requires a different public adapter/model from the fix agent"
             )
         if (agent.adapter, agent.model) in {
             (previous.adapter, previous.model) for previous in target.validator_agents
@@ -614,17 +616,17 @@ async def execute_validation(engine, job, on_progress=None):
                 started,
             )
             public = public.model_copy(update={"replay": replay, "failures": failures})
-        save("starting independent validator")
+        save(f"starting independent {role_name}")
         diff = git(
             "diff", "--no-ext-diff", "--no-textconv", public.base_sha, public.sha, cwd=worktree
         )
         if len(diff.encode()) > 256000:
-            raise ValueError("Repair patch exceeds validation context limit")
+            raise ValueError("repair patch exceeds validation context limit")
         from maxwell.provider import create_provider
 
         provider = create_provider(engine.paths, config)
         provider.on_usage = lambda usage: progress(
-            {"phase": "validator running", "usage": usage.model_dump()}
+            {"phase": f"{role_name} running", "usage": usage.model_dump()}
         )
         prompt = validation_prompt(target, diff, original, public)
         (artifact / "prompt.txt").write_text(config.redact(prompt))
@@ -635,7 +637,7 @@ async def execute_validation(engine, job, on_progress=None):
             or file_digests(worktree, list(hashes)) != hashes
             or git("ls-files", "--others", "--exclude-standard", cwd=worktree)
         ):
-            raise ValueError("Validator changed the read-only repair snapshot")
+            raise ValueError("review agent changed the read-only repair snapshot")
         effective = config.measurement.model_copy(
             update={
                 "tests": {
@@ -671,7 +673,7 @@ async def execute_validation(engine, job, on_progress=None):
                 integrate=bool(target.maintained_sha),
             )
             if not current or current[0] != target:
-                raise ValueError("Repair or assessment inputs changed during validation")
+                raise ValueError("repair or assessment inputs changed during validation")
         finally:
             client.close()
         if snapshot_state(repository, worktree) != before:
@@ -693,7 +695,7 @@ async def execute_validation(engine, job, on_progress=None):
             and not result.concerns
         ):
             outcome = "accepted"
-        state, summary = "completed", f"Repair validation: {outcome}. {result.summary}"
+        state, summary = "completed", f"repair validation: {outcome}. {result.summary}"
         public = public.model_copy(update={"state": state, "outcome": outcome, "summary": summary})
     except asyncio.CancelledError:
         state, error, summary = "cancelled", "Cancelled", "Validation cancelled; repair retained."

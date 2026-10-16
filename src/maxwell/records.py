@@ -15,6 +15,7 @@ from maxwell.contracts import (
     Usage,
     ValidationResult,
 )
+from maxwell.stages import agent_name, stage_from_storage, stage_role
 
 Identifier = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 Revision = Annotated[str, Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")]
@@ -29,8 +30,8 @@ class PublicAgent(BaseModel):
     effort: str | None = Field(default=None, max_length=100)
     prompt_version: str | None = Field(default=None, max_length=100)
 
-    def display(self):
-        return f"{self.adapter}/{self.model}, {self.role}"
+    def display(self, *, stage=None):
+        return f"{self.adapter}/{self.model}, {agent_name(self.role, stage=stage)}"
 
 
 class Record(BaseModel):
@@ -54,7 +55,7 @@ class FindingRecord(Record):
     @model_validator(mode="after")
     def check_agent(self):
         if self.agent and self.agent.role != "hunter":
-            raise ValueError("Finding agent must be a hunter")
+            raise ValueError("Finding requires a hunt agent")
         return self
 
 
@@ -159,11 +160,11 @@ class RepairRecord(Record):
         if bool(self.previous_id) != bool(self.parent_sha) or bool(self.previous_id) != bool(
             self.lineage_id
         ):
-            raise ValueError("Repair amendments require predecessor, parent and lineage")
+            raise ValueError("repair amendments require predecessor, parent and lineage")
         if self.branch != f"maxwell/repair/{self.lineage_id or self.execution_id}":
-            raise ValueError("Repair branch must match its lineage")
+            raise ValueError("repair branch must match its lineage")
         if self.agent.role != "fixer":
-            raise ValueError("Repair agent must be a fixer")
+            raise ValueError("repair requires a fix agent")
         if self.outcome == "prepared" and (
             not self.commit
             or not self.files
@@ -309,7 +310,7 @@ class ValidationRecord(Record):
         if len({bool(self.pr_id), bool(self.pr_head), bool(self.pr_base)}) != 1:
             raise ValueError("PR validation requires a revision reference and pinned head/base")
         if self.agent.role != "validator":
-            raise ValueError("Validation agent must be a validator")
+            raise ValueError("Validation requires a review agent")
         if self.id in self.supersedes:
             raise ValueError("Validation cannot supersede itself")
         for measurement, sha in (
@@ -368,7 +369,7 @@ class StageExecution(BaseModel):
     @model_validator(mode="after")
     def check_state(self):
         if self.agent.role in ("hunter", "human"):
-            raise ValueError("Discovery uses scans; humans do not have stage executions")
+            raise ValueError("hunt uses scans; humans do not have stage executions")
         if self.state == "running" and (self.started is None or self.lease is None):
             raise ValueError("Running executions require a start time and lease")
         if self.state not in ("queued", "running") and self.finished is None:
@@ -463,21 +464,10 @@ def public_agent(scan):
     adapter = settings.get("adapter")
     if adapter not in ("codex", "claude"):
         return None
-    roles = {
-        "discovery": "hunter",
-        "review": "reviewer",
-        "audit": "auditor",
-        "reproduction": "reproducer",
-        "fix": "fixer",
-        "repair": "fixer",
-        "validation": "validator",
-        "validate": "validator",
-        "integrate": "validator",
-    }
     return PublicAgent(
         adapter=adapter,
         model=scan.get("model") or execution.get("model") or "unknown",
-        role=roles[scan.get("stage", "discovery")],
+        role=stage_role(stage_from_storage(scan.get("stage", "discovery"))),
         effort=settings.get("effort"),
     )
 

@@ -30,8 +30,8 @@ def test_quota_wait_output_identifies_account_and_preserves_diagnostics(capsys):
 def test_redirected_scan_output_does_not_repeat_phases_or_heartbeats():
     stream = io.StringIO()
     display = ScanDisplay(stream)
-    display({"repository": "acme/repo", "state": "plan", "stages": ["review"]})
-    display({"state": "stage", "stage": "review", "status": "running"})
+    display({"repository": "acme/repo", "state": "plan", "stages": ["validate"]})
+    display({"state": "stage", "stage": "validate", "status": "running"})
     display({"state": "batch", "total": 9, "completed": 0})
     for index in range(9):
         for heartbeat in (False, True):
@@ -45,12 +45,12 @@ def test_redirected_scan_output_does_not_repeat_phases_or_heartbeats():
             )
         display({"state": "batch", "total": 9, "completed": index + 1})
     display(
-        {"state": "stage", "stage": "review", "status": "completed", "total": 9, "completed": 9}
+        {"state": "stage", "stage": "validate", "status": "completed", "total": 9, "completed": 9}
     )
     display.finish()
     text = stream.getvalue()
     assert len(text.splitlines()) == 2
-    assert "Review>" in text and "Review+ 9/9" in text
+    assert "validate>" in text and "validate+ 9/9" in text
     assert "agent running" not in text and "\033" not in text
 
 
@@ -68,10 +68,10 @@ def test_interactive_scan_rewrites_colored_panel_and_preserves_stage_failure(mon
         {
             "repository": "acme/repo",
             "state": "plan",
-            "stages": ["measure", "hunt", "review", "audit"],
+            "stages": ["measure", "hunt", "validate", "audit"],
         }
     )
-    for stage in ("measure", "hunt", "review", "audit"):
+    for stage in ("measure", "hunt", "validate", "audit"):
         display({"state": "stage", "stage": stage, "status": "running"})
         display({"state": "batch", "total": 3, "completed": 1})
         display({"state": "running", "model": "model-a", "effort": "high"})
@@ -87,20 +87,20 @@ def test_interactive_scan_rewrites_colored_panel_and_preserves_stage_failure(mon
         )
     display.finish()
     text = stream.getvalue()
-    frames = re.split(r"\033\[5A\r\033\[0J", text)
+    frames = re.split(r"\033\[\d+A\r\033\[0J", text)
     assert len(frames) > 1
     for frame in frames:
         plain = re.sub(r"\033\[[0-9;]*m", "", frame)
         lines = plain.splitlines()
-        assert len(lines) == 5
+        assert len(lines) == 6
         assert all(len(line) == 89 for line in lines)
         assert lines[0].startswith("╭ Maxwell · acme/repo")
         assert lines[-1].startswith("╰")
-    assert "\033[1;35mReview 1/3" in text
-    assert "\033[1;31m✗ Hunt" in text
-    assert "\033[32m✓ Audit" in text
+    assert "\033[1;35mvalidate 1/3" in text
+    assert "\033[1;31m✗ hunt" in text
+    assert "\033[32m✓ audit" in text
     assert "━━━━━━━━" in text and "100%" in text
-    assert "Review>" not in text and "Hunt!" not in text
+    assert "validate>" not in text and "hunt!" not in text
 
 
 @pytest.mark.parametrize("terminal", [False, True])
@@ -129,8 +129,8 @@ def test_test_names_containing_retry_stay_inside_progress_panel(terminal, monkey
     stream = io.StringIO()
     stream.isatty = lambda: terminal
     display = ScanDisplay(stream)
-    display({"repository": "acme/repo", "state": "plan", "stages": ["validate"]})
-    display({"state": "stage", "stage": "validate", "status": "running"})
+    display({"repository": "acme/repo", "state": "plan", "stages": ["review"]})
+    display({"state": "stage", "stage": "review", "status": "running"})
     for test in ("test_formatting_retry", "test_quota_wait_obeys_retry_after"):
         display(
             {
@@ -144,7 +144,7 @@ def test_test_names_containing_retry_stay_inside_progress_panel(terminal, monkey
 def test_scan_summary_groups_failures_and_links_main_status():
     scan = {
         "repository": "acme/repo",
-        "stage": "review",
+        "stage": "validate",
         "state": "completed",
         "admitted": 0,
         "publication_errors": [],
@@ -158,7 +158,7 @@ def test_scan_summary_groups_failures_and_links_main_status():
         "statuses": [{"repository": "acme/repo", "url": "https://github.com/acme/repo/issues/4"}],
     }
     text = "\n".join(human_lines(report, "scan"))
-    assert "review: 9 supported" in text
+    assert "validate: 9 supported" in text
     assert text.count("Agent timed out") == 1 and "(3 executions)" in text
     assert text.count("Status:") == 1 and text.endswith("https://github.com/acme/repo/issues/4")
     assert "Report:" not in text and "Assessment:" not in text
@@ -338,20 +338,20 @@ def test_scan_panel_fits_terminal_and_respects_no_color(columns, no_color, monke
         {
             "repository": "yuraaka/maxwell",
             "state": "plan",
-            "stages": ["measure", "hunt", "review", "audit"],
+            "stages": ["measure", "hunt", "validate", "audit"],
         }
     )
     display({"state": "stage", "stage": "measure", "status": "completed"})
     display({"state": "stage", "stage": "hunt", "status": "completed"})
-    display({"state": "stage", "stage": "review", "status": "running"})
+    display({"state": "stage", "stage": "validate", "status": "running"})
     display({"state": "batch", "total": 9, "completed": 4})
     display({"state": "running", "model": "gpt-6.1-sol", "effort": "high"})
     display({"state": "progress", "phase": "agent running"})
     frame = display.panel("2:21")
     plain = [re.sub(r"\033\[[0-9;]*m", "", line) for line in frame]
     assert all(len(line) == min(100, columns - 1) for line in plain)
-    assert "4/9" in plain[1] and "61%" in plain[2]
-    assert "2:21" in plain[3]
+    assert "4/9" in "".join(plain[1:-3]) and "61%" in plain[-3]
+    assert "2:21" in plain[-2]
     assert any(re.search(r"\033\[[0-9;]*m", line) for line in frame) != no_color
 
 
@@ -380,7 +380,7 @@ def test_scan_animation_changes_without_inventing_completed_work(monkeypatch):
         {
             "repository": "acme/repo",
             "state": "plan",
-            "stages": ["measure", "hunt", "review", "audit"],
+            "stages": ["measure", "hunt", "validate", "audit"],
         }
     )
     display({"state": "stage", "stage": "measure", "status": "running"})
@@ -388,7 +388,7 @@ def test_scan_animation_changes_without_inventing_completed_work(monkeypatch):
     first = display.panel("0:00")
     now[0] += 0.25
     second = display.panel("0:00")
-    assert first[2] != second[2] and first[3] != second[3]
+    assert first[-3] != second[-3] and first[-2] != second[-2]
     assert display.progress() == 0
     assert display.refresh_interval < 0.2
     display(
@@ -408,7 +408,7 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
     stream = io.StringIO()
     stream.isatty = lambda: True
     display = ScanDisplay(stream)
-    stages = ["hunt", "review", "audit", "repair", "validate", "integrate"]
+    stages = ["hunt", "validate", "audit", "fix", "review", "integrate"]
     display({"repository": "acme/repo", "state": "plan", "stages": stages, "pipeline": "infinite"})
     display(
         {
@@ -416,7 +416,7 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
             "state": "pools",
             "pools": dict.fromkeys(stages, 1),
             "capacities": dict.fromkeys(stages, 3),
-            "backlog": {"review": 23},
+            "backlog": {"validate": 23},
             "status_url": "https://github.com/acme/repo/issues/4",
         }
     )
@@ -432,17 +432,17 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
         )
     display({"state": "progress", "phase": "Waiting: integration pool full; Ctrl+C to stop"})
     panel = "\n".join(display.panel("2:00"))
-    assert "continuous" in panel and "Int 1/3" in panel
+    assert "continuous" in panel and "integrate 1/3" in panel
     assert "100 executions" in panel and "$0.1000 USD" in panel
     assert "100%" not in panel and "integration pool full" in panel
     assert "https://github.com/acme/repo/issues/4" in panel
-    assert "Backlog:" in panel and "review 23" in panel
+    assert "Backlog:" in panel and "validate 23" in panel
     assert not display.spending
 
 
 def test_pipeline_counts_preparation_failures_without_inventing_agent_spending():
     display = ScanDisplay(io.StringIO())
-    stages = ["repair", "validate"]
+    stages = ["fix", "review"]
     display(
         {"repository": "acme/repo", "state": "plan", "stages": stages, "pipeline": "repair-all"}
     )
@@ -460,14 +460,14 @@ def test_pipeline_counts_preparation_failures_without_inventing_agent_spending()
         "state": "pools",
         "pools": {},
         "capacities": {},
-        "counts": {"validate": 3, "repair": 1},
+        "counts": {"review": 3, "fix": 1},
     }
     display(event)
     display(event)
     panel = "\n".join(display.panel("1:00"))
     assert "4 executions" in panel and "$0.0010 USD" in panel
     assert not display.unknown_spending
-    display({**event, "repository": "acme/other", "counts": {"repair": 2}})
+    display({**event, "repository": "acme/other", "counts": {"fix": 2}})
     assert display.execution_count == 6
 
 
@@ -478,7 +478,7 @@ def test_batch_summary_uses_dashboard_without_per_execution_link_wall():
         "pipeline_repositories": [
             {
                 "repository": "acme/repo",
-                "executions": {"repair": 8, "validate": 16},
+                "executions": {"fix": 8, "review": 16},
                 "closed": 8,
                 "rejected": 2,
                 "remaining": 1,
@@ -491,4 +491,4 @@ def test_batch_summary_uses_dashboard_without_per_execution_link_wall():
     text = "\n".join(human_lines(result, "scan"))
     assert "8 closed" in text and "1 remaining" in text
     assert "GitHub checks pending" in text and "issues/4" in text
-    assert "/private/report" not in text and "Repair PR:" not in text
+    assert "/private/report" not in text and "repair PR:" not in text

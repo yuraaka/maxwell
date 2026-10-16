@@ -6,6 +6,7 @@ from argcomplete import shellcode
 from argcomplete.completers import DirectoriesCompleter, SuppressCompleter
 
 from maxwell.config import Paths
+from maxwell.stages import AGENT_STAGES, canonical_stage
 
 
 def read_rows(paths, sql):
@@ -128,8 +129,22 @@ def accounts(prefix, parsed_args, **kwargs):
     return ["default", *sorted(config.github.accounts)] if config else []
 
 
+def stages(prefix, **kwargs):
+    if "-" not in prefix:
+        return list(AGENT_STAGES)
+    start, _, _ = prefix.partition("-")
+    canonical = canonical_stage(start)
+    if canonical not in AGENT_STAGES:
+        return []
+    return [
+        f"{start}-",
+        *(f"{start}-{end}" for end in AGENT_STAGES[AGENT_STAGES.index(canonical) :]),
+    ]
+
+
 def configure_completion(parser):
     completers = {
+        "stage": stages,
         "provider": providers,
         "model": models,
         "effort": efforts,

@@ -111,7 +111,7 @@ def test_offline_check_does_not_access_network_or_create_database(home, github_r
         ({"archived": True}, "unarchive", False),
         ({"disabled": True}, "GitHub Support", False),
         ({"has_issues": False}, "enable Issues", False),
-        ({"allow_squash_merge": False}, "repair.auto_merge.merge_method to merge", False),
+        ({"allow_squash_merge": False}, "fix.auto_merge.merge_method to merge", False),
         ({"permissions": {}}, "did not report write permissions", True),
         ({"allow_squash_merge": None}, "did not report allowed merge methods", True),
         ({"allow_auto_merge": False}, "Repository allows squash merges", True),
@@ -120,7 +120,7 @@ def test_offline_check_does_not_access_network_or_create_database(home, github_r
 def test_apply_checks_merge_configuration_without_ci_or_protection(
     home, github_requests, capsys, overrides, expected, valid
 ):
-    update_config(home, lambda data: data.update(repair={"auto_merge": {"enabled": True}}))
+    update_config(home, lambda data: data.update(fix={"auto_merge": {"enabled": True}}))
     store = Store(home.db)
     store.register("yuraaka/maxwell", "/unused", "main")
     store.close()
@@ -180,7 +180,7 @@ def test_invalid_publication_limits_are_reported(home, limit):
     assert "limits.max_findings_per_scan" in json.dumps(report)
 
 
-@pytest.mark.parametrize("setting", ["max_reviews_per_scan", "max_audits_per_scan"])
+@pytest.mark.parametrize("setting", ["max_validations_per_scan", "max_audits_per_scan"])
 def test_stage_limit_defaults_and_config_validation(home, setting):
     assert getattr(Limits(), setting) == 1
     update_config(home, lambda data: data["limits"].update({setting: 50}))
@@ -188,7 +188,7 @@ def test_stage_limit_defaults_and_config_validation(home, setting):
     assert getattr(home.load().limits, setting) == 50
 
 
-@pytest.mark.parametrize("setting", ["max_reviews_per_scan", "max_audits_per_scan"])
+@pytest.mark.parametrize("setting", ["max_validations_per_scan", "max_audits_per_scan"])
 @pytest.mark.parametrize("limit", [0, -1, 1.5])
 def test_invalid_stage_limits_are_reported(home, setting, limit):
     update_config(home, lambda data: data["limits"].update({setting: limit}))
@@ -212,7 +212,7 @@ def test_missing_config_has_nonzero_exit_and_does_not_initialize(directory):
 
 
 def test_missing_settings_are_reported_together(home, github_requests, capsys, monkeypatch):
-    home.config.write_text("{}")
+    home.config.write_text("version: 2")
     monkeypatch.setattr("maxwell.config.shutil.which", lambda executable: None)
     code, report = command(home, capsys)
     assert code == 1
@@ -242,16 +242,16 @@ def test_missing_settings_are_reported_together(home, github_requests, capsys, m
         ),
         ("provider: {api_key: [secret-value]}", "provider.api_key"),
         (
-            "repair: {auto_merge: {required_validations: 0}}",
-            "repair.auto_merge.required_validations: Input should be greater than or equal to 1",
+            "fix: {auto_merge: {required_reviews: 0}}",
+            "fix.auto_merge.required_reviews: Input should be greater than or equal to 1",
         ),
         (
-            "repair: {auto_merge: {merge_method: secret-value}}",
-            "repair.auto_merge.merge_method",
+            "fix: {auto_merge: {merge_method: secret-value}}",
+            "fix.auto_merge.merge_method",
         ),
         (
-            "repair: {auto_merge: {secret-value: secret-value}}",
-            "repair.auto_merge.<key>",
+            "fix: {auto_merge: {secret-value: secret-value}}",
+            "fix.auto_merge.<key>",
         ),
         ("github: {api_url: 'https://secret-value@github.com'}", "github.api_url"),
         ("false", "Invalid config.yaml"),

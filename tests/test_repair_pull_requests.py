@@ -64,11 +64,14 @@ def test_validator_updates_one_summary_and_comment_review(
     }
     review = github["reviews"][number][0]
     assert review["event"] == "COMMENT" and review["commit_id"] == prepared["commit"]
-    assert "### Validator · accepted" in review["body"]
+    assert "### review agent · accepted" in review["body"]
     assert "$0.0019 USD" in review["body"]
     assert "$0.0019 USD" in review["comments"][0]["body"]
-    assert review["comments"][0]["body"].startswith("**Validator**")
+    assert review["comments"][0]["body"].startswith("**review agent**")
     assert review["comments"][0]["line"] == 2
+    review["body"] = review["body"].replace("### review agent ·", "### Validator ·", 1)
+    assert validate(home)["valid"]
+    assert len(github["reviews"][number]) == 1
     current_record = decode_record(
         next(
             comment["body"]
@@ -201,7 +204,7 @@ def test_human_merge_requires_independent_main_verification_before_closure(
         for comment in github["comments"][pull["number"]]
     )
     assert any(
-        "### Integration validator · accepted" in comment["body"]
+        "### integrate agent · accepted" in comment["body"]
         for comment in github["comments"][pull["number"]]
     )
     fresh = Store(home.root / "fresh.sqlite")
@@ -290,7 +293,7 @@ def test_merge_conflict_returns_pr_to_fixer_on_current_base(
     from maxwell.pipeline import load_snapshot
 
     snapshot = asyncio.run(load_snapshot(repairable[2], "acme/repo"))
-    assert snapshot.items[0].stage == "repair"
+    assert snapshot.items[0].stage == "fix"
     assert "maxwell:validation:conflicted" in {label["name"] for label in pull["labels"]}
     if concurrent_edit:
         original = Repository.push_repair
@@ -364,7 +367,7 @@ def test_full_scan_dispatches_pending_validation_and_can_skip_it(
         return {"state": "completed"}
 
     monkeypatch.setattr(manual, "measure_one", measured)
-    skipped = ("hunt", "review", "audit", "validate", "integrate")
+    skipped = ("hunt", "validate", "audit", "review", "integrate")
     result = asyncio.run(
         run_scans(home, home.load(), "acme/repo", model="validator-model", skip_stages=skipped)
     )
@@ -375,11 +378,11 @@ def test_full_scan_dispatches_pending_validation_and_can_skip_it(
             home.load(),
             "acme/repo",
             model="validator-model",
-            skip_stages=("hunt", "review", "audit"),
+            skip_stages=("hunt", "validate", "audit"),
         )
     )
     assert result["valid"], result
-    assert [scan["stage"] for scan in result["scans"]] == ["validate"]
+    assert [scan["stage"] for scan in result["scans"]] == ["review"]
 
 
 def test_pr_returning_to_previous_revision_gets_new_movement_record(
@@ -444,7 +447,7 @@ def test_merge_blocker_routes_to_fixer_and_updates_same_pr(
     if kind == "checks":
         assert "expected floating-point zero" in targets[0].merge_problem.checks[0]["summary"]
     snapshot = asyncio.run(load_snapshot(repairable[2], "acme/repo"))
-    assert snapshot.items[0].stage == "repair"
+    assert snapshot.items[0].stage == "fix"
     executable.write_text(executable.read_text().replace("if values else 0", "if values else 0.0"))
     result = run(home)
     assert result["valid"], json.dumps(result, indent=2)

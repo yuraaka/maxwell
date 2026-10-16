@@ -50,9 +50,7 @@ elif 'verdict' in json.loads""",
 
 def validate(home, **kwargs):
     return asyncio.run(
-        run_scans(
-            home, home.load(), "acme/repo", stage="validate", model="validator-model", **kwargs
-        )
+        run_scans(home, home.load(), "acme/repo", stage="review", model="validator-model", **kwargs)
     )
 
 
@@ -62,7 +60,7 @@ def test_validation_notes_are_advisory_and_blockers_are_inconclusive(
     from maxwell.contracts import ValidationResult
     from maxwell.reporting import record_report
 
-    note = "Repair metadata predates the passing host checks; the fix is unaffected."
+    note = "repair metadata predates the passing host checks; the fix is unaffected."
     result = ValidationResult(
         verdict="repaired",
         summary="The empty-input guard fixes the defect.",
@@ -81,7 +79,7 @@ def test_validation_notes_are_advisory_and_blockers_are_inconclusive(
         repairable[0].one("SELECT data FROM github_records WHERE type='validation'")["data"]
     )
     body = record_report(record)
-    assert "### Validator · accepted" in body
+    assert "### review agent · accepted" in body
     assert "**Note:** " + note in body
     assert "<details>" in body and body.index("<details>") < body.index("Execution:")
     import hashlib
@@ -207,7 +205,7 @@ def test_verdicts_and_operational_failures(
 
 def test_independence_rejects_same_public_model(home, prepared):
     with pytest.raises(ValueError, match="different public adapter/model"):
-        asyncio.run(run_scans(home, home.load(), "acme/repo", stage="validate", model="fake-model"))
+        asyncio.run(run_scans(home, home.load(), "acme/repo", stage="review", model="fake-model"))
 
 
 def test_local_branch_movement_does_not_change_remote_pr_validation(home, prepared, repairable):
@@ -291,8 +289,8 @@ def test_recovery_preserves_repair_and_removes_validation_snapshots(home, prepar
 
 
 def test_validate_cli_is_single_and_explicit(home):
-    args = parser().parse_args(["scan", "--stage", "validate", "--issue", "1", "acme/repo"])
-    assert args.stage == "validate"
+    args = parser().parse_args(["scan", "--stage", "review", "--issue", "1", "acme/repo"])
+    assert args.stage == "review"
     with pytest.raises(ValueError, match="one finding"):
         validate(home, limit=2)
 
@@ -352,7 +350,7 @@ def test_cancellation_preserves_repair_and_unrated_outcome(home, prepared, repai
 
         monkeypatch.setattr(CodexProvider, "validate", paused)
         task = asyncio.create_task(
-            run_scans(home, home.load(), "acme/repo", stage="validate", model="validator-model")
+            run_scans(home, home.load(), "acme/repo", stage="review", model="validator-model")
         )
         await started.wait()
         task.cancel()
@@ -551,9 +549,7 @@ def test_automatic_validator_excludes_fixer_aliases(home, prepared, repairable):
     selector.explicit = False
     selector.add(config.route(None, "validator-model"))
     selector.add(config.route(None, "fake-model", effort="high"))
-    route, decision = selector.select(
-        store, "acme/repo", "validate", avoid={("codex", "fake-model")}
-    )
+    route, decision = selector.select(store, "acme/repo", "review", avoid={("codex", "fake-model")})
     assert route["model"] == "validator-model"
     assert decision["method"] == "uniform-unrated-v1"
     assert decision["independence"] == "different_model" and decision["candidates"] == 1

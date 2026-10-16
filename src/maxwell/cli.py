@@ -28,6 +28,7 @@ from maxwell.repositories import (
     validate_ref,
 )
 from maxwell.scan_display import ScanDisplay
+from maxwell.stages import SKIPPABLE_STAGES, select_stages
 from maxwell.store import Store
 
 
@@ -42,6 +43,14 @@ def add_command(commands, name, **options):
     return command
 
 
+def stage_argument(value):
+    try:
+        select_stages(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
 def positive_int(value):
     number = int(value)
     if number < 1:
@@ -50,7 +59,10 @@ def positive_int(value):
 
 
 def parser():
-    root = TreeParser(prog="maxwell", description="Manual repository hunting, review, and audit")
+    root = TreeParser(
+        prog="maxwell",
+        description="Repository maintenance: hunt, validate, audit, fix, review, integrate",
+    )
     root.add_argument("--version", action="version", version=f"maxwell {__version__}")
     root.add_argument("--home", help="Runtime directory (default: ~/.maxwell)")
     root.add_argument(
@@ -118,14 +130,14 @@ def parser():
     change.add_argument("--ref", help="Base branch to scan")
     change.add_argument("--account", help="GitHub credential profile from config.yaml")
     scan = add_command(
-        commands, "scan", help="Run measure → hunt → review → audit, or select one agent stage"
+        commands, "scan", help="Run the full pipeline, one stage, or a stage interval"
     )
     scan.add_argument("repository", nargs="?")
     pipeline = scan.add_mutually_exclusive_group()
     pipeline.add_argument(
         "--repair-all",
         action="store_true",
-        help="Drain existing findings through review, audit, repair, validation and integration",
+        help="Drain existing findings through validate, audit, fix, review, integrate",
     )
     pipeline.add_argument(
         "--infinite",
@@ -134,18 +146,21 @@ def parser():
     )
     scan.add_argument(
         "--stage",
-        choices=["hunt", "review", "audit", "repair", "validate", "integrate"],
-        help="Run only this agent stage (default: measure, hunt, review, audit, then pending validation/integration)",
+        type=stage_argument,
+        metavar="STAGE[-STAGE]",
+        help="Select hunt, validate, audit, fix, review, integrate; START-END is inclusive, START- runs to the end",
     )
     scan.add_argument(
         "--skip-stage",
         action="append",
         default=[],
-        choices=["source", "tests", "hunt", "review", "audit", "validate", "integrate"],
+        choices=SKIPPABLE_STAGES,
         help="Disable a stage; source/tests reuse compatible GitHub history (repeatable)",
     )
     scan.add_argument(
-        "--issue", type=positive_int, help="Finding issue to review, audit, repair, or validate"
+        "--issue",
+        type=positive_int,
+        help="Finding issue for validate, audit, fix, review, or integrate",
     )
     scan.add_argument(
         "--limit",
@@ -155,7 +170,7 @@ def parser():
     scan.add_argument(
         "--force",
         action="store_true",
-        help="Reassess a finding, retry repair, or supersede its validation",
+        help="Reassess a finding, retry fix, or supersede its PR review",
     )
     scan.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     scan.add_argument("--model", help="Pin a model (default: automatic sampling)")

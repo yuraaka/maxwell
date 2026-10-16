@@ -190,7 +190,7 @@ class Limits(Settings):
     max_candidates_per_scan: int = Field(default=DEFAULT_SCAN_CANDIDATES, ge=1)
     max_hunt_diff_chars: int = Field(default=30_000, ge=1)
     max_hunt_changed_files: int = Field(default=200, ge=1)
-    max_reviews_per_scan: int = Field(default=1, ge=1)
+    max_validations_per_scan: int = Field(default=1, ge=1)
     max_audits_per_scan: int = Field(default=1, ge=1)
     human_queue_max: int = Field(default=6, ge=1)
     minimum_confidence: float = Field(default=0.8, ge=0, le=1)
@@ -274,20 +274,20 @@ class MeasurementSettings(Settings):
 
 class AutoMergeSettings(Settings):
     enabled: bool = False
-    required_validations: int = Field(default=2, ge=1, le=10)
+    required_reviews: int = Field(default=2, ge=1, le=10)
     merge_method: Literal["merge", "squash", "rebase"] = "squash"
 
 
-class RepairSettings(Settings):
+class FixSettings(Settings):
     auto_merge: AutoMergeSettings = Field(default_factory=AutoMergeSettings)
 
 
 class StagePoolSizes(Settings):
     hunt: int = Field(default=10, ge=0)
-    review: int = Field(default=10, ge=0)
+    validation: int = Field(default=10, ge=0, alias="validate")
     audit: int = Field(default=10, ge=0)
-    repair: int = Field(default=3, ge=0)
-    validation: int = Field(default=3, ge=0, alias="validate")
+    fix: int = Field(default=3, ge=0)
+    review: int = Field(default=3, ge=0)
     integrate: int = Field(default=1, ge=0)
 
 
@@ -298,13 +298,13 @@ class PipelineSettings(Settings):
 
 
 class Config(Settings):
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     github: GitHubSettings = Field(default_factory=GitHubSettings)
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     providers: dict[str, ProviderSettings] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
     measurement: MeasurementSettings = Field(default_factory=MeasurementSettings)
-    repair: RepairSettings = Field(default_factory=RepairSettings)
+    fix: FixSettings = Field(default_factory=FixSettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
 
     @model_validator(mode="before")
@@ -445,9 +445,11 @@ class Paths:
             raise ValueError(f"Restrict configuration permissions: chmod 600 {self.config}")
         try:
             data = yaml.safe_load(self.config.read_text())
-            return Config.model_validate(
-                {} if data is None else data, context={"config_root": self.root}
-            )
+            if data is None:
+                data = {}
+            if isinstance(data, dict):
+                data = {"version": None, **data}
+            return Config.model_validate(data, context={"config_root": self.root})
         except Exception as exc:
             # Validation errors can embed credential values.
             if detailed and isinstance(exc, ValidationError):
@@ -460,7 +462,7 @@ class Paths:
                     Limits,
                     MeasurementSettings,
                     MeasurementTests,
-                    RepairSettings,
+                    FixSettings,
                     AutoMergeSettings,
                     PipelineSettings,
                     StagePoolSizes,
@@ -472,15 +474,31 @@ class Paths:
                     for field in model.model_fields.values()
                     if field.alias
                 )
+                fields.update(("repair", "max_reviews_per_scan", "required_validations"))
                 errors = []
                 for error in exc.errors(
                     include_input=False, include_context=False, include_url=False
                 ):
+                    keys = list(error["loc"])
                     location = (
-                        ".".join(str(key) if key in fields else "<key>" for key in error["loc"])
-                        or "config"
+                        ".".join(str(key) if key in fields else "<key>" for key in keys) or "config"
                     )
-                    errors.append(f"{location}: {error['msg']}")
+                    replacements = {
+                        "repair": "fix",
+                        "limits.max_reviews_per_scan": "limits.max_validations_per_scan",
+                        "fix.auto_merge.required_validations": "fix.auto_merge.required_reviews",
+                        "pipeline.pools.repair": "pipeline.pools.fix",
+                    }
+                    message = error["msg"]
+                    if location == "version":
+                        message = (
+                            "Set version: 2 and rename legacy stage keys; "
+                            "old pool review becomes validate, validate becomes review, "
+                            "and repair becomes fix"
+                        )
+                    elif error["type"] == "extra_forbidden" and location in replacements:
+                        message = f"Obsolete key; use {replacements[location]}"
+                    errors.append(f"{location}: {message}")
                 raise ValueError("Invalid config.yaml: " + "; ".join(errors)) from exc
             if detailed and isinstance(exc, yaml.YAMLError):
                 mark = getattr(exc, "problem_mark", None)

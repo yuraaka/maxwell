@@ -19,7 +19,7 @@ from maxwell.daemon import Daemon
 from maxwell.github import GitHub
 from maxwell.provider import create_provider
 from maxwell.provider_runtime import native_errors, native_settings, runtime_environment
-from maxwell.reporting import Reporter, hunter_ratings, scan_report
+from maxwell.reporting import Reporter, hunt_ratings, scan_report
 from maxwell.repositories import stop_orphan
 from maxwell.store import Store
 
@@ -442,7 +442,7 @@ def test_different_models_scan_same_revision_and_keep_duplicate_evidence(native_
     assert len(daemon.store.rows("SELECT * FROM finding_observations")) == 2
     with daemon.store.db:
         daemon.store.db.execute("UPDATE findings SET state='confirmed'")
-    assert len(hunter_ratings(daemon.store)) == 2
+    assert len(hunt_ratings(daemon.store)) == 2
     daemon.store.enqueue("acme/repo", forced=False, execution=execution)
     assert run_next(daemon)["state"] == "skipped"
 
@@ -521,7 +521,7 @@ def test_provider_rejects_results_over_configured_candidate_limit(native_daemon,
 @pytest.mark.parametrize("provider", ["first", "claude"])
 def test_review_and_audit_use_both_provider_adapters(native_daemon, home, capsys, provider):
     daemon, _ = native_daemon
-    for stage in ("hunt", "review", "audit"):
+    for stage in ("hunt", "validate", "audit"):
         execute(
             parser().parse_args(
                 [

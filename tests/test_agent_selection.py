@@ -149,7 +149,9 @@ def test_sampling_responds_to_role_evidence_but_keeps_exploration(selection, fin
 def test_independence_avoids_same_model_across_efforts_and_reports_fallback(selection):
     home, store, config = selection
     selector = AgentSelector(home, config, rng=random.Random(2))
-    route, decision = selector.select(store, "acme/repo", "review", avoid={("codex", "fake-model")})
+    route, decision = selector.select(
+        store, "acme/repo", "validate", avoid={("codex", "fake-model")}
+    )
     assert route["model"] == "other-model" and decision["independence"] == "different_model"
     _, fallback = selector.select(
         store, "acme/repo", "audit", avoid={("codex", "fake-model"), ("codex", "other-model")}
@@ -160,7 +162,9 @@ def test_independence_avoids_same_model_across_efforts_and_reports_fallback(sele
 def test_explicit_selection_preserves_private_route_and_configured_effort(selection):
     home, store, config = selection
     selector = AgentSelector(home, config, provider="private-a", model="fake-model", effort="high")
-    route, decision = selector.select(store, "acme/repo", "review", avoid={("codex", "fake-model")})
+    route, decision = selector.select(
+        store, "acme/repo", "validate", avoid={("codex", "fake-model")}
+    )
     assert route == {"provider": "private-a", "model": "fake-model", "effort": "high"}
     assert decision["method"] == "explicit" and decision["independence"] == "overridden"
     assert "private-a" not in json.dumps(decision)
@@ -197,7 +201,7 @@ def test_supported_efforts_do_not_expand_sampling_pool(selection):
 def test_explicit_distinct_model_still_reports_independence(selection):
     home, store, config = selection
     selector = AgentSelector(home, config, provider="private-a", model="other-model")
-    _, decision = selector.select(store, "acme/repo", "review", avoid={("codex", "fake-model")})
+    _, decision = selector.select(store, "acme/repo", "validate", avoid={("codex", "fake-model")})
     assert decision["method"] == "explicit" and decision["independence"] == "different_model"
 
 

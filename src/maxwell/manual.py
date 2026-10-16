@@ -13,6 +13,11 @@ from maxwell.measurement_runner import measure_one, recover_measurements
 from maxwell.progress import ScanProgress
 from maxwell.repair import collect_repair_targets
 from maxwell.reporting import Reporter
+from maxwell.stages import (
+    SKIPPABLE_STAGES,
+    select_stages,
+    stored_stage,
+)
 from maxwell.store import Store
 from maxwell.validation import collect_validation_targets
 
@@ -51,6 +56,7 @@ async def execute_job(
                 )
         finally:
             client.close()
+    execution = {**execution, "stage": stored_stage(stage)}
     identifier = store.enqueue(record["name"], priority, execution=execution)
     job = store.claim(
         micros(config.limits.daily_budget_usd),
@@ -231,6 +237,8 @@ async def run_scans(
     repair_all=False,
     infinite=False,
 ):
+    stages = select_stages(stage)
+    single_stage = stages[0] if stage is not None and len(stages) == 1 else None
     if repair_all and infinite:
         raise ValueError("Choose either --repair-all or --infinite")
     if (repair_all or infinite) and (
@@ -243,24 +251,24 @@ async def run_scans(
         raise ValueError(
             "--repair-all/--infinite require automatic model selection for independent validation; omit --model"
         )
-    if stage not in (None, "hunt", "review", "audit", "repair", "validate", "integrate"):
-        raise ValueError("Stage must be hunt, review, audit, repair, validate, or integrate")
-    if stage in (None, "hunt") and (issue is not None or limit is not None or force):
+    if single_stage in (None, "hunt") and (issue is not None or limit is not None or force):
         raise ValueError(
-            "--issue, --limit, and --force apply to an explicit review, audit, repair, or validate only"
+            "--issue, --limit, and --force require a single explicit validate, audit, fix, review, or integrate stage"
         )
-    if stage in ("repair", "validate", "integrate") and limit is not None:
+    if single_stage in ("fix", "review", "integrate") and limit is not None:
         raise ValueError(
-            "Repair and validation handle one finding per run; --limit is not supported"
+            "fix, review, and integrate handle one finding per run; --limit is not supported"
         )
     if issue is not None and repository is None:
         raise ValueError("--issue requires a repository")
     if (issue is not None and issue < 1) or (limit is not None and limit < 1):
         raise ValueError("--issue and --limit must be positive integers")
-    if set(skip_stages) - {"source", "tests", "hunt", "review", "audit", "validate", "integrate"}:
+    if set(skip_stages) - set(SKIPPABLE_STAGES):
         raise ValueError("Unknown skipped stage")
     if stage is not None and skip_stages:
-        raise ValueError("--skip-stage applies to the full scan; use --stage for one agent stage")
+        raise ValueError(
+            "--skip-stage applies to the default full scan; use --stage to select a stage or interval"
+        )
     config.ready()
     with paths.lock.open("a+") as lock:
         try:
@@ -311,9 +319,8 @@ async def run_scans(
                     execute=execute_job,
                 )
             results, skipped, errors, measurements = [], [], [], []
-            stages = (stage,) if stage else ("hunt", "review", "audit", "validate", "integrate")
             for record in records:
-                if stage in ("repair", "validate", "integrate") and results:
+                if single_stage in ("fix", "review", "integrate") and results:
                     break
 
                 def stage_event(current_stage, status, **details):
@@ -415,19 +422,19 @@ async def run_scans(
                                 async with preparation.watch():
                                     collector = (
                                         collect_validation_targets
-                                        if current_stage in ("validate", "integrate")
+                                        if current_stage in ("review", "integrate")
                                         else collect_repair_targets
-                                        if current_stage == "repair"
+                                        if current_stage == "fix"
                                         else collect_targets
                                     )
                                     arguments = (
                                         {}
-                                        if current_stage in ("repair", "validate", "integrate")
+                                        if current_stage in ("fix", "review", "integrate")
                                         else {"stage": current_stage}
                                     )
                                     if current_stage == "integrate":
                                         arguments["integrate"] = True
-                                    if current_stage in ("validate", "integrate"):
+                                    if current_stage in ("review", "integrate"):
                                         arguments["diagnostics"] = skip_reasons
                                     targets = await collector(
                                         reporter,
@@ -437,11 +444,11 @@ async def run_scans(
                                         force=force,
                                     )
                                 configured_limit = (
-                                    config.limits.max_reviews_per_scan
-                                    if current_stage == "review"
+                                    config.limits.max_validations_per_scan
+                                    if current_stage == "validate"
                                     else config.limits.max_audits_per_scan
                                 )
-                                if current_stage in ("repair", "validate", "integrate"):
+                                if current_stage in ("fix", "review", "integrate"):
                                     configured_limit = 1
                                 targets = targets[
                                     : limit if limit is not None else configured_limit
@@ -490,11 +497,11 @@ async def run_scans(
                                     avoid=independent_agents(target),
                                 )
                                 if (
-                                    current_stage in ("validate", "integrate")
+                                    current_stage in ("review", "integrate")
                                     and decision["independence"] != "different_model"
                                 ):
                                     raise ValueError(
-                                        "Independent validation requires a different public adapter/model from the fixer and previous validators; select another model"
+                                        "Independent validation requires a different public adapter/model from the fix agent and previous review agents; select another model"
                                     )
                                 execution = {
                                     **config.execution(route, record),
@@ -518,13 +525,12 @@ async def run_scans(
                                 results.append(result)
                                 stage_results.append(result)
                                 if (
-                                    current_stage == "validate"
-                                    and config.repair.auto_merge.enabled
+                                    current_stage == "review"
+                                    and config.fix.auto_merge.enabled
                                     and not selector.explicit
                                     and result["state"] == "completed"
                                     and not result["publication_errors"]
-                                    and len(stage_results)
-                                    < config.repair.auto_merge.required_validations
+                                    and len(stage_results) < config.fix.auto_merge.required_reviews
                                     and any(
                                         item["outcome"] == "accepted"
                                         for item in result["validations"]

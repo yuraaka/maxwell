@@ -11,6 +11,7 @@ from maxwell.records import (
     RepairPullRequestRecord,
 )
 from maxwell.repositories import Repository, git
+from maxwell.stages import agent_name
 
 
 def records(store, repository, kind):
@@ -309,10 +310,15 @@ async def publish_review(reporter, repo, link, pull, record):
     if not record.result or not record.result.comments:
         return
     legacy_body = f"<!-- maxwell:pr-review:{record.id} -->\nIndependent model verdict: {record.outcome}. {record.result.summary}"
-    role = "Integration validator" if isinstance(record, IntegrationRecord) else "Validator"
+    legacy_role = "Integration validator" if isinstance(record, IntegrationRecord) else "Validator"
+    role = agent_name(
+        "validator", stage="integrate" if isinstance(record, IntegrationRecord) else "review"
+    )
     body = f"<!-- maxwell:pr-review:{record.id} -->\n### {role} · {record.outcome}\n\n`{record.agent.adapter}/{record.agent.model}`\n\n{record.result.summary}"
     previous_body = body
     body += f"\n\n{spending_summary(record.spending)}"
+    previous_role_body = previous_body.replace(f"### {role} ·", f"### {legacy_role} ·", 1)
+    previous_role_cost_body = previous_role_body + f"\n\n{spending_summary(record.spending)}"
     authors = await reporter.authorized_authors()
     reviews = await reporter.call(
         lambda: list(reporter.github.paginate(f"repos/{repo}/pulls/{link.number}/reviews"))
@@ -327,7 +333,8 @@ async def publish_review(reporter, repo, link, pull, record):
             len(matching) != 1
             or matching[0].get("user", {}).get("login") not in authors
             or matching[0].get("commit_id") != record.pr_head
-            or matching[0].get("body") not in (body, previous_body, legacy_body)
+            or matching[0].get("body")
+            not in (body, previous_body, legacy_body, previous_role_body, previous_role_cost_body)
         ):
             raise ValueError("PR feedback marker conflicts with existing review")
         with reporter.store.db:
@@ -469,7 +476,7 @@ async def feedback(reporter, repo, *, auto_merge=True):
         pull = await reporter.call(reporter.github.pull, repo, number)
         check_pull(pull, repo, link.branch, link.base_branch, authors)
         if pull["state"] != "open":
-            if reporter.config.repair.auto_merge.enabled and reporter.store.one(
+            if reporter.config.fix.auto_merge.enabled and reporter.store.one(
                 "SELECT id FROM pr_actions WHERE repository=? AND id=? AND action='merge'",
                 (repo, str(number)),
             ):
@@ -484,7 +491,7 @@ async def feedback(reporter, repo, *, auto_merge=True):
                         "<!-- maxwell:validation-summary:v1 -->",
                     )
                     if current
-                    else "<!-- maxwell:validation-summary:v1 -->\n### Validation\n"
+                    else "<!-- maxwell:validation-summary:v1 -->\n### review\n"
                 )
                 await publish_summary(
                     reporter,
@@ -533,8 +540,8 @@ async def feedback(reporter, repo, *, auto_merge=True):
                 "<!-- maxwell:validation-summary:v1 -->",
             )
         else:
-            stage = "repair" if verdict == "conflicted" else "validate"
-            body = f"<!-- maxwell:validation-summary:v1 -->\n### Validation — {verdict}\n\nCurrent PR head: `{pull['head']['sha']}`; target base: `{pull['base']['sha']}`. Run `maxwell scan {repo} --stage {stage} --issue {link.finding_issue}`.\n"
+            stage = "fix" if verdict == "conflicted" else "review"
+            body = f"<!-- maxwell:validation-summary:v1 -->\n### review — {verdict}\n\nCurrent PR head: `{pull['head']['sha']}`; target base: `{pull['base']['sha']}`. Run `maxwell scan {repo} --stage {stage} --issue {link.finding_issue}`.\n"
         await summary_matches(reporter, repo, number)
         refreshed = await reporter.call(reporter.github.pull, repo, number)
         if (refreshed["head"]["sha"], refreshed["base"]["sha"]) != current_head:
@@ -581,17 +588,17 @@ async def feedback(reporter, repo, *, auto_merge=True):
             await try_auto_merge(reporter, repo, link, verdict)
             if auto_merge
             else "deferred while selecting or rechecking forced validation"
-            if reporter.config.repair.auto_merge.enabled
+            if reporter.config.fix.auto_merge.enabled
             else "disabled"
         )
         reporter.merge_statuses[number] = reporter.config.redact(status)
-        if reporter.config.repair.auto_merge.enabled:
+        if reporter.config.fix.auto_merge.enabled:
             identities = {
                 (record.agent.adapter, record.agent.model)
                 for record in current
                 if record.state == "completed" and record.outcome == "accepted"
             }
-            body += f"\nAccepted validation models: {len(identities)}/{reporter.config.repair.auto_merge.required_validations}.\n"
+            body += f"\nAccepted review models: {len(identities)}/{reporter.config.fix.auto_merge.required_reviews}.\n"
         await publish_summary(
             reporter, repo, number, reporter.config.redact(body + f"\nAuto-merge: {status}.\n")
         )

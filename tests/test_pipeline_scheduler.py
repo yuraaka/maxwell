@@ -81,15 +81,15 @@ def classify(
         votes,
         integrations,
         head,
-        Config().repair.auto_merge.model_copy(update={"enabled": True}),
+        Config().fix.auto_merge.model_copy(update={"enabled": True}),
     )
 
 
 def test_classification_requires_audit_before_new_repair_and_keeps_attention_visible(subject):
     _, review, audit = subject
-    assert classify(subject, assessments=[]).stage == "review"
+    assert classify(subject, assessments=[]).stage == "validate"
     assert classify(subject, assessments=[review]).stage == "audit"
-    assert classify(subject).stage == "repair"
+    assert classify(subject).stage == "fix"
     inconclusive = audit.model_copy(update={"verdict": "inconclusive"})
     result = classify(subject, assessments=[review, inconclusive])
     assert result.pool == "audit" and result.stage is None
@@ -108,17 +108,17 @@ def test_partial_validation_quorum_and_amendments_count_one_issue(subject):
         state="completed", outcome="accepted", agent=Namespace(adapter="codex", model="v1")
     )
     first = classify(subject, repair=repair, pull=pull, votes=[vote])
-    assert (first.pool, first.stage) == ("repair", "validate")
+    assert (first.pool, first.stage) == ("fix", "review")
     duplicate = Namespace(**vars(vote))
-    assert classify(subject, repair=repair, pull=pull, votes=[vote, duplicate]).stage == "validate"
+    assert classify(subject, repair=repair, pull=pull, votes=[vote, duplicate]).stage == "review"
     second = Namespace(
         state="completed", outcome="accepted", agent=Namespace(adapter="codex", model="v2")
     )
     ready = classify(subject, repair=repair, pull=pull, votes=[vote, second])
-    assert ready.pool == "validate" and ready.stage is None
+    assert ready.pool == "review" and ready.stage is None
     second.outcome = "rejected"
     amendment = classify(subject, repair=repair, pull=pull, votes=[second])
-    assert (amendment.pool, amendment.stage) == ("repair", "repair")
+    assert (amendment.pool, amendment.stage) == ("fix", "fix")
     second.outcome = "inconclusive"
     assert classify(subject, repair=repair, pull=pull, votes=[second]).stage is None
 
@@ -127,7 +127,7 @@ def test_existing_provisional_repair_can_resume_and_merged_repairs_get_integrati
     _, review, _ = subject
     repair = Namespace(references=[review.id])
     item = classify(subject, assessments=[review], repair=repair, pull={"state": "open"})
-    assert item.stage == "validate"
+    assert item.stage == "review"
     integrated = Namespace(sha="old", state="completed", outcome="accepted")
     item = classify(
         subject, repair=repair, pull={"state": "closed", "merged": True}, integrations=[integrated]
@@ -145,20 +145,20 @@ def test_blocked_fixer_is_not_automatically_retried_with_unchanged_evidence(subj
     repair = Namespace(references=[review.id, audit.id], outcome="blocked")
     assert classify(subject, repair=repair).stage is None
     repair.references = ["old"]
-    assert classify(subject, repair=repair).stage == "repair"
+    assert classify(subject, repair=repair).stage == "fix"
 
 
 def test_output_capacities_allow_drain_and_in_place_amendment_but_bound_admission():
-    review = PipelineItem(1, "one", "hunt", "review")
-    amendment = PipelineItem(2, "two", "repair", "repair")
+    review = PipelineItem(1, "one", "hunt", "validate")
+    amendment = PipelineItem(2, "two", "fix", "fix")
     snapshot = PipelineSnapshot([], [review, amendment], "head", reservations={"hunt": 1})
-    caps = StagePoolSizes(hunt=2, review=0, repair=1, integrate=0).model_dump(by_alias=True)
+    caps = StagePoolSizes(hunt=2, validate=0, fix=1, integrate=0).model_dump(by_alias=True)
     assert not has_room(snapshot, None, "hunt", caps)
-    assert not has_room(snapshot, review, "review", caps)
-    assert has_room(snapshot, amendment, "repair", caps)
+    assert not has_room(snapshot, review, "validate", caps)
+    assert has_room(snapshot, amendment, "fix", caps)
     assert has_room(snapshot, None, "integrate", caps)
     assert snapshot.occupancy()["hunt"] == 2
-    assert caps["validate"] == 3
+    assert caps["review"] == 3
     with pytest.raises(ValidationError):
         StagePoolSizes(hunt=-1)
 
@@ -171,15 +171,15 @@ def test_attempts_survive_restart_cool_down_and_allow_changed_inputs(home, monke
         now = [1000.0]
         monkeypatch.setattr("maxwell.pipeline.time.time", lambda: now[0])
         ledger = AttemptLedger(store, config, True)
-        ledger.save("acme/repo", "review", "finding", "same", "failed", "agent failed")
+        ledger.save("acme/repo", "validate", "finding", "same", "failed", "agent failed")
         reopened = AttemptLedger(store, config, True)
-        assert reopened.blocker("acme/repo", "review", "finding", "same") == "agent failed"
-        assert reopened.blocker("acme/repo", "review", "finding", "new") is None
+        assert reopened.blocker("acme/repo", "validate", "finding", "same") == "agent failed"
+        assert reopened.blocker("acme/repo", "validate", "finding", "new") is None
         now[0] += config.pipeline.retry_seconds
-        assert reopened.blocker("acme/repo", "review", "finding", "same") is None
-        reopened.save("acme/repo", "review", "finding", "same", "completed")
+        assert reopened.blocker("acme/repo", "validate", "finding", "same") is None
+        reopened.save("acme/repo", "validate", "finding", "same", "completed")
         now[0] += config.pipeline.retry_seconds * 10
-        assert "already attempted" in reopened.blocker("acme/repo", "review", "finding", "same")
+        assert "already attempted" in reopened.blocker("acme/repo", "validate", "finding", "same")
         reopened.save("acme/repo", "hunt", "hunt", "constant", "completed")
         assert "cooldown" in reopened.blocker("acme/repo", "hunt", "hunt", "other")
     finally:
@@ -189,13 +189,13 @@ def test_attempts_survive_restart_cool_down_and_allow_changed_inputs(home, monke
 def test_failed_validation_execution_ids_do_not_bypass_backoff():
     class Target:
         def model_dump(self, **kwargs):
-            return {"supersedes": self.supersedes, "repair": "same", "head": "same"}
+            return {"supersedes": self.supersedes, "fix": "same", "head": "same"}
 
     target = Target()
     target.supersedes = ["failure-one"]
-    first = fingerprint("validate", target, "head")
+    first = fingerprint("review", target, "head")
     target.supersedes = ["failure-two"]
-    assert fingerprint("validate", target, "head") == first
+    assert fingerprint("review", target, "head") == first
 
 
 @pytest.mark.parametrize(
@@ -227,7 +227,7 @@ def test_admission_precheck_does_not_create_failed_jobs(home, monkeypatch):
         config = home.load()
         store.register("acme/repo", "/tmp/source", "main")
         monkeypatch.setattr(store, "unpriced_started_today", lambda: config.limits.daily_scan_limit)
-        execution = {"stage": "review", "settings": {}}
+        execution = {"stage": "validate", "settings": {}}
         reason = admission_blocker(store, config, "acme/repo", execution)
         assert "Daily scan limit" in reason and "next daily reset" in reason
         assert not store.rows("SELECT * FROM scans")
@@ -242,10 +242,10 @@ def test_real_batch_reviews_and_audits_all_existing_findings_without_hunting(
 
     home, store, config = automatic
     github["branches"]["main"] = git("rev-parse", "HEAD", cwd=source)
-    config.pipeline.pools.repair = 0
+    config.pipeline.pools.fix = 0
     result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
     assert result["valid"], json.dumps(result, indent=2)
-    assert [item["stage"] for item in result["scans"]] == ["review", "audit", "review", "audit"]
+    assert [item["stage"] for item in result["scans"]] == ["validate", "audit", "validate", "audit"]
     assert result["pipeline_repositories"][0]["remaining"] == 2
     assert store.one("SELECT COUNT(*) AS n FROM scans")["n"] == 4
     again = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
@@ -287,11 +287,11 @@ def test_real_batch_resumes_prepared_pr_with_independent_validation(
     cache_models(home, store, config)
     result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
     assert result["valid"], json.dumps(result, indent=2)
-    assert [item["stage"] for item in result["scans"]] == ["validate"]
+    assert [item["stage"] for item in result["scans"]] == ["review"]
     scan = result["scans"][0]
     assert scan["model"] != prepared["agent"]["model"]
     assert scan["validations"][0]["outcome"] == "accepted"
-    assert result["pipeline_repositories"][0]["pools"]["validate"] == 1
+    assert result["pipeline_repositories"][0]["pools"]["review"] == 1
     assert any(
         "auto-merge disabled" in reason for reason in result["pipeline_repositories"][0]["waiting"]
     )
@@ -303,7 +303,7 @@ def scheduler(home, monkeypatch, subject):
     store = Store(home.db)
     store.register("acme/repo", "/tmp/source", "main")
     config = home.load()
-    state = {1: ("hunt", "review"), 2: ("hunt", "review")}
+    state = {1: ("hunt", "validate"), 2: ("hunt", "validate")}
     executions = []
     finding = subject[0]
 
@@ -377,25 +377,25 @@ def test_snapshot_batch_continues_past_failure_and_excludes_new_findings(schedul
     async def execute(*args, stage, **kwargs):
         issue = args[5]["target"]["issue"]
         scheduler.executions.append((issue, stage))
-        scheduler.state[3] = ("hunt", "review")
+        scheduler.state[3] = ("hunt", "validate")
         if issue == 1:
             return scheduler.result(stage, "agent exited")
         scheduler.state[issue] = {
-            "review": ("review", "audit"),
-            "audit": ("audit", "repair"),
-            "repair": ("repair", "validate"),
-            "validate": ("integrate", "integrate"),
+            "validate": ("validate", "audit"),
+            "audit": ("audit", "fix"),
+            "fix": ("fix", "review"),
+            "review": ("integrate", "integrate"),
             "integrate": (None, None),
         }[stage]
         return scheduler.result(stage)
 
     report = asyncio.run(scheduler.run(execute))
     assert scheduler.executions == [
-        (1, "review"),
-        (2, "review"),
-        (2, "audit"),
-        (2, "repair"),
+        (1, "validate"),
         (2, "validate"),
+        (2, "audit"),
+        (2, "fix"),
+        (2, "review"),
         (2, "integrate"),
     ]
     assert not report["valid"]
@@ -408,7 +408,7 @@ def test_unsuccessful_amendment_waits_for_new_evidence_after_cooldown(
     scheduler, monkeypatch, outcome
 ):
     scheduler.state.clear()
-    scheduler.state[1] = ("repair", "repair")
+    scheduler.state[1] = ("fix", "fix")
     now = [1000.0]
     monkeypatch.setattr("maxwell.pipeline.time.time", lambda: now[0])
 
@@ -418,19 +418,19 @@ def test_unsuccessful_amendment_waits_for_new_evidence_after_cooldown(
 
     report = asyncio.run(scheduler.run(execute))
     assert not report["valid"]
-    assert scheduler.executions == ["repair"]
+    assert scheduler.executions == ["fix"]
     attempt = scheduler.store.one("SELECT * FROM pipeline_attempts")
     now[0] += scheduler.config.pipeline.retry_seconds * 2
     ledger = AttemptLedger(scheduler.store, scheduler.config, True)
     assert "waiting for new evidence" in ledger.blocker(
-        "acme/repo", "repair", attempt["subject"], attempt["fingerprint"]
+        "acme/repo", "fix", attempt["subject"], attempt["fingerprint"]
     )
-    assert ledger.blocker("acme/repo", "repair", attempt["subject"], "new-check-run") is None
+    assert ledger.blocker("acme/repo", "fix", attempt["subject"], "new-check-run") is None
 
 
 def test_scheduler_drains_downstream_before_admitting_upstream(scheduler):
-    scheduler.config.pipeline.pools.review = 1
-    scheduler.state[2] = ("review", "audit")
+    scheduler.config.pipeline.pools.validation = 1
+    scheduler.state[2] = ("validate", "audit")
 
     async def execute(*args, stage, **kwargs):
         issue = args[5]["target"]["issue"]
@@ -440,12 +440,12 @@ def test_scheduler_drains_downstream_before_admitting_upstream(scheduler):
 
     report = asyncio.run(scheduler.run(execute))
     assert report["valid"]
-    assert scheduler.executions == [(2, "audit"), (1, "review")]
+    assert scheduler.executions == [(2, "audit"), (1, "validate")]
 
 
 def test_existing_backlog_refills_bounded_pool_before_new_reviews(scheduler):
-    scheduler.config.pipeline.pools.review = 2
-    scheduler.state.update({number: ("review", "audit") for number in range(3, 8)})
+    scheduler.config.pipeline.pools.validation = 2
+    scheduler.state.update({number: ("validate", "audit") for number in range(3, 8)})
     events = []
 
     async def execute(*args, stage, **kwargs):
@@ -456,13 +456,13 @@ def test_existing_backlog_refills_bounded_pool_before_new_reviews(scheduler):
 
     report = asyncio.run(scheduler.run(execute, on_progress=events.append))
     pools = [event for event in events if event["state"] == "pools"]
-    assert pools[0]["pools"]["review"] == 2
-    assert pools[0]["backlog"]["review"] == 3
-    assert [event["backlog"]["review"] for event in pools[:4]] == [3, 2, 1, 0]
-    assert all(event["pools"]["review"] <= 2 for event in pools)
+    assert pools[0]["pools"]["validate"] == 2
+    assert pools[0]["backlog"]["validate"] == 3
+    assert [event["backlog"]["validate"] for event in pools[:4]] == [3, 2, 1, 0]
+    assert all(event["pools"]["validate"] <= 2 for event in pools)
     assert scheduler.executions == [(n, "audit") for n in range(3, 8)] + [
-        (1, "review"),
-        (2, "review"),
+        (1, "validate"),
+        (2, "validate"),
     ]
     assert report["valid"]
 
@@ -495,7 +495,7 @@ def test_zero_pool_leaves_existing_findings_in_backlog(scheduler):
 
 def test_infinite_hunter_waits_for_existing_hunted_backlog(scheduler, monkeypatch):
     scheduler.config.pipeline.pools.hunt = 1
-    scheduler.config.pipeline.pools.review = 0
+    scheduler.config.pipeline.pools.validation = 0
     events = []
 
     async def execute(*args, **kwargs):
@@ -515,15 +515,15 @@ def test_infinite_hunter_waits_for_existing_hunted_backlog(scheduler, monkeypatc
 def test_pending_publications_reserve_slots_before_backlog_admission():
     snapshot = PipelineSnapshot(
         [],
-        [PipelineItem(n, str(n), "review", "audit") for n in range(3)],
+        [PipelineItem(n, str(n), "validate", "audit") for n in range(3)],
         "head",
-        reservations={"review": 1},
+        reservations={"validate": 1},
     )
-    capacities = StagePoolSizes(review=2).model_dump(by_alias=True)
+    capacities = StagePoolSizes(validate=2).model_dump(by_alias=True)
     admitted, pools, backlog = snapshot.admit(capacities, snapshot.items)
     assert len(admitted) == 1
-    assert pools["review"] == 2
-    assert backlog["review"] == 2
+    assert pools["validate"] == 2
+    assert backlog["validate"] == 2
 
 
 def test_infinite_hunt_is_clipped_then_waits_for_cadence(scheduler, monkeypatch):
@@ -584,8 +584,8 @@ def test_real_batch_validates_quorum_merges_and_verifies_main(
         from test_validation import validate
 
         assert validate(home)["valid"]
-        config.repair.auto_merge.required_validations = 1
-    config.repair.auto_merge.enabled = True
+        config.fix.auto_merge.required_reviews = 1
+    config.fix.auto_merge.enabled = True
     original = GitHub.merge_pull
     repository = Repository(home, store.repository("acme/repo"))
 
@@ -599,7 +599,7 @@ def test_real_batch_validates_quorum_merges_and_verifies_main(
     result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
     assert result["valid"], json.dumps(result, indent=2)
     assert [run["stage"] for run in result["scans"]] == (
-        ["integrate"] if already_validated else ["validate", "validate", "integrate"]
+        ["integrate"] if already_validated else ["review", "review", "integrate"]
     )
     if not already_validated:
         assert len({run["model"] for run in result["scans"][:2]}) == 2
@@ -634,9 +634,9 @@ def test_real_batch_creates_second_repair_and_validates_both(home, prepared, rep
     reporter.github.create_comment("acme/repo", second, record_report(audit))
     result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
     assert result["valid"], json.dumps(result, indent=2)
-    assert [run["stage"] for run in result["scans"]] == ["validate", "repair", "validate"]
+    assert [run["stage"] for run in result["scans"]] == ["review", "fix", "review"]
     assert len(github["pulls"]) == 2
-    assert result["pipeline_repositories"][0]["pools"]["validate"] == 2
+    assert result["pipeline_repositories"][0]["pools"]["review"] == 2
     assert not github["merges"]
 
 
@@ -671,7 +671,7 @@ def test_unpublished_assessment_reserves_destination_and_prevents_duplicate_exec
     )
     try:
         snapshot = asyncio.run(load_snapshot(reporter, "acme/repo"))
-        assert snapshot.occupancy()["review"] == 1
+        assert snapshot.occupancy()["validate"] == 1
         assert snapshot.items[0].stage is None
         assert "publication" in snapshot.items[0].reason
     finally:
@@ -685,7 +685,7 @@ def test_blocked_repository_does_not_prevent_another_repository(scheduler, monke
     async def snapshot(reporter, repository):
         return PipelineSnapshot(
             [{"number": 1, "state": "closed" if repository in done else "open"}],
-            [] if repository in done else [PipelineItem(1, repository, "hunt", "review")],
+            [] if repository in done else [PipelineItem(1, repository, "hunt", "validate")],
             "head",
         )
 

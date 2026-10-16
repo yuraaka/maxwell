@@ -37,6 +37,7 @@ from maxwell.records import (
     record_digest,
 )
 from maxwell.reputation import agent_reputation, reputation_report
+from maxwell.stages import agent_name, stage_from_storage, stage_name
 
 
 def token_summary(usage):
@@ -57,7 +58,7 @@ def agent_selection_report(value):
     decision = AgentSelection.model_validate(value)
     basis = {
         "explicit": "explicit model override",
-        "thompson-source-v1": "Thompson sampling from provisional source support or reviewer–auditor agreement",
+        "thompson-source-v1": "Thompson sampling from provisional source support or validate–audit agreement",
         "thompson-repair-v1": "Thompson sampling from independent repair validation",
         "uniform-unrated-v1": "uniform sampling; quality is unrated",
     }[decision.method]
@@ -71,19 +72,17 @@ def scan_report(scan, finding_ids=(), *, record=None):
     usage = json.loads(scan["usage"] or "{}")
     tokens = token_summary(usage)
     agent = public_agent(scan)
-    identity = agent.display() if agent else "Unknown legacy agent"
-    stage = scan.get("stage", "discovery")
-    label = "Discovery" if stage == "discovery" else stage.title()
-    role = (
-        "Integration validator" if stage == "integrate" else agent.role.title() if agent else label
-    )
+    stage = stage_from_storage(scan.get("stage", "discovery"))
+    identity = agent.display(stage=stage) if agent else "Unknown legacy agent"
+    label = stage_name(stage)
+    role = agent_name(agent.role, stage=stage) if agent else label
     result = (
         f"{scan['admitted']} new candidates"
-        if stage == "discovery"
+        if stage == "hunt"
         else "Draft PR repair; awaiting independent validation"
-        if stage == "repair"
+        if stage == "fix"
         else "Independent PR repair validation; see validation record"
-        if stage == "validate"
+        if stage == "review"
         else "Independent maintained-branch verification; see integration record"
         if stage == "integrate"
         else "Source assessment; not reproduced"
@@ -106,10 +105,10 @@ Agent: `{identity}`
 | Stage | Token usage | Result |
 | --- | --- | --- |
 | {label} | {tokens} | {result} |
-| Reproduction | {"See validation record" if stage in ("validate", "integrate") else "Not run"} | {"Host regression replay" if stage in ("validate", "integrate") else "Later milestone"} |
-| Fixing | {"See repair record" if stage == "repair" else "Not run"} | {"Draft PR publication" if stage == "repair" else "Explicit repair stage"} |
-| Validation | {"See validation record" if stage in ("validate", "integrate") else "Not run"} | {"Independent model and host checks" if stage in ("validate", "integrate") else "Explicit validate stage"} |
-| Integration | {"See integration record" if stage == "integrate" else "Not run"} | {"Maintained-branch verification" if stage == "integrate" else "Merge then integrate stage"} |
+| regression replay | {"See validation record" if stage in ("review", "integrate") else "Not run"} | {"Host regression replay" if stage in ("review", "integrate") else "Later milestone"} |
+| fix | {"See repair record" if stage == "fix" else "Not run"} | {"Draft PR publication" if stage == "fix" else "fix stage"} |
+| review | {"See validation record" if stage in ("review", "integrate") else "Not run"} | {"Independent model and host checks" if stage in ("review", "integrate") else "review stage"} |
+| integrate | {"See integration record" if stage == "integrate" else "Not run"} | {"Maintained-branch verification" if stage == "integrate" else "Merge then integrate stage"} |
 
 **{tokens}.** Includes the failed attempt, if any.
 Usage complete: {usage.get("complete", False)}.
@@ -170,7 +169,7 @@ def record_report(record):
     if isinstance(record, AssessmentRecord):
         identity = f"{record.agent.adapter}/{record.agent.model}" if record.agent else record.actor
         body = (
-            f"{marker}\n### {record.role.title()} · {record.verdict}\n\n"
+            f"{marker}\n### {agent_name(record.role)} · {record.verdict}\n\n"
             f"Agent / actor: `{identity}`\n\n"
             f"Verdict: **{record.verdict}**; actionability: {record.actionability}\n\n"
             f"{record.evidence}\n"
@@ -211,23 +210,23 @@ def record_report(record):
         body += "\n</details>\n"
     elif isinstance(record, RepairPullRequestRecord):
         body = (
-            f"{marker}\n### Repair PR — #{record.number}\n\n"
+            f"{marker}\n### fix PR — #{record.number}\n\n"
             f"[Open PR](https://github.com/{record.repository}/pull/{record.number}) · "
             f"head `{record.head_sha}`; base `{record.base_sha}`.\n\n"
-            f"Repair: `{record.repair_id}`; provenance: {record.provenance}.\n"
+            f"repair: `{record.repair_id}`; provenance: {record.provenance}.\n"
         )
     elif isinstance(record, RepairRecord):
         body = (
-            f"{marker}\n### Fixer · {record.outcome}\n\n"
+            f"{marker}\n### {agent_name('fixer')} · {record.outcome}\n\n"
             f"Agent: `{record.agent.adapter}/{record.agent.model}`\n\n"
             f"{record.summary}\n\n{record.explanation}\n\n"
-            "<details>\n<summary>Repair checks and provenance</summary>\n\n"
+            "<details>\n<summary>repair checks and provenance</summary>\n\n"
             f"Base: `{record.sha}`\n\nLocal branch: `{record.branch}`\n\n"
             f"Local worktree: `{record.worktree}`\n\n"
             f"Commit: `{record.commit or 'none'}`. Prepared repairs are published as draft PRs.\n\n"
             "Awaiting independent validation; no observed entropy reduction.\n\n"
             f"Changed files: {', '.join(record.files) or 'none'}.\n\n"
-            f"Regression coverage claimed by fixer: {', '.join(record.regression_tests) or 'none'}.\n\n"
+            f"Regression coverage claimed by fix agent: {', '.join(record.regression_tests) or 'none'}.\n\n"
             f"Execution: `{record.execution_id}`; assessment inputs: {', '.join(record.references)}.\n"
         )
         for check in record.checks:
@@ -240,7 +239,9 @@ def record_report(record):
         body += "\n</details>\n"
     elif isinstance(record, ValidationRecord):
         changes = validation_changes(record)
-        role = "Integration validator" if isinstance(record, IntegrationRecord) else "Validator"
+        role = agent_name(
+            "validator", stage="integrate" if isinstance(record, IntegrationRecord) else "review"
+        )
         summary = (
             record.result.summary
             if record.state == "completed" and record.result
@@ -267,7 +268,7 @@ def record_report(record):
         )
         body += "\n<details>\n<summary>Evidence, measurements, and execution details</summary>\n\n"
         body += (
-            f"Repair: `{record.repair_id}`; original: `{record.base_sha}`; repaired: `{record.sha}`.\n\n"
+            f"repair: `{record.repair_id}`; original: `{record.base_sha}`; repaired: `{record.sha}`.\n\n"
             f"Execution: `{record.execution_id}`; assessment inputs: {', '.join(record.references)}.\n"
         )
         if record.result:
@@ -305,7 +306,7 @@ def record_report(record):
         body += "\n</details>\n"
     elif isinstance(record, ExecutionRecord):
         identity = record.agent.display() if record.agent else "Unknown legacy agent"
-        role = record.agent.role.title() if record.agent else "Agent"
+        role = agent_name(record.agent.role) if record.agent else "Agent"
         body = (
             f"{marker}\n### {role} execution · {record.state}\n\n"
             f"Agent: `{identity}`; revision: `{record.sha or 'not resolved'}`\n\n"
@@ -325,7 +326,7 @@ def record_report(record):
     return body + "\n" + encode_record(record) + "\n"
 
 
-def hunter_ratings(store, repo=None):
+def hunt_ratings(store, repo=None):
     rows = store.rows(
         "SELECT DISTINCT s.profile, f.id, f.state FROM findings f "
         "JOIN (SELECT finding_id,scan_id FROM finding_observations UNION "
@@ -341,7 +342,7 @@ def hunter_ratings(store, repo=None):
     return [
         {
             "profile": profile,
-            "stage": "hunter",
+            "stage": "hunt",
             "assessments": sum(tally.values()),
             "rating": round(100 * (tally["confirmed"] + 2) / (sum(tally.values()) + 4), 1),
             "confidence": "provisional; human assessments, Beta(2,2) smoothing",
@@ -742,13 +743,13 @@ class Reporter:
                 scan = self.store.one("SELECT * FROM scans WHERE id=?", (finding["scan_id"],))
                 agent = public_agent(scan)
                 body = f"""{marker}
-### Hunter · suspected {data["kind"]}
+### {agent_name("hunter")} · suspected {data["kind"]}
 
 **Source inspection only; not reproduced or independently validated.**
 
 Scanned revision: `{scan["sha"]}`  
 Location: `{data["path"]}:{data["line"]}` (`{data["symbol"]}`)  
-Suggested priority: {data["priority"]}; hunter confidence: {data["confidence"]:.0%}
+Suggested priority: {data["priority"]}; hunt agent confidence: {data["confidence"]:.0%}
 Agent: `{agent.display() if agent else "Unknown legacy agent"}`
 Proposed factors: {", ".join(data.get("factors", [])) or "none established"}.
 
@@ -758,11 +759,11 @@ Proposed factors: {", ".join(data.get("factors", [])) or "none established"}.
 ### Expected behavior / benefit
 {data["expected"]}
 
-Discovery scan: `{finding["scan_id"]}`. Token usage is recorded on that execution;
+hunt scan: `{finding["scan_id"]}`. Token usage is recorded on that execution;
 it is not counted again for this finding.
 {spending_summary(json.loads(scan["usage"] or "{}").get("spending"))}
-This is the shared hunter execution cost, not a separate charge for each finding.
-Reproduction, fixing, and validation: **not run**.
+This is the shared hunt execution cost, not a separate charge for each finding.
+repair, validate, and integrate: **not run**.
 
 Authorized users may comment `/maxwell confirm`, `/maxwell reject <reason>`,
 or `/maxwell priority P1`. Confirmation here is a human assessment, not a reproduced test.
@@ -1117,7 +1118,7 @@ or `/maxwell priority P1`. Confirmation here is a human assessment, not a reprod
             (repo,),
         )
         if repairs:
-            queue_body += "\n### Repair pull requests\n\n"
+            queue_body += "\n### fix pull requests\n\n"
             for row in repairs:
                 repair = RECORD_ADAPTER.validate_json(row["data"])
                 url = (

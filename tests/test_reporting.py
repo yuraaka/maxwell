@@ -163,7 +163,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
         assert "| Executions with unavailable token usage | 1 |" in dashboard
         assert "| Executions with incomplete token usage | 2 |" in dashboard
         assert "#### Investigation tokens" in dashboard
-        assert "| hunter | 3 | 1,200 | 120 | 1,320 | 1 | 2 |" in dashboard
+        assert "| hunt agent | 3 | 1,200 | 120 | 1,320 | 1 | 2 |" in dashboard
         assert "run `maxwell measure` to establish a baseline" in dashboard
         bodies = [issue["body"] for issue in github["issues"].values()] + [
             comment["body"] for comments in github["comments"].values() for comment in comments
@@ -184,7 +184,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
         assert decode_record(finding_body).allocated_cost_micros is None
         assert decode_record(finding_body).spending == usages[0].spending
         assert "$0.1230 USD" in finding_body
-        assert "shared hunter execution cost" in finding_body
+        assert "shared hunt execution cost" in finding_body
     finally:
         client.close()
         store.close()

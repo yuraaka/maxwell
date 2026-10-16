@@ -288,7 +288,7 @@ def test_finding_and_execution_publish_public_identities_and_project(records, gi
         comment["body"] for comments in github["comments"].values() for comment in comments
     ]
     assert all("private-work-alias" not in body for body in all_bodies)
-    assert any("claude/fake-model, hunter" in body for body in all_bodies)
+    assert any("claude/fake-model, hunt agent" in body for body in all_bodies)
     projections = store.rows("SELECT type,id,status,data FROM github_records ORDER BY type")
     assert [(item["type"], item["id"], item["status"]) for item in projections] == [
         ("execution", execution_id, "current"),

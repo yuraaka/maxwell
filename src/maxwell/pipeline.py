@@ -19,10 +19,11 @@ from maxwell.records import RECORD_ADAPTER
 from maxwell.repair import collect_repair_targets, merge_repair_problem
 from maxwell.repair_pull_requests import active_validations, records
 from maxwell.reporting import Reporter
+from maxwell.stages import AGENT_STAGES, stored_stage
 from maxwell.validation import collect_validation_targets
 
-POOLS = ("hunt", "review", "audit", "repair", "validate", "integrate")
-STAGES = ("integrate", "validate", "repair", "audit", "review", "hunt")
+POOLS = AGENT_STAGES
+STAGES = tuple(reversed(AGENT_STAGES))
 
 
 @dataclass
@@ -82,30 +83,30 @@ def classify_item(
         return item("integrate", "integrate")
     if link:
         if not pull or pull["state"] != "open":
-            return item("repair", reason="repair PR is closed without merge")
+            return item("fix", reason="repair PR is closed without merge")
         if not repair or set(repair.references) != {
             record.id for record in input_assessments(finding, assessments)
         }:
-            return item("repair", reason="repair assessment inputs changed")
+            return item("fix", reason="repair assessment inputs changed")
         if any(record.state == "failed" and record.requires_rebase for record in votes):
-            return item("repair", "repair")
+            return item("fix", "fix")
         completed = [record for record in votes if record.state == "completed"]
         if any(record.outcome == "rejected" for record in completed):
-            return item("repair", "repair")
+            return item("fix", "fix")
         if any(record.outcome == "inconclusive" for record in completed):
             return item(
-                "repair",
+                "fix",
                 reason="validation is inconclusive; fresh evidence or explicit --force required",
             )
         identities = {(record.agent.adapter, record.agent.model) for record in completed}
-        required = policy.required_validations if policy.enabled else 1
+        required = policy.required_reviews if policy.enabled else 1
         if not completed or len(identities) < required:
-            return item("repair", "validate")
+            return item("fix", "review")
         return item(
-            "validate",
+            "review",
             reason="awaiting merge"
             if policy.enabled
-            else "auto-merge disabled; merge the PR manually or enable repair.auto_merge",
+            else "auto-merge disabled; merge the PR manually or enable fix.auto_merge",
         )
     reviews, audits = finding_assessments(assessments, finding)
     humans = active_assessments(
@@ -118,9 +119,9 @@ def classify_item(
     )
     if not humans:
         if not reviews:
-            return item("hunt", "review")
+            return item("hunt", "validate")
         if not audits:
-            return item("review", "audit")
+            return item("validate", "audit")
     decision, level, _, _ = repair_decision(finding, assessments)
     if not decision:
         decisions = humans or audits
@@ -130,7 +131,7 @@ def classify_item(
             "audit", reason="current assessments are inconclusive, conflicting, or not actionable"
         )
     if level not in ("audited", "human"):
-        return item("review", "audit")
+        return item("validate", "audit")
     if (
         repair
         and repair.outcome in ("blocked", "checks_failed")
@@ -139,9 +140,9 @@ def classify_item(
     ):
         return item(
             "audit",
-            reason="fixer blocked or checks failed; new assessment evidence or explicit --force required",
+            reason="fix agent blocked or checks failed; new assessment evidence or explicit --force required",
         )
-    return item("audit", "repair")
+    return item("audit", "fix")
 
 
 async def load_snapshot(reporter, repository):
@@ -185,9 +186,9 @@ async def load_snapshot(reporter, repository):
             active_validations(reporter.store, repository, link) if link else [],
             active_validations(reporter.store, repository, link, "integration") if link else [],
             commit["sha"],
-            reporter.config.repair.auto_merge,
+            reporter.config.fix.auto_merge,
         )
-        if link and (item.stage in ("repair", "validate") or item.pool == "validate"):
+        if link and (item.stage in ("fix", "review") or item.pool == "review"):
             try:
                 problem = await merge_repair_problem(reporter, repository, pull)
             except (httpx.HTTPError, ValueError) as exc:
@@ -198,9 +199,9 @@ async def load_snapshot(reporter, repository):
                 )
             else:
                 if problem:
-                    item.pool, item.stage, item.reason = "repair", "repair", ""
+                    item.pool, item.stage, item.reason = "fix", "fix", ""
         if (
-            item.pool == "validate"
+            item.pool == "review"
             and link
             and link.number in reporter.merge_statuses
             and not item.reason.startswith("Cannot inspect")
@@ -229,11 +230,11 @@ async def load_snapshot(reporter, repository):
         if not item:
             continue
         destination = (
-            {"reviewer": "review", "auditor": "audit"}.get(record.role)
+            {"reviewer": "validate", "auditor": "audit"}.get(record.role)
             if record.type == "assessment"
-            else "repair"
+            else "fix"
             if record.type == "repair" and record.outcome == "prepared"
-            else "validate"
+            else "review"
             if record.type == "validation" and record.outcome == "accepted"
             else None
         )
@@ -256,7 +257,7 @@ def has_room(snapshot, item, stage, capacities):
 
 def fingerprint(stage, target, head):
     value = target.model_dump(mode="json") if target else {"hunt": True}
-    if stage == "repair":
+    if stage == "fix":
         value["maintained_head"] = head
     # Failed execution IDs do not constitute new evidence.
     value.pop("supersedes", None)
@@ -269,9 +270,10 @@ class AttemptLedger:
         self.started = time.time()
 
     def blocker(self, repository, stage, subject, identity):
+        key_stage = stage if stage == "hunt" else stored_stage(stage)
         row = self.store.one(
             "SELECT * FROM pipeline_attempts WHERE repository=? AND stage=? AND subject=? AND fingerprint=?",
-            (repository, stage, subject, identity),
+            (repository, key_stage, subject, identity),
         )
         interval = (
             self.config.limits.scan_interval_seconds
@@ -280,10 +282,10 @@ class AttemptLedger:
         )
         latest = self.store.one(
             "SELECT MAX(attempted) AS attempted FROM pipeline_attempts WHERE repository=? AND stage=? AND subject=?",
-            (repository, stage, subject),
+            (repository, key_stage, subject),
         )["attempted"]
-        if stage in ("repair", "hunt") and latest is not None:
-            if stage == "repair" and not self.infinite and latest >= self.started:
+        if stage in ("fix", "hunt") and latest is not None:
+            if stage == "fix" and not self.infinite and latest >= self.started:
                 return (
                     "repair already attempted in this batch; remaining feedback needs another run"
                 )
@@ -299,12 +301,13 @@ class AttemptLedger:
         return None
 
     def save(self, repository, stage, subject, identity, state, error=None):
+        key_stage = stage if stage == "hunt" else stored_stage(stage)
         with self.store.db:
             self.store.db.execute(
                 "INSERT INTO pipeline_attempts VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(repository,stage,subject,fingerprint) DO UPDATE SET "
                 "attempted=excluded.attempted,state=excluded.state,error=excluded.error",
-                (repository, stage, subject, identity, time.time(), state, error),
+                (repository, key_stage, subject, identity, time.time(), state, error),
             )
 
 
@@ -327,11 +330,11 @@ class PipelineRepository:
 async def targets_for(reporter, repository, snapshot, stage, issue):
     if stage == "hunt":
         return [None]
-    if stage in ("review", "audit"):
+    if stage in ("validate", "audit"):
         return await collect_targets(
             reporter, repository, stage, issue=issue, issues=snapshot.issues
         )
-    if stage == "repair":
+    if stage == "fix":
         return await collect_repair_targets(
             reporter, repository, issue=issue, issues=snapshot.issues
         )
@@ -534,7 +537,7 @@ async def run_pipeline(
                                     store, repository, stage, avoid=independent_agents(target)
                                 )
                                 if (
-                                    stage in ("validate", "integrate")
+                                    stage in ("review", "integrate")
                                     and decision["independence"] != "different_model"
                                 ):
                                     context.waiting.append(
@@ -630,7 +633,7 @@ async def run_pipeline(
                                     result["publication_errors"]
                                 )
                                 needs_evidence = (
-                                    stage == "repair"
+                                    stage == "fix"
                                     and not result["publication_errors"]
                                     and any(
                                         repair["outcome"] in ("blocked", "checks_failed")

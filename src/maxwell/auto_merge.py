@@ -14,12 +14,12 @@ def evidence_blocker(policy, link, finding, repair, validations, assessments):
         return "finding assessments changed; validation is stale"
     if any(record.state != "completed" or record.outcome != "accepted" for record in validations):
         return "a current validation is rejected, inconclusive, or incomplete"
-    fixer = (repair.agent.adapter, repair.agent.model)
+    repair_agent = (repair.agent.adapter, repair.agent.model)
     agents = {(record.agent.adapter, record.agent.model) for record in validations}
-    if fixer in agents:
-        return "a validator uses the fixer's model"
-    if len(agents) < policy.required_validations:
-        return f"waiting for independent validations ({len(agents)}/{policy.required_validations})"
+    if repair_agent in agents:
+        return "a review agent uses the fix agent's model"
+    if len(agents) < policy.required_reviews:
+        return f"waiting for independent validations ({len(agents)}/{policy.required_reviews})"
     for record in validations:
         if record.result and record.result.concerns:
             return "blocking validation concern: " + record.result.concerns[0][:250]
@@ -72,7 +72,7 @@ def merge_error_message(response, repo, number, method):
         404: "Check that this token can access the repository and PR; run maxwell config apply",
         405: "Resolve the required checks, reviews, merge queue, or branch rules shown on the PR",
         409: "The PR head changed; synchronize and run fresh validation",
-        422: f"Check that {method!r} merging is enabled in Settings > General > Pull Requests, or change repair.auto_merge.merge_method and run maxwell config apply",
+        422: f"Check that {method!r} merging is enabled in Settings > General > Pull Requests, or change fix.auto_merge.merge_method and run maxwell config apply",
     }
     advice = instructions.get(response.status_code, "Inspect the PR's merge requirements")
     return f"GitHub denied the merge (HTTP {response.status_code}): {detail}. {advice}. https://github.com/{repo}/pull/{number}"
@@ -99,7 +99,7 @@ def projected_blocker(reporter, repo, link):
         None,
     )
     return evidence_blocker(
-        reporter.config.repair.auto_merge,
+        reporter.config.fix.auto_merge,
         link,
         finding,
         repair,
@@ -135,7 +135,7 @@ async def integration_pool_blocker(reporter, repo):
 async def try_auto_merge(reporter, repo, link, verdict):
     from maxwell.repair_pull_requests import check_pull, records
 
-    policy = reporter.config.repair.auto_merge
+    policy = reporter.config.fix.auto_merge
     identity = str(link.number)
     if not policy.enabled:
         return "disabled"
@@ -175,7 +175,7 @@ async def try_auto_merge(reporter, repo, link, verdict):
     if blocker:
         return blocker
     if reporter.store.one(
-        "SELECT id FROM scans WHERE repository=? AND stage IN ('repair','validate') AND state IN ('queued','running') "
+        "SELECT id FROM scans WHERE repository=? AND stage IN ('fix','repair','validate') AND state IN ('queued','running') "
         "AND json_extract(execution,'$.target.finding.id')=?",
         (repo, link.finding_id),
     ):

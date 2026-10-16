@@ -229,7 +229,7 @@ def human_lines(value, command, repo_command=None):
                 if any(item["stage"] == "hunt" for item in runs)
                 else []
             )
-            for stage in ("review", "audit"):
+            for stage in ("validate", "audit"):
                 verdicts = [
                     assessment["verdict"]
                     for item in successful
@@ -295,14 +295,12 @@ def human_lines(value, command, repo_command=None):
                         if reduction is not None
                         else "observed reduction unknown"
                     )
-                    lines.append(f"Validation: {validation['outcome']} · {delta}")
+                    lines.append(f"review: {validation['outcome']} · {delta}")
                 for link in item.get("pull_requests", []):
-                    lines.append(
-                        f"Repair PR: https://github.com/{repository}/pull/{link['number']}"
-                    )
+                    lines.append(f"fix PR: https://github.com/{repository}/pull/{link['number']}")
                 if not item.get("pull_requests"):
                     for repair in item.get("repairs", []):
-                        lines.append(f"Repair: {repair['outcome']} · PR publication pending")
+                        lines.append(f"fix: {repair['outcome']} · PR publication pending")
             status = next(
                 (item for item in value.get("statuses", []) if item["repository"] == repository),
                 None,

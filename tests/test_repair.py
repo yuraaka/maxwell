@@ -173,7 +173,7 @@ def test_repair_end_to_end_pinned_local_branch_and_repeat(home, source, repairab
     assert any(isinstance(record, RepairRecord) for record in published)
     dashboard = store.one("SELECT issue FROM dashboards")["issue"]
     assert not github["comments"].get(dashboard)
-    assert "Repair pull requests" in github["issues"][dashboard]["body"]
+    assert "fix pull requests" in github["issues"][dashboard]["body"]
     assert public["branch"] in github["issues"][dashboard]["body"]
     again = run(home)
     assert again["valid"] and not again["scans"]
@@ -314,7 +314,7 @@ def test_repair_options_are_explicit_and_single_finding(home):
     assert args.stage == "repair" and args.issue == 7
     with pytest.raises(ValueError, match="one finding"):
         run(home, limit=2)
-    with pytest.raises(ValueError, match="explicit review"):
+    with pytest.raises(ValueError, match="single explicit validate"):
         run(home, stage=None, force=True)
 
 

@@ -25,7 +25,11 @@ from maxwell.store import Store
 
 
 @pytest.fixture
-def automatic(home, source):
+def automatic(home, source, monkeypatch):
+    async def no_fix_targets(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr("maxwell.manual.collect_repair_targets", no_fix_targets)
     data = yaml.safe_load(home.config.read_text())
     data["provider"]["models"] = ["fake-model", "model-b", "model-c"]
     home.config.write_text(yaml.safe_dump(data))
@@ -80,7 +84,7 @@ def backlog(automatic, finding, source):
             )
     finally:
         client.close()
-    config.limits.max_reviews_per_scan = 3
+    config.limits.max_validations_per_scan = 3
     config.limits.max_audits_per_scan = 3
 
 
@@ -95,7 +99,7 @@ def test_no_argument_scan_publishes_hunt_review_audit_in_order(automatic, github
         <= store.one("SELECT started FROM scans ORDER BY created LIMIT 1")["started"]
     )
     scans = result["scans"]
-    assert [item["stage"] for item in scans] == ["hunt", "review", "audit"]
+    assert [item["stage"] for item in scans] == ["hunt", "validate", "audit"]
     assert len({item["model"] for item in scans}) == 3
     assert all(item["state"] == "completed" for item in scans)
     assert scans[1]["agent_selection"]["independence"] == "different_model"
@@ -120,9 +124,10 @@ def test_no_argument_scan_publishes_hunt_review_audit_in_order(automatic, github
     repeated = json.loads(capsys.readouterr().out)
     assert repeated["valid"] and [item["stage"] for item in repeated["scans"]] == ["hunt"]
     assert {item["stage"] for item in repeated["skipped"]} == {
-        "review",
-        "audit",
         "validate",
+        "audit",
+        "fix",
+        "review",
         "integrate",
     }
 
@@ -211,7 +216,7 @@ def test_pipeline_recovers_transient_github_failures_without_duplicate_creates(
     monkeypatch.setattr(httpx.Client, "send", unreliable)
     report = asyncio.run(run_scans(home, config))
     assert report["valid"], report
-    assert [item["stage"] for item in report["scans"]] == ["hunt", "review", "audit"]
+    assert [item["stage"] for item in report["scans"]] == ["hunt", "validate", "audit"]
     assert faults == {"lost_issue_response": 1, "comments_502": 1}
     assert github["creates"] == 3
     assert all(not item["publication_errors"] for item in report["scans"])
@@ -245,16 +250,17 @@ def test_pipeline_checks_remaining_stages_on_hunter_failure(automatic, directory
     if mode == "wait":
         assert "codex agent timed out after 1s" in report["scans"][0]["error"]
     assert {item["stage"] for item in report["skipped"]} == {
-        "review",
-        "audit",
         "validate",
+        "audit",
+        "fix",
+        "review",
         "integrate",
     }
     assert all(
         item["reason"]
         == (
             "No prepared repair PRs"
-            if item["stage"] in ("validate", "integrate")
+            if item["stage"] in ("review", "integrate")
             else "No eligible findings"
         )
         for item in report["skipped"]
@@ -299,7 +305,7 @@ def test_pipeline_continues_other_jobs_and_stages_after_execution_failure(
     report = asyncio.run(run_scans(home, config))
     assert not report["valid"] and failed
     assert sum(item["state"] == "failed" for item in report["scans"]) == 1
-    assert sum(item["stage"] == "review" for item in report["scans"]) >= 2
+    assert sum(item["stage"] == "validate" for item in report["scans"]) >= 2
     assert sum(item["stage"] == "audit" for item in report["scans"]) == (
         3 if failed_stage == "audit" else 2
     )
@@ -307,7 +313,7 @@ def test_pipeline_continues_other_jobs_and_stages_after_execution_failure(
         sum(item["state"] == "completed" and item["stage"] == "audit" for item in report["scans"])
         == 2
     )
-    assert {item["stage"] for item in report["skipped"]} == {"validate", "integrate"}
+    assert {item["stage"] for item in report["skipped"]} == {"fix", "review", "integrate"}
 
 
 def test_unresolved_hunt_publication_does_not_fail_reviews_or_repost_issue(
@@ -330,8 +336,8 @@ def test_unresolved_hunt_publication_does_not_fail_reviews_or_repost_issue(
     assert report["scans"][0]["publication_errors"]
     assert [item["stage"] for item in report["scans"]] == [
         "hunt",
-        "review",
-        "review",
+        "validate",
+        "validate",
         "audit",
         "audit",
     ]
@@ -350,12 +356,13 @@ def test_pipeline_respects_admission_limit_and_checks_audit_eligibility(automati
     config.limits.daily_scan_limit = 1
     report = asyncio.run(run_scans(home, config))
     assert not report["valid"]
-    assert [item["stage"] for item in report["scans"]] == ["hunt", "review"]
+    assert [item["stage"] for item in report["scans"]] == ["hunt", "validate"]
     assert report["scans"][1]["state"] == "failed"
     assert "daily_scan_limit" in report["scans"][1]["error"]
     assert report["skipped"] == [
         {"repository": "acme/repo", "stage": "audit", "reason": "No eligible findings"},
-        {"repository": "acme/repo", "stage": "validate", "reason": "No prepared repair PRs"},
+        {"repository": "acme/repo", "stage": "fix", "reason": "No eligible findings"},
+        {"repository": "acme/repo", "stage": "review", "reason": "No prepared repair PRs"},
         {"repository": "acme/repo", "stage": "integrate", "reason": "No prepared repair PRs"},
     ]
     assert not store.rows("SELECT * FROM scans WHERE state='queued'")
@@ -380,7 +387,7 @@ def test_pipeline_continues_other_repositories_after_failure(automatic, source, 
     assert [(item["repository"], item["stage"]) for item in report["scans"]] == [
         ("acme/repo", "hunt"),
         ("acme/second", "hunt"),
-        ("acme/second", "review"),
+        ("acme/second", "validate"),
         ("acme/second", "audit"),
     ]
 
@@ -396,7 +403,7 @@ def test_pipeline_reports_context_failure_without_launching_agent(automatic, mon
     assert not report["valid"] and report["scans"] == []
     assert report["errors"] == [
         {"repository": "acme/repo", "stage": stage, "error": "GitHub unavailable"}
-        for stage in ("measure", "hunt", "review", "audit", "validate", "integrate")
+        for stage in ("measure", "hunt", "validate", "audit", "review", "integrate")
     ]
     assert not store.rows("SELECT * FROM scans")
 
@@ -448,11 +455,11 @@ def test_pipeline_handles_empty_hunt_but_reviews_backlog_with_stage_limits(
             )
     finally:
         client.close()
-    config.limits.max_reviews_per_scan = 2
+    config.limits.max_validations_per_scan = 2
     config.limits.max_audits_per_scan = 1
     report = asyncio.run(run_scans(home, config))
     assert report["valid"]
-    assert [item["stage"] for item in report["scans"]] == ["hunt", "review", "review", "audit"]
+    assert [item["stage"] for item in report["scans"]] == ["hunt", "validate", "validate", "audit"]
     assert report["scans"][0]["admitted"] == 0
     assessments = [
         decode_record(item["body"]) for comments in github["comments"].values() for item in comments
@@ -470,7 +477,7 @@ def test_scan_can_skip_measurement_stages_and_reuse_history(automatic, monkeypat
 
     monkeypatch.setattr("maxwell.measurement_runner.python_measurement", forbidden)
     second = asyncio.run(
-        run_scans(home, config, skip_stages=("source", "tests", "hunt", "review", "audit"))
+        run_scans(home, config, skip_stages=("source", "tests", "hunt", "validate", "audit"))
     )
     assert second["valid"] and second["scans"] == []
     measurement = second["measurements"][0]

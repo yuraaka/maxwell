@@ -53,9 +53,9 @@ def assessments(github, issue):
 def test_hunt_review_audit_and_forced_reassessment(home, hunted, github, capsys):
     store, issue, hunt = hunted
     assert hunt["stage"] == "hunt"
-    reviewed = run(home, capsys, "--stage", "review", "--effort", "high")
+    reviewed = run(home, capsys, "--stage", "validate", "--effort", "high")
     review = reviewed["scans"][0]
-    assert reviewed["valid"] and review["stage"] == "review"
+    assert reviewed["valid"] and review["stage"] == "validate"
     assert review["sha"] == hunt["sha"] and review["admitted"] == 0
     assert review["selection"] is None and review["usage"]["input_tokens"] == 1000
     record = assessments(github, issue)[0]
@@ -71,7 +71,7 @@ def test_hunt_review_audit_and_forced_reassessment(home, hunted, github, capsys)
         "maxwell:state:reviewed",
         "maxwell:review:supported",
     }
-    assert run(home, capsys, "--stage", "review")["scans"] == []
+    assert run(home, capsys, "--stage", "validate")["scans"] == []
     audited = run(home, capsys, "--stage", "audit", "--issue", str(issue))
     audit = audited["scans"][0]
     assert audited["valid"] and audit["stage"] == "audit"
@@ -84,7 +84,7 @@ def test_hunt_review_audit_and_forced_reassessment(home, hunted, github, capsys)
         "maxwell:review:supported",
     }
     assert run(home, capsys, "--stage", "audit")["scans"] == []
-    replacement = run(home, capsys, "--stage", "review", "--issue", str(issue), "--force")
+    replacement = run(home, capsys, "--stage", "validate", "--issue", str(issue), "--force")
     latest = assessments(github, issue)[2]
     assert replacement["valid"] and latest.supersedes == record.id
     assert not any(
@@ -117,7 +117,7 @@ def test_review_reports_each_verdict_without_closing_issue(home, hunted, github,
     (Path(home.load().provider.executable).parent / "assessment.json").write_text(
         json.dumps({"verdict": verdict})
     )
-    result = run(home, capsys, "--stage", "review")
+    result = run(home, capsys, "--stage", "validate")
     assert result["valid"] and result["scans"][0]["assessments"][0]["verdict"] == verdict
     assert assessments(github, issue)[0].verdict == verdict
     assert {label["name"] for label in github["issues"][issue]["labels"]} >= {
@@ -129,7 +129,7 @@ def test_review_reports_each_verdict_without_closing_issue(home, hunted, github,
 
 def test_noop_review_refreshes_reputation_without_running_an_agent(home, hunted, github, capsys):
     store, issue, _ = hunted
-    run(home, capsys, "--stage", "review")
+    run(home, capsys, "--stage", "validate")
     record = assessments(github, issue)[0]
     comments = github["comments"][issue]
     comments[:] = [item for item in comments if decode_record(item["body"]) != record]
@@ -169,7 +169,7 @@ def test_review_uses_pinned_revision_after_branch_moves_and_queue_is_full(
     assert run(home, capsys)["scans"][0]["sha"] == head
     config["limits"]["human_queue_max"] = 1
     home.config.write_text(yaml.safe_dump(config))
-    result = run(home, capsys, "--stage", "review")
+    result = run(home, capsys, "--stage", "validate")
     assert result["valid"] and result["scans"][0]["sha"] == hunt["sha"]
     assert store.one("SELECT COUNT(*) AS n FROM findings")["n"] == 1
     assert git("rev-parse", "HEAD", cwd=source) == head
@@ -192,7 +192,7 @@ def test_fresh_database_reviews_github_findings_without_local_finding_rows(
     store = Store(fresh.db)
     store.register("acme/repo", str(source), "main")
     try:
-        result = run(fresh, capsys, "--stage", "review")
+        result = run(fresh, capsys, "--stage", "validate")
         assert result["valid"] and result["scans"][0]["sha"] == hunt["sha"]
         assert not store.rows("SELECT * FROM findings")
         assert assessments(github, issue)[0].finding_id == hunt["findings"][0]["id"]
@@ -201,7 +201,7 @@ def test_fresh_database_reviews_github_findings_without_local_finding_rows(
             {"name": "maxwell:state:suspected"},
             {"name": "custom"},
         ]
-        assert run(fresh, capsys, "--stage", "review")["scans"] == []
+        assert run(fresh, capsys, "--stage", "validate")["scans"] == []
         assert {label["name"] for label in github["issues"][issue]["labels"]} == {
             "maxwell",
             "custom",
@@ -219,7 +219,7 @@ def test_failed_review_publishes_no_assessment_and_records_usage(
     store, issue, _ = hunted
     (Path(home.load().provider.executable).parent / "mode").write_text(mode)
     with pytest.raises(SystemExit):
-        run(home, capsys, "--stage", "review")
+        run(home, capsys, "--stage", "validate")
     result = json.loads(capsys.readouterr().out)
     assert not result["valid"] and result["scans"][0]["state"] == "failed"
     assert result["scans"][0]["usage"]["input_tokens"] == 1000
@@ -232,22 +232,22 @@ def test_targeted_audit_requires_review_and_legacy_finding_cannot_be_assessed(
     home, hunted, github, capsys
 ):
     store, issue, _ = hunted
-    with pytest.raises(ValueError, match="requires a current review"):
+    with pytest.raises(ValueError, match="requires a current validate assessment"):
         run(home, capsys, "--stage", "audit", "--issue", str(issue))
     assert store.one("SELECT COUNT(*) AS n FROM scans")["n"] == 1
     github["issues"][issue]["body"] = github["issues"][issue]["body"].split(
         "<!-- maxwell:record:v1"
     )[0]
     with pytest.raises(ValueError, match="legacy findings"):
-        run(home, capsys, "--stage", "review", "--issue", str(issue))
+        run(home, capsys, "--stage", "validate", "--issue", str(issue))
     assert store.one("SELECT COUNT(*) AS n FROM scans")["n"] == 1
 
 
 def test_unauthorized_review_is_ignored(home, hunted, github, capsys):
     _, issue, _ = hunted
-    run(home, capsys, "--stage", "review")
+    run(home, capsys, "--stage", "validate")
     github["comments"][issue][0]["user"] = {"login": "outsider"}
-    result = run(home, capsys, "--stage", "review")
+    result = run(home, capsys, "--stage", "validate")
     assert result["valid"] and len(result["scans"]) == 1
 
 
@@ -262,12 +262,12 @@ def test_human_output_identifies_stage_and_verdict(home, hunted, capsys):
                 "--model",
                 "fake-model",
                 "--stage",
-                "review",
+                "validate",
             ]
         )
     )
     output = capsys.readouterr().out
-    assert "Review>" in output and "review: 1 supported" in output
+    assert "validate>" in output and "validate: 1 supported" in output
     assert "Status: https://github.com/acme/repo/issues/" in output
     assert "Assessment:" not in output
     execute(
@@ -280,14 +280,14 @@ def test_human_output_identifies_stage_and_verdict(home, hunted, capsys):
                 "--model",
                 "fake-model",
                 "--stage",
-                "review",
+                "validate",
             ]
         )
     )
-    assert "[SKIP] acme/repo / review: No eligible findings" in capsys.readouterr().out
+    assert "[SKIP] acme/repo / validate: No eligible findings" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("options", [["--issue", "0"], ["--limit", "-1"], ["--stage", "fix"]])
+@pytest.mark.parametrize("options", [["--issue", "0"], ["--limit", "-1"], ["--stage", "merge"]])
 def test_invalid_stage_cli_options_are_rejected(options):
     with pytest.raises(SystemExit):
         parser().parse_args(["scan", "--model", "fake-model", *options])
@@ -295,7 +295,7 @@ def test_invalid_stage_cli_options_are_rejected(options):
 
 @pytest.mark.parametrize("options", [["--issue", "1"], ["--limit", "2"], ["--force"]])
 def test_hunt_rejects_assessment_options(home, options):
-    with pytest.raises(ValueError, match="explicit review, audit, repair, or validate only"):
+    with pytest.raises(ValueError, match="single explicit validate"):
         execute(
             parser().parse_args(
                 ["--home", str(home.root), "scan", "--model", "fake-model", *options]
@@ -303,7 +303,7 @@ def test_hunt_rejects_assessment_options(home, options):
         )
 
 
-@pytest.mark.parametrize("stage", ["review", "audit"])
+@pytest.mark.parametrize("stage", ["validate", "audit"])
 @pytest.mark.parametrize("configured,override,expected", [(2, None, 2), (1, 2, 2), (3, 1, 1)])
 def test_stage_config_limit_and_cli_override_rank_findings(
     home,
@@ -335,15 +335,17 @@ def test_stage_config_limit_and_cli_override_rank_findings(
             "body": f"<!-- maxwell:finding:{record.id} -->\n" + encode_record(record),
         }
     if stage == "audit":
-        assert run(home, capsys, "--stage", "review", "--limit", "3")["valid"]
+        assert run(home, capsys, "--stage", "validate", "--limit", "3")["valid"]
     config = yaml.safe_load(home.config.read_text())
-    config["limits"][f"max_{stage}s_per_scan"] = configured
+    config["limits"][
+        "max_validations_per_scan" if stage == "validate" else "max_audits_per_scan"
+    ] = configured
     home.config.write_text(yaml.safe_dump(config))
     options = ["--limit", str(override)] if override is not None else []
     result = run(home, capsys, "--stage", stage, *options)
     assert result["valid"] and len(result["scans"]) == expected
     assert [scan["assessments"][0]["issue"] for scan in result["scans"]] == [21, issue][:expected]
-    role = "reviewer" if stage == "review" else "auditor"
+    role = "reviewer" if stage == "validate" else "auditor"
     assert not [record for record in assessments(github, 20) if record.role == role]
     assert store.one("SELECT COUNT(*) AS n FROM findings")["n"] == 1
 
@@ -360,7 +362,7 @@ def test_review_is_still_blocked_by_daily_execution_limit(home, hunted, capsys):
     config["provider"]["home"] = str(native)
     config["limits"].update(daily_scan_limit=1, human_queue_max=1)
     home.config.write_text(yaml.safe_dump(config))
-    run(home, capsys, "--stage", "review")
+    run(home, capsys, "--stage", "validate")
     with pytest.raises(SystemExit):
         run(home, capsys, "--stage", "audit")
     result = json.loads(capsys.readouterr().out)
@@ -387,14 +389,14 @@ def test_assessment_publication_is_reconciled_without_another_agent_call(
 
     with monkeypatch.context() as patch:
         patch.setattr(GitHub, "create_comment", lost)
-        result = run(home, capsys, "--stage", "review")
+        result = run(home, capsys, "--stage", "validate")
     assert result["valid"] and result["scans"][0]["state"] == "completed"
     assert not result["scans"][0]["publication_errors"]
     assert (
         store.one("SELECT state FROM record_publications WHERE type='assessment'")["state"]
         == "published"
     )
-    repeated = run(home, capsys, "--stage", "review")
+    repeated = run(home, capsys, "--stage", "validate")
     assert repeated["valid"] and repeated["scans"] == []
     assert len(assessments(github, issue)) == 1
     assert (
@@ -420,7 +422,7 @@ def test_issue_option_requires_repository(home):
                     "--model",
                     "fake-model",
                     "--stage",
-                    "review",
+                    "validate",
                     "--issue",
                     "1",
                 ]
@@ -432,7 +434,7 @@ def test_review_and_audit_agent_output_updates_factor_associations(home, hunted,
     _, issue, _ = hunted
     result = Path(home.load().provider.executable).parent / "assessment.json"
     result.write_text(json.dumps({"factors": ["test_runtime"]}))
-    reviewed = run(home, capsys, "--stage", "review")
+    reviewed = run(home, capsys, "--stage", "validate")
     assert reviewed["valid"]
     assert assessments(github, issue)[0].factors == ["test_runtime"]
     assert "maxwell:factor:test_runtime" in {
@@ -457,7 +459,7 @@ def test_review_publishes_repair_and_audit_receives_it(home, hunted, github, cap
     }
     payload = Path(home.load().provider.executable).parent / "assessment.json"
     payload.write_text(json.dumps({"repair": repair}))
-    reviewed = run(home, capsys, "--stage", "review")
+    reviewed = run(home, capsys, "--stage", "validate")
     assert reviewed["valid"]
     record = assessments(github, issue)[0]
     assert record.repair.plan == repair["plan"]

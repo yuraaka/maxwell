@@ -22,15 +22,17 @@ _prepared = pytest.fixture(name="prepared")(prepared_fixture.__wrapped__)
 
 @pytest.fixture
 def votes(monkeypatch):
-    monkeypatch.setattr("maxwell.auto_merge.input_assessments", lambda *_: [Namespace(id="review")])
+    monkeypatch.setattr(
+        "maxwell.auto_merge.input_assessments", lambda *_: [Namespace(id="validate")]
+    )
     link = Namespace(id="link", head_sha="head", base_sha="base")
     finding = Namespace(finding=Namespace(kind="bug"))
-    repair = Namespace(references=["review"], agent=Namespace(adapter="codex", model="fixer"))
+    repair = Namespace(references=["validate"], agent=Namespace(adapter="codex", model="fixer"))
     validations = [
         Namespace(
             state="completed",
             outcome="accepted",
-            references=["review"],
+            references=["validate"],
             agent=Namespace(adapter="codex", model=f"validator-{index}", effort=None),
             pr_id="link",
             pr_head="head",
@@ -47,10 +49,10 @@ def votes(monkeypatch):
 
 
 def test_auto_merge_config_is_opt_in_and_allows_one_validation():
-    assert not Config().repair.auto_merge.enabled
-    assert Config().repair.auto_merge.required_validations == 2
-    assert AutoMergeSettings(required_validations=1).required_validations == 1
-    for values in ({"required_validations": 0}, {"merge_method": "override"}):
+    assert not Config().fix.auto_merge.enabled
+    assert Config().fix.auto_merge.required_reviews == 2
+    assert AutoMergeSettings(required_reviews=1).required_reviews == 1
+    for values in ({"required_reviews": 0}, {"merge_method": "override"}):
         with pytest.raises(ValidationError):
             AutoMergeSettings(**values)
 
@@ -62,7 +64,7 @@ def test_independent_votes_cannot_be_increased_by_effort_or_alias(votes):
     validations[1].agent.effort = "high"
     assert "1/2" in evidence_blocker(*votes)
     validations[1].agent.model = "fixer"
-    assert "fixer's model" in evidence_blocker(*votes)
+    assert "fix agent's model" in evidence_blocker(*votes)
 
 
 def test_informational_notes_do_not_block_auto_merge(votes):
@@ -134,7 +136,7 @@ def test_actual_github_merge_blockers_have_instructions(mergeable, state, reason
         (404, "access"),
         (405, "merge queue"),
         (409, "fresh validation"),
-        (422, "repair.auto_merge.merge_method"),
+        (422, "fix.auto_merge.merge_method"),
     ],
 )
 def test_merge_api_errors_keep_github_reason_and_next_action(status, instruction):
@@ -147,7 +149,7 @@ def test_merge_api_errors_keep_github_reason_and_next_action(status, instruction
 
 def enable(home, reporter):
     data = yaml.safe_load(home.config.read_text())
-    data["repair"] = {"auto_merge": {"enabled": True}}
+    data["fix"] = {"auto_merge": {"enabled": True}}
     home.config.write_text(yaml.safe_dump(data))
     reporter.config = home.load()
 
@@ -165,7 +167,7 @@ def test_one_required_validation_can_merge(home, prepared, repairable, github, p
     _, _, reporter, _, _, issue = repairable
     enable(home, reporter)
     data = yaml.safe_load(home.config.read_text())
-    data["repair"]["auto_merge"]["required_validations"] = 1
+    data["fix"]["auto_merge"]["required_reviews"] = 1
     home.config.write_text(yaml.safe_dump(data))
     if not protected:
         github["protection"] = None
@@ -204,7 +206,7 @@ def test_automatic_validation_collects_two_models_and_merges_once(
         },
         hashlib.sha256(home.config.read_bytes()).hexdigest(),
     )
-    result = asyncio.run(run_scans(home, config, "acme/repo", stage="validate"))
+    result = asyncio.run(run_scans(home, config, "acme/repo", stage="review"))
     assert result["valid"], json.dumps(result, indent=2)
     assert len(result["scans"]) == 2
     link = records(store, "acme/repo", "pull_request")[0]
@@ -228,10 +230,10 @@ def test_pinned_model_needs_another_model_and_checks_can_finish_later(
     assert validate(home)["valid"]
     pull = next(iter(github["pulls"].values()))
     assert "1/2" in summary(github, pull["number"]) and not github["merges"]
-    with pytest.raises(ValueError, match="previous validators"):
+    with pytest.raises(ValueError, match="previous review agents"):
         validate(home)
     result = asyncio.run(
-        run_scans(home, home.load(), "acme/repo", stage="validate", model="other-validator")
+        run_scans(home, home.load(), "acme/repo", stage="review", model="other-validator")
     )
     assert result["valid"], result
     link = records(store, "acme/repo", "pull_request")[0]
@@ -262,7 +264,7 @@ def test_merge_response_reconciliation_never_blindly_retries(
     else:
         github[failure] = True
     result = asyncio.run(
-        run_scans(home, home.load(), "acme/repo", stage="validate", model="other-validator")
+        run_scans(home, home.load(), "acme/repo", stage="review", model="other-validator")
     )
     assert result["valid"], result
     state = store.one("SELECT state FROM pr_actions WHERE action='merge'")["state"]
@@ -301,7 +303,7 @@ def test_revision_movement_during_checks_prevents_merge(
     github["statuses"][0]["state"] = "pending"
     assert validate(home)["valid"]
     result = asyncio.run(
-        run_scans(home, home.load(), "acme/repo", stage="validate", model="other-validator")
+        run_scans(home, home.load(), "acme/repo", stage="review", model="other-validator")
     )
     assert result["valid"], result
     github["statuses"][0]["state"] = "success"
@@ -331,7 +333,7 @@ def test_forced_revalidation_cannot_merge_using_old_votes(
     github["statuses"][0]["state"] = "pending"
     assert validate(home)["valid"]
     second = asyncio.run(
-        run_scans(home, home.load(), "acme/repo", stage="validate", model="other-validator")
+        run_scans(home, home.load(), "acme/repo", stage="review", model="other-validator")
     )
     assert second["valid"], second
     github["statuses"][0]["state"] = "success"
@@ -351,7 +353,7 @@ def test_integration_pool_blocks_generic_sync_until_capacity_available(
     store, _, reporter, _, _, _ = repairable
     enable(home, reporter)
     data = yaml.safe_load(home.config.read_text())
-    data["repair"]["auto_merge"]["required_validations"] = 1
+    data["fix"]["auto_merge"]["required_reviews"] = 1
     data["pipeline"] = {"pools": {"integrate": 0}}
     home.config.write_text(yaml.safe_dump(data))
     assert validate(home)["valid"]
