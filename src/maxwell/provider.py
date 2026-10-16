@@ -222,14 +222,19 @@ class CLIProvider:
                         except (ValueError, TypeError):
                             continue
 
+        async def deliver_prompt():
+            try:
+                process.stdin.write(prompt.encode())
+                await process.stdin.drain()
+            finally:
+                process.stdin.close()
+
         try:
             on_start(process.pid)
-            process.stdin.write(prompt.encode())
-            await process.stdin.drain()
-            process.stdin.close()
             tasks = [
                 asyncio.create_task(capture(process.stdout, artifact / "events.jsonl", True)),
                 asyncio.create_task(capture(process.stderr, artifact / "stderr.log")),
+                asyncio.create_task(deliver_prompt()),
                 asyncio.create_task(process.wait()),
             ]
             timeout = self.config.limits.scan_timeout_seconds
