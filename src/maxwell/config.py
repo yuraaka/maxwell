@@ -198,7 +198,7 @@ class Limits(Settings):
     daily_scan_limit: int = Field(default=20, ge=1)
 
 
-class MeasurementTests(Settings):
+class MeasureTests(Settings):
     command: list[str] = Field(min_length=1, max_length=100)
     cwd: str = "."
     runs: int = Field(default=5, ge=2)
@@ -222,7 +222,7 @@ class MeasurementTests(Settings):
         return value
 
 
-class MeasurementSettings(Settings):
+class MeasureSettings(Settings):
     complexity_threshold: int = Field(default=10, ge=1)
     clone_tokens: int = Field(default=50, ge=5, le=1000)
     clone_lines: int = Field(default=5, ge=1)
@@ -248,7 +248,7 @@ class MeasurementSettings(Settings):
     max_architecture_modules: int = Field(default=1000, ge=1)
     max_cohesion_members: int = Field(default=500, ge=2)
     auto_test_runtime_budget_seconds: float = Field(default=60, gt=0)
-    tests: dict[str, MeasurementTests] = Field(default_factory=dict)
+    tests: dict[str, MeasureTests] = Field(default_factory=dict)
 
     @field_validator("weights")
     @classmethod
@@ -282,6 +282,31 @@ class FixSettings(Settings):
     auto_merge: AutoMergeSettings = Field(default_factory=AutoMergeSettings)
 
 
+class ReviewCI(Settings):
+    checks: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        min_length=1, max_length=20
+    )
+    app_id: int | None = Field(default=None, gt=0)
+    poll_seconds: float = Field(default=30, ge=1)
+    timeout_seconds: float = Field(default=3600, ge=1)
+    measurement_check: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def designated_checks(self):
+        if len(set(self.checks)) != len(self.checks) or any(
+            not name.strip() for name in self.checks
+        ):
+            raise ValueError("CI check names must be nonempty and unique")
+        if self.measurement_check and self.measurement_check not in self.checks:
+            raise ValueError("measurement_check must be one of the designated checks")
+        return self
+
+
+class ReviewSettings(Settings):
+    ci: dict[str, ReviewCI] = Field(default_factory=dict)
+    max_fix_attempts: int = Field(default=3, ge=0)
+
+
 class StagePoolSizes(Settings):
     hunt: int = Field(default=10, ge=0)
     validation: int = Field(default=10, ge=0, alias="validate")
@@ -303,8 +328,9 @@ class Config(Settings):
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     providers: dict[str, ProviderSettings] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
-    measurement: MeasurementSettings = Field(default_factory=MeasurementSettings)
+    measure: MeasureSettings = Field(default_factory=MeasureSettings)
     fix: FixSettings = Field(default_factory=FixSettings)
+    review: ReviewSettings = Field(default_factory=ReviewSettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
 
     @model_validator(mode="before")
@@ -460,8 +486,8 @@ class Paths:
                     ProviderSettings,
                     ModelSettings,
                     Limits,
-                    MeasurementSettings,
-                    MeasurementTests,
+                    MeasureSettings,
+                    MeasureTests,
                     FixSettings,
                     AutoMergeSettings,
                     PipelineSettings,
@@ -474,7 +500,9 @@ class Paths:
                     for field in model.model_fields.values()
                     if field.alias
                 )
-                fields.update(("repair", "max_reviews_per_scan", "required_validations"))
+                fields.update(
+                    ("repair", "max_reviews_per_scan", "required_validations", "measurement")
+                )
                 errors = []
                 for error in exc.errors(
                     include_input=False, include_context=False, include_url=False
@@ -484,6 +512,7 @@ class Paths:
                         ".".join(str(key) if key in fields else "<key>" for key in keys) or "config"
                     )
                     replacements = {
+                        "measurement": "measure",
                         "repair": "fix",
                         "limits.max_reviews_per_scan": "limits.max_validations_per_scan",
                         "fix.auto_merge.required_validations": "fix.auto_merge.required_reviews",

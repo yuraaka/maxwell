@@ -35,6 +35,13 @@ from maxwell.records import (
 from maxwell.repair import RepairTarget, file_digests, recover_check, run_checks
 from maxwell.reporting import Reporter
 from maxwell.repositories import RepairMergeConflict, Repository, git
+from maxwell.review_ci import (
+    check_record,
+    covered_revision,
+    read_checks,
+    test_measurement,
+    wait_for_checks,
+)
 from maxwell.stages import agent_name, stage_from_storage
 
 
@@ -224,7 +231,9 @@ def snapshot_state(repository, worktree):
     )
 
 
-async def compute_measurement(repository, identity, sha, settings, profile, artifact, progress):
+async def compute_measurement(
+    repository, identity, sha, settings, profile, artifact, progress, *, ci_tests=None
+):
     artifact.mkdir()
     _, worktree = await prepare_snapshot(repository, identity, None, sha)
     try:
@@ -240,7 +249,12 @@ async def compute_measurement(repository, identity, sha, settings, profile, arti
             await analysis
             raise
         evidence, fingerprint = {"source": source}, None
-        if profile:
+        if ci_tests is not None:
+            added, reasons, tests, fingerprint = ci_tests
+            factors.update(added)
+            statuses.update(reasons)
+            evidence["tests"] = tests
+        elif profile:
             added, reasons, tests, fingerprint = await run_test_measurement(
                 repository, identity, None, sha, profile, artifact, progress, settings.source_roots
             )
@@ -266,6 +280,13 @@ async def compute_measurement(repository, identity, sha, settings, profile, arti
                 if isinstance(value, (int, float, str, bool))
             }
         policy = measurement_policy(settings, repository.record["name"])
+        if ci_tests is not None:
+            policy["tests"] = {
+                "source": "github-ci",
+                "protocol": tests.get("protocol"),
+                "runs": tests.get("valid_runs"),
+                "runtime_budget_seconds": profile.runtime_budget_seconds if profile else None,
+            }
         return MeasurementRecord(
             id=uuid.uuid4().hex,
             repository=repository.record["name"],
@@ -367,7 +388,7 @@ async def regression_replay(
         environment = {
             **profile.environment,
             "PYTHONPATH": os.pathsep.join(
-                [str(probe), *(str(base / root) for root in config.measurement.source_roots)]
+                [str(probe), *(str(base / root) for root in config.measure.source_roots)]
             )
             + (
                 os.pathsep + profile.environment["PYTHONPATH"]
@@ -440,6 +461,7 @@ Use concerns only for unresolved correctness, security, or regression risks that
 these require an inconclusive or not_repaired verdict. Put non-blocking metadata observations
 and optional improvements in notes. Do not treat an agent's instruction not to run tests as
 missing verification when the supplied host checks passed. Avoid duplicating patch comments.
+Checks with command ["github-ci", SHA] are pinned remote CI evidence, not local commands.
 Finding and current assessments: {target.model_dump_json()}
 Original finding source (bounded): {json.dumps(original)}
 Actual committed patch: {diff}
@@ -455,6 +477,7 @@ async def execute_validation(engine, job, on_progress=None):
     artifact = engine.paths.root / "artifacts" / job["id"]
     artifact.mkdir(parents=True, exist_ok=True)
     repository, worktree, provider, public = None, None, None, None
+    ci_evidence, ci_settings = None, None
     usage, cost, state, error = Usage(), 0, "failed", None
     summary = "Validation failed before preparation."
     manifest = {"execution_id": job["id"], "state": "preparing"}
@@ -564,7 +587,7 @@ async def execute_validation(engine, job, on_progress=None):
         try:
             profile, _ = test_profile(
                 base,
-                config.measurement,
+                config.measure,
                 job["repository"],
                 execution["repository"].get("directory"),
             )
@@ -578,9 +601,37 @@ async def execute_validation(engine, job, on_progress=None):
         hashes = file_digests(worktree, [path for path in tracked if path])
         check_artifact = artifact / "fixed-checks"
         check_artifact.mkdir()
-        save("running repaired host checks")
-        check = await run_checks(worktree, check_artifact, profile, config, started)
+        ci_settings = config.review.ci.get(job["repository"]) if not target.maintained_sha else None
+        if ci_settings:
+            save("checking GitHub CI coverage")
+            client = GitHub(
+                config.github.for_account(execution["repository"]["github_account"]),
+                on_status=progress,
+                account=execution["repository"]["github_account"],
+            )
+            try:
+                ci_sha = await covered_revision(repository, client, link, tested, token, progress)
+                if ci_sha:
+                    ci_evidence = await wait_for_checks(
+                        client, link, ci_sha, ci_settings, check_artifact, progress
+                    )
+            finally:
+                client.close()
+        if ci_evidence is not None:
+            check = check_record(ci_evidence, check_artifact)
+            save(f"GitHub CI {check.state}")
+        else:
+            save("running repaired host checks")
+            check = await run_checks(worktree, check_artifact, profile, config, started)
         public = public.model_copy(update={"checks": [check]})
+        if ci_evidence is not None and check.state != "passed":
+            state = "completed" if check.state == "failed" else "failed"
+            summary = (
+                "GitHub CI failed; returned to fix. "
+                if check.state == "failed"
+                else "GitHub CI did not pass; review remains inconclusive. "
+            ) + check.detail
+            return
         if (
             snapshot_state(repository, worktree) != before
             or file_digests(worktree, list(hashes)) != hashes
@@ -617,9 +668,7 @@ async def execute_validation(engine, job, on_progress=None):
             )
             public = public.model_copy(update={"replay": replay, "failures": failures})
         save(f"starting independent {role_name}")
-        diff = git(
-            "diff", "--no-ext-diff", "--no-textconv", public.base_sha, public.sha, cwd=worktree
-        )
+        diff = git("diff", "--no-ext-diff", "--no-textconv", link.base_sha, tested, cwd=worktree)
         if len(diff.encode()) > 256000:
             raise ValueError("repair patch exceeds validation context limit")
         from maxwell.provider import create_provider
@@ -638,16 +687,34 @@ async def execute_validation(engine, job, on_progress=None):
             or git("ls-files", "--others", "--exclude-standard", cwd=worktree)
         ):
             raise ValueError("review agent changed the read-only repair snapshot")
-        effective = config.measurement.model_copy(
+        effective = config.measure.model_copy(
             update={
                 "tests": {
-                    **config.measurement.tests,
+                    **config.measure.tests,
                     **({job["repository"]: profile} if profile else {}),
                 }
             }
         )
         for side, sha in (("before", link.base_sha), ("after", tested)):
             save(f"measuring {side} snapshot")
+            ci_tests = None
+            if ci_evidence is not None:
+                evidence = ci_evidence
+                if side == "before":
+                    client = GitHub(
+                        config.github.for_account(execution["repository"]["github_account"]),
+                        on_status=progress,
+                        account=execution["repository"]["github_account"],
+                    )
+                    try:
+                        evidence = await asyncio.to_thread(
+                            read_checks, client, job["repository"], sha, ci_settings
+                        )
+                    finally:
+                        client.close()
+                ci_tests = test_measurement(
+                    evidence, ci_settings, profile.runtime_budget_seconds if profile else None
+                )
             measured = await compute_measurement(
                 repository,
                 job["id"] + "-" + side,
@@ -656,6 +723,7 @@ async def execute_validation(engine, job, on_progress=None):
                 profile,
                 artifact / side,
                 progress,
+                ci_tests=ci_tests,
             )
             public = public.model_copy(update={side: measured})
         save("rechecking validation inputs on GitHub")
@@ -665,8 +733,27 @@ async def execute_validation(engine, job, on_progress=None):
             account=execution["repository"]["github_account"],
         )
         try:
+            if ci_evidence is not None:
+                refreshed = await wait_for_checks(
+                    client, link, ci_evidence["sha"], ci_settings, check_artifact, progress
+                )
+                if refreshed != ci_evidence:
+                    public = public.model_copy(
+                        update={
+                            "checks": [check_record(refreshed, check_artifact), *public.checks[1:]]
+                        }
+                    )
+                    raise ValueError(
+                        "GitHub CI evidence changed during review; retry this revision"
+                    )
             current = await collect_validation_targets(
-                Reporter(engine.store, client, config, engine.paths),
+                Reporter(
+                    engine.store,
+                    client,
+                    config,
+                    engine.paths,
+                    merge_issues=execution.get("merge_issues"),
+                ),
                 job["repository"],
                 issue=target.issue,
                 force=target.replace_validations,
@@ -703,6 +790,12 @@ async def execute_validation(engine, job, on_progress=None):
         if isinstance(exc, RepairMergeConflict) and public:
             public = public.model_copy(update={"merge_conflicts": exc.paths})
         error = (engine.config.redact(str(exc)).strip() or type(exc).__name__)[:2000]
+        if isinstance(exc, RepairMergeConflict) and public:
+            error += (
+                f"; repair required for PR #{target.pull_request.number}. "
+                f"Run maxwell scan {job['repository']} --stage fix --issue {target.issue}, "
+                f"then maxwell scan {job['repository']} --stage review --issue {target.issue} --force"
+            )
         summary = f"Validation failed: {error}"
         engine.log.warning("Validation %s failed: %s", job["id"], error)
     finally:

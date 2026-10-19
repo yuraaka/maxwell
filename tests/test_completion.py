@@ -47,6 +47,21 @@ printf '%s\n' "${COMPREPLY[@]}"
     return {value.strip() for value in result.stdout.splitlines() if value.strip()}
 
 
+def test_repeat_mode_flags_and_stage_ranges_complete(directory):
+    flags = complete(directory, "maxwell scan --")
+    assert {"--drain", "--infinite", "--stage"} <= flags
+    assert "--repair-all" not in flags
+    for mode in ("--drain", "--infinite"):
+        assert complete(directory, f"maxwell scan {mode} --stage validate-") == {
+            "validate-",
+            "validate-validate",
+            "validate-audit",
+            "validate-fix",
+            "validate-review",
+            "validate-integrate",
+        }
+
+
 @pytest.fixture
 def catalog(home, source):
     data = yaml.safe_load(home.config.read_text())
@@ -117,6 +132,12 @@ def catalog(home, source):
         ("scan --stage=a", {"audit"}),
         ("scan --priority ", {"P0", "P1", "P2", "P3"}),
         ("scan --st", {"--stage"}),
+        ("scan --sk", {"--skip"}),
+        (
+            "scan --skip ",
+            {"source", "tests", "hunt", "validate", "audit", "fix", "review", "integrate"},
+        ),
+        ("measure --skip ", {"source", "tests"}),
     ],
 )
 def test_static_completion_without_configuration(directory, suffix, expected):

@@ -154,7 +154,7 @@ async def run_test_measurement(
                 try:
                     await asyncio.wait_for(process.wait(), profile.timeout_seconds)
                 except TimeoutError:
-                    invalid.append(f"Run {index + 1}: timeout")
+                    invalid.append(f"Run {index + 1}: timeout after {profile.timeout_seconds:g}s")
                     continue
             duration = time.monotonic() - start
             read_progress()
@@ -218,7 +218,9 @@ async def run_test_measurement(
     }
     factors, status = {}, {}
     if len(runs) != profile.runs or invalid:
-        reason = "Repeated test execution incomplete"
+        reason = "Repeated test execution incomplete: " + "; ".join(invalid[:3])
+        if any("timeout after" in failure for failure in invalid):
+            reason += "; increase measure.tests.<owner/repo>.timeout_seconds for longer suites"
         return (
             factors,
             dict.fromkeys(("test_runtime", "test_flakiness"), reason),

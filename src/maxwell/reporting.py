@@ -259,7 +259,7 @@ def record_report(record):
             for note in record.result.notes:
                 body += f"\n**Note:** {note}\n"
         states = ", ".join(check.state for check in record.checks) or "unavailable"
-        body += f"\nHost checks: **{states}**.\n"
+        body += f"\nTest checks: **{states}**.\n"
         body += "\nObserved maintenance entropy reduction: "
         body += (
             f"**{changes['reduction']:+.2f} points**.\n"
@@ -279,7 +279,8 @@ def record_report(record):
                 if comment.suggestion:
                     body += f"\n```suggestion\n{comment.suggestion}\n```\n"
         for check in record.checks:
-            body += f"\nRepaired host check: **{check.state}**, exit {check.returncode}, {check.seconds:.2f}s. {check.detail}\n"
+            source = "GitHub CI" if check.command[:1] == ["github-ci"] else "Repaired host check"
+            body += f"\n{source}: **{check.state}**, exit {check.returncode}, {check.seconds:.2f}s. {check.detail}\n"
         if record.replay:
             body += f"\nOriginal-source regression replay: **{record.replay.state}**, exit {record.replay.returncode}. {record.replay.detail}\n"
         first = measurement_contributions(record.before) if record.before else None

@@ -168,7 +168,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
         bodies = [issue["body"] for issue in github["issues"].values()] + [
             comment["body"] for comments in github["comments"].values() for comment in comments
         ]
-        assert "| Recorded API-equivalent cost (USD estimate) | $0.1350 |" in dashboard
+        assert "| Recorded API-equivalent cost (USD estimate) | $0 |" in dashboard
         assert "| Executions with unknown cost | 1 |" in dashboard
         assert "| Executions with partial cost | 1 |" in dashboard
         assert any("Cost: unknown" in body for body in bodies)
@@ -183,7 +183,7 @@ def test_reports_sum_execution_tokens_without_counting_findings_again(
         )
         assert decode_record(finding_body).allocated_cost_micros is None
         assert decode_record(finding_body).spending == usages[0].spending
-        assert "$0.1230 USD" in finding_body
+        assert "$0 USD" in finding_body
         assert "shared hunt execution cost" in finding_body
     finally:
         client.close()

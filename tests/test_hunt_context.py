@@ -3,7 +3,7 @@ import json
 import pytest
 
 from maxwell.cli import execute, parser
-from maxwell.config import Limits, MeasurementSettings, Paths
+from maxwell.config import Limits, MeasureSettings, Paths
 from maxwell.hunt_context import measurement_context, previous_hunt, revision_changes
 from maxwell.measurement import ANALYZER, POLICY, digest, measurement_policy
 from maxwell.records import ExecutionRecord, MeasurementFactor, MeasurementRecord, PublicAgent
@@ -29,7 +29,7 @@ def execution(sha, number=1, **changes):
 
 
 def measurement(sha, settings=None, number=10, **changes):
-    policy = measurement_policy(settings or MeasurementSettings(), "acme/repo")
+    policy = measurement_policy(settings or MeasureSettings(), "acme/repo")
     return MeasurementRecord(
         **{
             "id": f"{number:032x}",
@@ -146,7 +146,7 @@ def test_latest_applicable_measurement_includes_baseline_hotspots_and_provenance
         measurement(sha, number=13, protocol="invalid"),
     ]:
         project(store, record)
-    result = measurement_context(store, "acme/repo", sha, MeasurementSettings())
+    result = measurement_context(store, "acme/repo", sha, MeasureSettings())
     assert result["id"] == current.id and result["baseline"]["id"] == baseline.id
     assert result["at_current_revision"]
     assert not result["stage_provenance"]["source"]["at_current_revision"]
@@ -166,18 +166,18 @@ def test_unavailable_or_incompatible_measurements_stay_unknown(store, source, st
     record = measurement(sha)
     project(store, record)
     assert not measurement_context(
-        store, "acme/repo", sha, MeasurementSettings(complexity_threshold=20)
+        store, "acme/repo", sha, MeasureSettings(complexity_threshold=20)
     )["available"]
     with store.db:
         store.db.execute("UPDATE github_records SET status=?", (status,))
-    result = measurement_context(store, "acme/repo", sha, MeasurementSettings())
+    result = measurement_context(store, "acme/repo", sha, MeasureSettings())
     assert not result["available"] and "No published measurement" in result["reason"]
 
 
 def test_malformed_optional_hotspots_remain_unknown_without_blocking_context(store, source):
     sha = git("rev-parse", "HEAD", cwd=source)
     project(store, measurement(sha, evidence={"source": {"complex_functions": None}}))
-    result = measurement_context(store, "acme/repo", sha, MeasurementSettings())
+    result = measurement_context(store, "acme/repo", sha, MeasureSettings())
     assert result["available"] and result["hotspots"]["complex_functions"] is None
 
 
@@ -270,7 +270,7 @@ def test_hunt_context_reconstructs_from_github_in_a_fresh_home(
         for issue in github["issues"].values()
         if "<!-- maxwell:dashboard:v1 -->" in issue["body"]
     )
-    record = measurement(first["sha"], home.load().measurement)
+    record = measurement(first["sha"], home.load().measure)
     github["comments"].setdefault(dashboard["number"], []).append(
         {"id": 9999, "body": record_report(record), "user": {"login": "maintainer"}}
     )
@@ -304,11 +304,11 @@ def test_hunt_context_reconstructs_from_github_in_a_fresh_home(
 def test_auto_test_policy_and_architecture_hotspots_reach_hunters(store, source):
     import sys
 
-    from maxwell.config import MeasurementTests
+    from maxwell.config import MeasureTests
 
-    settings = MeasurementSettings(
+    settings = MeasureSettings(
         tests={
-            "acme/repo": MeasurementTests(
+            "acme/repo": MeasureTests(
                 command=[sys.executable, "-m", "pytest", "-q"],
                 runs=2,
                 warmups=0,
@@ -330,7 +330,7 @@ def test_auto_test_policy_and_architecture_hotspots_reach_hunters(store, source)
         },
     )
     project(store, record)
-    context = measurement_context(store, "acme/repo", sha, MeasurementSettings())
+    context = measurement_context(store, "acme/repo", sha, MeasureSettings())
     assert context["available"]
     assert context["hotspots"]["coupling_hotspots"][0]["reachable_dependencies"] == 3
     assert context["hotspots"]["cohesion_hotspots"][0]["symbol"] == "Mixed"

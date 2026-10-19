@@ -73,7 +73,7 @@ def parser():
     measure.add_argument("repository", nargs="?")
     measure.add_argument("--revision", help="Pinned commit SHA (default: registered branch)")
     measure.add_argument(
-        "--skip-stage",
+        "--skip",
         action="append",
         choices=["source", "tests"],
         default=[],
@@ -135,14 +135,14 @@ def parser():
     scan.add_argument("repository", nargs="?")
     pipeline = scan.add_mutually_exclusive_group()
     pipeline.add_argument(
-        "--repair-all",
+        "--drain",
         action="store_true",
-        help="Drain existing findings through validate, audit, fix, review, integrate",
+        help="Repeat selected stages until no further progress is possible",
     )
     pipeline.add_argument(
         "--infinite",
         action="store_true",
-        help="Continuously hunt and process findings within configured stage pool sizes",
+        help="Repeat selected stages continuously within configured stage pool sizes",
     )
     scan.add_argument(
         "--stage",
@@ -151,7 +151,7 @@ def parser():
         help="Select hunt, validate, audit, fix, review, integrate; START-END is inclusive, START- runs to the end",
     )
     scan.add_argument(
-        "--skip-stage",
+        "--skip",
         action="append",
         default=[],
         choices=SKIPPABLE_STAGES,
@@ -323,8 +323,8 @@ def execute(args):
                 config,
                 args.repository,
                 revision=args.revision,
-                run_tests="tests" not in args.skip_stage,
-                skip_source="source" in args.skip_stage,
+                run_tests="tests" not in args.skip,
+                skip_source="source" in args.skip,
                 on_progress=None if args.json else measurement_line,
             )
         )
@@ -366,8 +366,8 @@ def execute(args):
                     issue=args.issue,
                     limit=args.limit,
                     force=args.force,
-                    skip_stages=args.skip_stage,
-                    repair_all=args.repair_all,
+                    skip_stages=args.skip,
+                    drain=args.drain,
                     infinite=args.infinite,
                     on_progress=display,
                 )

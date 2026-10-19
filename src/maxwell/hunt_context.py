@@ -203,7 +203,7 @@ def revision_changes(worktree, sha, previous, limits):
 
 
 async def build_hunt_context(store, repository, sha, worktree, config):
-    measurement = measurement_context(store, repository, sha, config.measurement)
+    measurement = measurement_context(store, repository, sha, config.measure)
     changes = await asyncio.to_thread(
         revision_changes, worktree, sha, previous_hunt(store, repository), config.limits
     )

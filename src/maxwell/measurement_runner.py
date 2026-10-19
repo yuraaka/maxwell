@@ -12,7 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
-from maxwell.config import MeasurementTests
+from maxwell.config import MeasureTests
 from maxwell.github import GitHub
 from maxwell.measurement import (
     ANALYZER,
@@ -78,9 +78,9 @@ def test_profile(worktree, settings, repository, checkout=None):
     if interpreter is None:
         return (
             None,
-            "Pytest suite detected but no pytest runner is available; configure measurement.tests",
+            "Pytest suite detected but no pytest runner is available; configure measure.tests",
         )
-    return MeasurementTests(
+    return MeasureTests(
         command=[interpreter, "-m", "pytest", "-q"],
         runs=2,
         warmups=0,
@@ -156,7 +156,7 @@ async def measure_one(
             asyncio.to_thread(
                 test_profile,
                 worktree,
-                config.measurement,
+                config.measure,
                 repository_record["name"],
                 repository_record.get("directory")
                 or (
@@ -171,10 +171,10 @@ async def measure_one(
         except asyncio.CancelledError:
             await profiling
             raise
-        effective_settings = config.measurement.model_copy(
+        effective_settings = config.measure.model_copy(
             update={
                 "tests": {
-                    **config.measurement.tests,
+                    **config.measure.tests,
                     **({repository_record["name"]: profile} if profile else {}),
                 }
             }
@@ -222,7 +222,7 @@ async def measure_one(
         if not skip_source:
             progress("measuring Python source")
             analysis = asyncio.create_task(
-                asyncio.to_thread(python_measurement, worktree, config.measurement)
+                asyncio.to_thread(python_measurement, worktree, config.measure)
             )
             try:
                 added, reasons, source = await asyncio.shield(analysis)
@@ -243,7 +243,7 @@ async def measure_one(
                 profile,
                 artifact,
                 progress,
-                config.measurement.source_roots,
+                config.measure.source_roots,
             )
             factors.update(added)
             status.update(reasons)
@@ -263,7 +263,7 @@ async def measure_one(
             policy_version=POLICY,
             coverage=min(sum(policy["weights"][name] for name in factors), 1),
             factors=factors,
-            exclusions=config.measurement.exclude,
+            exclusions=config.measure.exclude,
             measured_at=time.time(),
             protocol=digest(policy),
             policy=policy,

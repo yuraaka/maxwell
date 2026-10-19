@@ -399,15 +399,15 @@ Use `scan --stage hunt|validate|audit|fix|review|integrate` to execute one stage
 Intervals are inclusive: `--stage hunt-review` runs hunt through review, and `--stage hunt-`
 runs hunt through integrate. Explicit stage selections reuse published measurements; only
 the default full scan measures first. `--issue`, `--limit`, and `--force` require a single stage.
-`--skip-stage` applies to the default full scan, including `--skip-stage fix`.
+`--skip` applies to the default full scan, including `--skip fix`.
 
 Config files must explicitly set `version: 2`; version 1 and unversioned files are rejected.
 There is no automatic migration or legacy config alias support. Rename old pool `review`
 to `validate`, old pool `validate` to `review`, and `repair` to `fix` together.
 Also rename the root `repair` section to `fix`, `limits.max_reviews_per_scan` to
 `limits.max_validations_per_scan`, and `fix.auto_merge.required_validations` to
-`fix.auto_merge.required_reviews`. Keep the values attached to their original responsibilities,
-then run `maxwell config apply`. The CLI still accepts `repair` as an alias for `fix`.
+`fix.auto_merge.required_reviews`. Rename the root `measurement` section to `measure`.
+Keep the values attached to their original responsibilities, then run `maxwell config apply`. The CLI still accepts `repair` as an alias for `fix`.
 CLI `review` and `validate` now always use the new meanings. Historical GitHub record roles,
 labels, branch names, and SQLite stage identifiers keep their original representation so
 published evidence and execution history remain valid.
@@ -424,21 +424,32 @@ Provider aliases select local connections; published identities use `codex` or `
 ### Drain existing findings or maintain the pipeline
 
 ```bash
-maxwell scan owner/repo --repair-all
+maxwell scan owner/repo --stage validate- --drain
+maxwell scan owner/repo --stage validate- --infinite
+maxwell scan owner/repo --stage review-integrate --drain
 maxwell scan owner/repo --infinite
 ```
 
-`--repair-all` snapshots the existing open structured findings on GitHub and processes
-missing reviews/audits, repairs, independent validations, eligible auto-merges, and
-verification on main. It stops when no remaining transition can run, and reports what
-is still waiting. Findings arriving later belong to the next batch. It never hunts.
+`--stage` selects the work; `--drain` and `--infinite` control repetition. Without either
+flag, scan makes one pass through the selected stages. Both repeat modes respect pool
+capacities and prioritize downstream work within the selected interval.
 
-`--infinite` keeps reconciling GitHub until Ctrl+C. It drains downstream work first,
-then hunts when there is capacity. Each repository gets one execution per scheduling
-round. Models are sampled using the existing reputation policy, with independent
-review agent identities. `--provider` can constrain the pool of models; a single pinned
-`--model` cannot be used with these modes. `--stage`, `--issue`, `--limit`, `--force`,
-and `--skip-stage` select a different workflow and cannot be combined with them.
+`--drain` snapshots the existing open structured findings on GitHub, processes the selected
+stages until no further progress is possible, reports remaining blockers, and exits.
+If hunt is selected, it runs at most once per repository and adds its findings to the batch.
+Other findings arriving later belong to the next batch. `--stage validate- --drain` replaces
+`--repair-all`, which is no longer accepted.
+
+`--infinite` keeps reconciling GitHub until Ctrl+C, admitting new eligible findings and
+waiting when idle or blocked. It hunts only when hunt is selected and its pool has capacity.
+Without `--stage`, both modes select the full pipeline; before hunting they measure each
+new source revision. Explicit stage selections reuse published measurements.
+
+Each repository gets one execution per scheduling round. Models are sampled using the
+existing reputation policy, with independent review agent identities. `--provider` can
+constrain the pool of models; a single pinned `--model` cannot be used with these modes.
+`--issue`, `--limit`, `--force`, and `--skip` cannot be combined with them.
+Auto-merge runs only when review is selected and `fix.auto_merge` allows it.
 
 Configure the maximum number of issues waiting **after** each stage:
 
@@ -509,7 +520,7 @@ Maxwell creates `maxwell/repair/<execution-id>` in its local mirror and retains 
 worktree. The base is the finding's original pinned revision; newer main changes
 may require later integration. Your maintained checkout stays unchanged. The fix agent
 edits source and adds regression coverage; Maxwell runs the configured
-`measurement.tests.<owner/repo>.command` **once**, or detects the existing pytest
+`measure.tests.<owner/repo>.command` **once**, or detects the existing pytest
 suite. The command is selected before editing. Configure a runner for other test
 frameworks. A missing runner, failing checks, no edits, or missing bug regression
 coverage does not produce a prepared repair.
@@ -540,7 +551,8 @@ the same PR with an exact lease before fresh independent validation. A validatio
 conflicts applies `maxwell:validation:conflicted`. Pending checks, required human approvals,
 and access restrictions wait with diagnostics. A fix agent reporting blocked or failed host checks
 waits for changed inputs or an explicit `--force` retry; operational failures remain retryable.
-Generic validation failures remain validation work; they do not trigger a rewrite of the repair.
+Operational review failures remain review work; actionable source feedback and merge blockers
+return the existing PR to fix.
 `--limit` is rejected for repair.
 
 ### Independently review a repair PR
@@ -551,7 +563,8 @@ maxwell scan owner/repo --stage review --issue 12
 maxwell scan owner/repo --stage review --provider codex-work --model your-review-model
 ```
 
-Validation handles **one PR per invocation**, fetching its exact head and target base.
+Review handles **one PR per invocation**, with a bounded fix/review loop, fetching each
+revision's exact head and target base.
 It tests a fresh merge candidate against that base and independently inspects the patch.
 Public worktree paths are never used to locate source. The review agent uses a **different
 public adapter/model from the fix agent**; provider aliases and effort changes do not establish
@@ -565,7 +578,7 @@ failures, or unsupported replay runners leave reproduction unresolved. Passing t
 lower entropy alone cannot establish correctness.
 
 Immutable validation records are published **on the PR**. One updated verdict summary
-shows host evidence and measured component changes. Actionable patch comments become
+shows local or GitHub CI evidence and measured component changes. Actionable patch comments become
 inline GitHub `COMMENT` reviews, pinned to the inspected head. Shared-account validate agents
 use comment reviews rather than GitHub approval/request-changes events. Feedback whose
 line cannot be anchored stays in the summary.
@@ -593,6 +606,109 @@ reduction requires all five compatible factors; partial component observations r
 visible. These measurements do not replace the main repository baseline. fix agent reputation
 uses independent accepted/rejected validation of the fix agent's exact revision; external edits,
 conflicting verdicts, operational failures, and integration checks add no fix agent quality credit.
+
+### Review and fix recovery loop
+
+`maxwell scan owner/repo --stage review --force` follows actionable review feedback through
+`review → fix → review` on the same finding and PR. Conflicts, failed CI, rejected source
+reviews, and inconclusive reviews with blocking concerns or actionable comments return to
+`fix`. The fixer receives all current structured review feedback and merge/check blockers.
+Each amendment uses the fresh target base when the PR does not already contain it, preserving
+unrelated target-branch changes. A new independent review checks the published amendment.
+
+```yaml
+review:
+  max_fix_attempts: 3
+```
+
+The limit counts automatic fix attempts for a review invocation. Set it to `0` to disable
+recovery for review-only commands; an explicit `--skip fix` also disables nested recovery.
+`--model` pins the review model; recovery chooses a different verified model from the configured
+pool. If no independent model is available, Maxwell stops with a diagnostic rather than using
+the review model as its own fixer. Budget limits still apply to each execution.
+
+The progress panel announces recovery and displays `fix` while it runs. The final output
+marks an earlier failed review `[RECOVERED]` only after the new revision is accepted. All
+executions, costs, and immutable GitHub records remain available. Failed fix checks, failed
+publication, missing actionable evidence, and exhausted retries remain explicit failures;
+transport/provider failures do not cause speculative source edits.
+
+`--stage review --drain` and `--stage review --infinite` may also run dependency fixes for
+existing repair PRs. They do not start unrelated new repairs. New review feedback permits
+another bounded fix attempt; repeated unchanged inputs remain blocked by the execution ledger.
+Batch output retains its historical failed-execution count even if a later attempt succeeds.
+
+### Reuse GitHub CI during review
+
+Designate the GitHub check names that run the repository's test suite:
+
+```yaml
+review:
+  ci:
+    owner/repo:
+      checks: [tests] # Exact check-run names or commit-status contexts; include every matrix job.
+      poll_seconds: 30
+      timeout_seconds: 3600
+      # app_id: 15368 # Optional publisher ID for check runs; excludes legacy commit statuses.
+      # measurement_check: tests # Optional structured test measurements in this check's output.text.
+```
+
+Run `maxwell config apply`, then `maxwell scan owner/repo --stage review`.
+Already completed reviews require `--force` to run again. Check names are explicit because
+passing lint, formatting, or an unrelated workflow cannot establish test-suite coverage.
+The GitHub token needs Checks read access and, unless `app_id` is set, Commit statuses read
+access. A configured check that has not appeared yet is treated as pending; correct a misspelled name
+or wait for CI to start. No branch-protection settings are required.
+
+Maxwell reuses successful checks on a commit whose Git tree matches the reviewed merge
+candidate: the PR head or GitHub's synthetic merge commit. Head/base changes invalidate the
+review. Missing or running designated checks are polled with progress diagnostics, without
+starting the review agent. API request time, including quota waits, does not consume the
+CI waiting timeout. Failed CI returns the finding to `fix`, with check names, URLs,
+and failure summaries. Skipped, neutral, and cancelled checks do not count as passing.
+Duplicate check names from different publishers require `app_id` to disambiguate them.
+GitHub access errors remain errors; they do not silently become passing evidence.
+
+With reusable CI, review skips the local full suite and repeated local test measurements.
+It still runs targeted regression coverage on the fixed and original source and asks an
+independent agent to review the patch and evidence. CI is rechecked after the agent finishes
+and before auto-merge. If CI changes during review, the result remains inconclusive and needs
+a retry. Repositories without a `review.ci` entry use local tests, as do merge candidates
+whose content is not covered by the available CI revisions. `fix`, `measure`, and `integrate`
+retain their existing local checks.
+
+For runtime and flakiness, a green check is insufficient. An optional `measurement_check`
+(must also be in `checks`) can publish raw JSON in its Check Run `output.text`:
+
+```json
+{
+  "version": 1,
+  "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "environment_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "protocol": "full-pytest-suite-v1",
+  "runs": [
+    {"duration_seconds": 12.0, "outcomes": {"tests/test_app.py::test_empty": "passed"}},
+    {"duration_seconds": 13.0, "outcomes": {"tests/test_app.py::test_empty": "passed"}}
+  ]
+}
+```
+
+The publisher must include every collected test and only complete measured runs, excluding
+warmups. Supported outcomes are `passed`, `failed`, and `skipped`. Each of the 2–20 runs must
+contain the same test IDs. `sha` must match the check's commit; use actual values rather than
+the placeholders above. The environment fingerprint is a SHA-256 digest of runner platform,
+runtime/tool versions, dependencies, and relevant test environment. Change `protocol` when
+the suite selection or measurement procedure changes. Do not include the source revision in
+the environment fingerprint, since equivalent environments must compare across revisions.
+
+Maxwell calculates median duration against `measure.tests.<owner/repo>.runtime_budget_seconds`
+(or the auto-detected runtime budget), and observed flaky tests divided by eligible tests.
+Before/after comparisons require compatible measurement policies, protocols, run counts, and
+environments. Publish the same report format for base-branch CI to supply the before evidence.
+Missing, incomplete, or invalid reports leave the affected factors unknown, with a reason;
+Maxwell does not rerun the whole suite to fill them. This input accepts Maxwell's JSON format,
+not arbitrary JUnit files or workflow job durations. Existing CI publishers can construct the
+report from their test results; Maxwell does not install or modify workflows automatically.
 
 ### Automatically merge verified repairs
 
@@ -622,7 +738,8 @@ Maxwell uses GitHub's mergeability result and merge API to respect the repositor
 configured requirements, including branch protection and rulesets. CI, required checks,
 administrator enforcement, and GitHub's **Allow auto-merge** setting are not prerequisites:
 Maxwell sends an ordinary merge request after its own validation passes. Non-required
-checks do not introduce extra Maxwell merge restrictions. Repositories without CI or
+checks do not introduce extra Maxwell merge restrictions unless explicitly designated in
+`review.ci`; checks used as review evidence must still pass before merge. Repositories without CI or
 protection can merge normally. The token needs repository access with Contents and
 Pull requests write permissions; administration-read permission is not required.
 Maxwell does not change repository rules or request an administrative bypass.
@@ -651,7 +768,7 @@ maxwell scan owner/repo --stage integrate --issue 12
 
 Full `maxwell scan` runs also execute fix and process pending PR review and integration, one PR per
 stage (with additional validation models when auto-merge is enabled).
-`--skip-stage review` and `--skip-stage integrate` disable those stages. Generic
+`--skip review` and `--skip integrate` disable those stages. Generic
 GitHub synchronization updates PR state and reconciles publications without launching models.
 Skipped validation/integration stages report the specific PR blocker, including awaiting
 merge and the current auto-merge reason, instead of a generic “No eligible findings.”
@@ -944,25 +1061,28 @@ quality failures. Model routing remains configured rather than adaptive.
 
 ```bash
 maxwell measure owner/repo
-maxwell measure owner/repo --skip-stage tests
-maxwell measure owner/repo --skip-stage source --skip-stage tests
+maxwell measure owner/repo --skip tests
+maxwell measure owner/repo --skip source --skip tests
 maxwell measure owner/repo --revision FULL_COMMIT_SHA --json
 ```
 
-Measurement requires a registered repository and its GitHub credentials, with no
+`measure` requires a registered repository and its GitHub credentials, with no
 provider or model selection. It analyzes a pinned committed snapshot without changing
 your checkout. A full `maxwell scan` measures first, then runs hunt, validate, audit, fix, review, and integrate.
-By default measurement runs source analysis and tests in separate disposable snapshots.
+By default `measure` runs source analysis and tests in separate disposable snapshots.
 When no test profile is configured, a detected pytest suite uses the repository's existing
 `.venv` when available (registered checkout or matching current checkout), then Maxwell's Python
 if it has pytest. It performs two measured runs, with no warmup and a 60-second runtime budget. Pytest must already be
-installed. Set `measurement.auto_test_runtime_budget_seconds` to change that budget; configure
-a repository test profile to select another interpreter, environment, run count, or budget. Structural analysis never imports source modules. Use a trusted
+installed. Set `measure.auto_test_runtime_budget_seconds` to change the scoring budget.
+Each automatically detected test run has a 600-second timeout. For longer suites, configure
+`measure.tests.<owner/repo>.timeout_seconds` along with the test command. The runtime budget
+affects the entropy score; the timeout stops execution. A repository test profile can also
+select another interpreter, environment, run count, or budget. Structural analysis never imports source modules. Use a trusted
 local test environment: a disposable worktree is not an operating-system sandbox.
 Maxwell does not install dependencies or inherit provider/GitHub credentials into tests.
 
-Use repeatable `--skip-stage source` or `--skip-stage tests` arguments on `measure` or `scan`
-to disable measurement stages. A full scan also accepts `--skip-stage hunt`, `validate`, or `audit`;
+Use repeatable `--skip source` or `--skip tests` arguments on `measure` or `scan`
+to disable measurement stages. A full scan also accepts `--skip hunt`, `validate`, or `audit`;
 `--stage hunt|validate|audit` still runs just that agent stage using published measurement context.
 Source covers complexity, duplication, and coupling; tests covers runtime and flakiness.
 Skipped stages reuse the latest compatible usable GitHub measurement, including across
@@ -975,7 +1095,7 @@ stages reuse history; failed or incomplete active stages retain their actual out
 Configure the test profile by repository in `config.yaml`:
 
 ```yaml
-measurement:
+measure:
   tests:
     owner/repo:
       command: [/absolute/path/to/venv/bin/python, -m, pytest, -q]
@@ -1038,7 +1158,7 @@ Dynamic imports, parse failures, ambiguous module names, empty populations, and 
 resource limits are reported as unavailable evidence rather than healthy zero values.
 
 All thresholds, exclusions, source roots, weights, and resource limits are configurable
-under `measurement`; see `config.example.yaml`. All five positive weights must sum to 1.
+under `measure`; see `config.example.yaml`. All five positive weights must sum to 1.
 The full aggregate is unknown until every factor has usable evidence. Missing test
 profiles, absent runtime budgets, and incomplete runs never redistribute factor weights.
 The report shows measured factor weight and Python file coverage separately. This first

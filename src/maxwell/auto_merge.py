@@ -132,6 +132,30 @@ async def integration_pool_blocker(reporter, repo):
     return None
 
 
+async def ci_evidence_blocker(reporter, repo, link, pull):
+    from maxwell.repair_pull_requests import active_validations
+    from maxwell.review_ci import read_checks
+
+    revisions = {
+        check.command[1]
+        for record in active_validations(reporter.store, repo, link)
+        for check in record.checks
+        if len(check.command) == 2 and check.command[0] == "github-ci"
+    }
+    if not revisions:
+        return None
+    settings = reporter.config.review.ci.get(repo)
+    if settings is None:
+        return "CI review configuration changed; fresh review required"
+    for sha in revisions:
+        if sha not in (link.head_sha, pull.get("merge_commit_sha")):
+            return "CI-tested merge revision changed; fresh review required"
+        evidence = await reporter.call(read_checks, reporter.github, repo, sha, settings)
+        if evidence["state"] != "passed":
+            return f"GitHub CI is {evidence['state']} for {sha[:12]}; merge deferred"
+    return None
+
+
 async def try_auto_merge(reporter, repo, link, verdict):
     from maxwell.repair_pull_requests import check_pull, records
 
@@ -146,7 +170,7 @@ async def try_auto_merge(reporter, repo, link, verdict):
         return "merged; waiting for independent integration verification"
     allowed = getattr(reporter, "merge_issues", None)
     if allowed is not None and link.finding_issue not in allowed:
-        return "outside this pipeline's initial finding snapshot"
+        return "outside this pipeline's selected stages or finding scope"
     previous = reporter.store.one(
         "SELECT state FROM pr_actions WHERE repository=? AND id=? AND action='merge'",
         (repo, identity),
@@ -215,6 +239,9 @@ async def try_auto_merge(reporter, repo, link, verdict):
     if blocker:
         return blocker
     blocker = await integration_pool_blocker(reporter, repo)
+    if blocker:
+        return blocker
+    blocker = await ci_evidence_blocker(reporter, repo, link, final)
     if blocker:
         return blocker
     # Persist uncertainty before the mutation so a crash cannot cause a blind retry.

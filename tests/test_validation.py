@@ -22,7 +22,18 @@ _repairable = pytest.fixture(name="repairable")(repairable_fixture.__wrapped__)
 
 
 @pytest.fixture
-def prepared(home, repairable, executable, directory):
+def prepared(home, repairable, executable, directory, request):
+    import yaml
+
+    data = yaml.safe_load(home.config.read_text())
+    data["review"] = {"max_fix_attempts": 0}
+    home.config.write_text(yaml.safe_dump(data))
+    if hasattr(request, "param"):
+        executable.write_text(
+            executable.read_text().replace(
+                "['test_app.py'] if behavior", f"{request.param!r} if behavior"
+            )
+        )
     result = run(home)
     assert result["valid"], json.dumps(result, indent=2)
     repair = result["scans"][0]["repairs"][0]
@@ -52,6 +63,57 @@ def validate(home, **kwargs):
     return asyncio.run(
         run_scans(home, home.load(), "acme/repo", stage="review", model="validator-model", **kwargs)
     )
+
+
+@pytest.mark.parametrize(
+    "prepared",
+    [["test_app.py::test_empty", "test_app.py::test_empty[case/with/path]"]],
+    indirect=True,
+)
+def test_fix_accepts_pytest_selectors_and_review_replays_the_test_file(home, prepared):
+    assert prepared["regression_tests"] == ["test_app.py"]
+    result = validate(home)
+    assert result["valid"], result
+    record = result["scans"][0]["validations"][0]
+    assert record["outcome"] == "accepted"
+    assert record["replay"]["returncode"] == 1
+    assert "ZeroDivisionError" in record["failures"][0]["detail"]
+
+
+def test_review_diff_excludes_main_changes_inherited_by_updated_pr(
+    home, source, prepared, repairable, github
+):
+    store, _, _, _, _, _ = repairable
+    (source / "unrelated.txt").write_text("unrelated base content\n" * 14000)
+    git("add", "unrelated.txt", cwd=source)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@localhost",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "advance main",
+        cwd=source,
+    )
+    base = git("rev-parse", "HEAD", cwd=source)
+    repository = Repository(home, store.repository("acme/repo"))
+    repository.fetch_revision(base, None)
+    head, worktree = repository.merge_candidate("a" * 32 + "-updated-pr", prepared["commit"], base)
+    repository.cleanup(worktree)
+    pull = next(iter(github["pulls"].values()))
+    pull["base"]["sha"], pull["head"]["sha"] = base, head
+    github["branches"]["main"] = base
+    result = validate(home)
+    scan = result["scans"][0]
+    assert result["valid"], scan["error"]
+    assert scan["validations"][0]["outcome"] == "accepted"
+    prompt = (home.root / "artifacts" / scan["id"] / "prompt.txt").read_text()
+    diff = prompt.split("Actual committed patch: ", 1)[1].split("Host checks:", 1)[0]
+    assert "unrelated base content" not in diff
+    assert "app.py" in diff and "test_app.py" in diff
 
 
 def test_validation_notes_are_advisory_and_blockers_are_inconclusive(
@@ -299,7 +361,7 @@ def test_missing_runner_is_inconclusive(home, prepared, repairable):
     import yaml
 
     data = yaml.safe_load(home.config.read_text())
-    data.pop("measurement")
+    data.pop("measure")
     home.config.write_text(yaml.safe_dump(data))
     result = validate(home)
     assert result["valid"], json.dumps(result, indent=2)
@@ -595,7 +657,7 @@ def test_complete_comparable_measurements_report_total_delta(
     for comment in github["comments"][issue]:
         comment["body"] = comment["body"].replace(finding.sha, sha)
     data = yaml.safe_load(home.config.read_text())
-    data["measurement"]["tests"]["acme/repo"].update(runs=2, warmups=0, runtime_budget_seconds=60)
+    data["measure"]["tests"]["acme/repo"].update(runs=2, warmups=0, runtime_budget_seconds=60)
     home.config.write_text(yaml.safe_dump(data))
     assert run(home)["valid"]
     from unittest.mock import patch

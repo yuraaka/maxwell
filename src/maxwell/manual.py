@@ -56,7 +56,11 @@ async def execute_job(
                 )
         finally:
             client.close()
-    execution = {**execution, "stage": stored_stage(stage)}
+    execution = {
+        **execution,
+        "stage": stored_stage(stage),
+        "merge_issues": sorted(merge_issues) if merge_issues is not None else None,
+    }
     identifier = store.enqueue(record["name"], priority, execution=execution)
     job = store.claim(
         micros(config.limits.daily_budget_usd),
@@ -234,22 +238,20 @@ async def run_scans(
     force=False,
     on_progress=None,
     skip_stages=(),
-    repair_all=False,
+    drain=False,
     infinite=False,
 ):
     stages = select_stages(stage)
     single_stage = stages[0] if stage is not None and len(stages) == 1 else None
-    if repair_all and infinite:
-        raise ValueError("Choose either --repair-all or --infinite")
-    if (repair_all or infinite) and (
-        stage is not None or issue is not None or limit is not None or force or skip_stages
-    ):
+    if drain and infinite:
+        raise ValueError("Choose either --drain or --infinite")
+    if (drain or infinite) and (issue is not None or limit is not None or force or skip_stages):
         raise ValueError(
-            "--repair-all/--infinite cannot be combined with --stage, --issue, --limit, --force, or --skip-stage"
+            "--drain/--infinite cannot be combined with --issue, --limit, --force, or --skip"
         )
-    if (repair_all or infinite) and model is not None:
+    if (drain or infinite) and model is not None:
         raise ValueError(
-            "--repair-all/--infinite require automatic model selection for independent validation; omit --model"
+            "--drain/--infinite require automatic model selection for independent review; omit --model"
         )
     if single_stage in (None, "hunt") and (issue is not None or limit is not None or force):
         raise ValueError(
@@ -267,7 +269,7 @@ async def run_scans(
         raise ValueError("Unknown skipped stage")
     if stage is not None and skip_stages:
         raise ValueError(
-            "--skip-stage applies to the default full scan; use --stage to select a stage or interval"
+            "--skip applies to the default full scan; use --stage to select a stage or interval"
         )
     config.ready()
     with paths.lock.open("a+") as lock:
@@ -303,7 +305,7 @@ async def run_scans(
                     )
             engine.recover()
             recover_measurements(store, paths)
-            if repair_all or infinite:
+            if drain or infinite:
                 from maxwell.pipeline import run_pipeline
 
                 return await run_pipeline(
@@ -314,6 +316,8 @@ async def run_scans(
                     records,
                     selector,
                     infinite=infinite,
+                    stages=stages,
+                    measure_before_hunt=stage is None,
                     priority=priority,
                     on_progress=on_progress,
                     execute=execute_job,
@@ -348,6 +352,48 @@ async def run_scans(
                     account=record["github_account"],
                 )
                 reporter = Reporter(store, client, config, paths)
+
+                async def launch(job_stage, target, *, avoid=()):
+                    selected = AgentSelector(paths, config) if avoid else selector
+                    if not selected.explicit:
+                        preparation = ScanProgress(
+                            {"repository": record["name"], "stage": job_stage},
+                            on_progress,
+                        )
+                        preparation.update("loading agent evidence from GitHub")
+                        client.on_status = preparation.update
+                        async with preparation.watch():
+                            await reporter.project_repository_records(record["name"])
+                    route, decision = selected.select(
+                        store,
+                        record["name"],
+                        job_stage,
+                        avoid=avoid or independent_agents(target),
+                    )
+                    if (job_stage in ("review", "integrate") or avoid) and decision[
+                        "independence"
+                    ] != "different_model":
+                        raise ValueError(
+                            "Independent validation requires a different public adapter/model from the fix agent and previous review agents; select another model"
+                        )
+                    execution = {
+                        **config.execution(route, record),
+                        "agent_selection": decision,
+                    }
+                    if target:
+                        execution.update(stage=job_stage, target=target.model_dump(mode="json"))
+                    return await execute_job(
+                        paths,
+                        config,
+                        store,
+                        engine,
+                        record,
+                        execution,
+                        stage=job_stage,
+                        priority=priority,
+                        on_progress=on_progress,
+                    )
+
                 try:
                     if stage is None:
                         stage_event("measure", "running")
@@ -408,6 +454,7 @@ async def run_scans(
                             continue
                         stage_event(current_stage, "running")
                         stage_results = []
+                        stage_recovery_failed = False
                         skip_reasons = []
                         try:
                             if current_stage == "hunt":
@@ -481,56 +528,47 @@ async def run_scans(
                                     }
                                 )
                             for target in targets:
-                                if not selector.explicit:
-                                    preparation = ScanProgress(
-                                        {"repository": record["name"], "stage": current_stage},
-                                        on_progress,
-                                    )
-                                    preparation.update("loading agent evidence from GitHub")
-                                    client.on_status = preparation.update
-                                    async with preparation.watch():
-                                        await reporter.project_repository_records(record["name"])
-                                route, decision = selector.select(
-                                    store,
-                                    record["name"],
-                                    current_stage,
-                                    avoid=independent_agents(target),
-                                )
+                                result = await launch(current_stage, target)
+                                attempts = [result]
                                 if (
-                                    current_stage in ("review", "integrate")
-                                    and decision["independence"] != "different_model"
+                                    current_stage == "review"
+                                    and config.review.max_fix_attempts
+                                    and "fix" not in skip_stages
                                 ):
-                                    raise ValueError(
-                                        "Independent validation requires a different public adapter/model from the fix agent and previous review agents; select another model"
+                                    from maxwell.review_loop import complete_review
+
+                                    attempts, recovery_error = await complete_review(
+                                        reporter,
+                                        record["name"],
+                                        target,
+                                        result,
+                                        launch,
+                                        on_progress or (lambda event: None),
+                                        config.review.max_fix_attempts,
                                     )
-                                execution = {
-                                    **config.execution(route, record),
-                                    "agent_selection": decision,
-                                }
-                                if target:
-                                    execution.update(
-                                        stage=current_stage, target=target.model_dump(mode="json")
-                                    )
-                                result = await execute_job(
-                                    paths,
-                                    config,
-                                    store,
-                                    engine,
-                                    record,
-                                    execution,
-                                    stage=current_stage,
-                                    priority=priority,
-                                    on_progress=on_progress,
-                                )
-                                results.append(result)
-                                stage_results.append(result)
+                                    if recovery_error:
+                                        errors.append(
+                                            {
+                                                "repository": record["name"],
+                                                "stage": "review",
+                                                "error": recovery_error,
+                                            }
+                                        )
+                                        stage_recovery_failed = True
+                                    result = attempts[-1]
+                                results.extend(attempts)
+                                stage_results.extend(attempts)
                                 if (
                                     current_stage == "review"
                                     and config.fix.auto_merge.enabled
                                     and not selector.explicit
                                     and result["state"] == "completed"
                                     and not result["publication_errors"]
-                                    and len(stage_results) < config.fix.auto_merge.required_reviews
+                                    and sum(
+                                        item["stage"] == "review" and not item.get("resolved_by")
+                                        for item in stage_results
+                                    )
+                                    < config.fix.auto_merge.required_reviews
                                     and any(
                                         item["outcome"] == "accepted"
                                         for item in result["validations"]
@@ -550,7 +588,11 @@ async def run_scans(
                                             "state": "batch",
                                             "stage": current_stage,
                                             "total": len(targets),
-                                            "completed": len(stage_results),
+                                            "completed": sum(
+                                                item["stage"] == current_stage
+                                                and not item.get("resolved_by")
+                                                for item in stage_results
+                                            ),
                                         }
                                     )
                             stage_event(
@@ -558,8 +600,10 @@ async def run_scans(
                                 "skipped"
                                 if not targets
                                 else "failed"
-                                if any(
-                                    item["state"] != "completed" or item["publication_errors"]
+                                if stage_recovery_failed
+                                or any(
+                                    (item["state"] != "completed" or item["publication_errors"])
+                                    and not item.get("resolved_by")
                                     for item in stage_results
                                 )
                                 else "completed",
@@ -599,7 +643,8 @@ async def run_scans(
                 "errors": errors,
                 "valid": not errors
                 and all(
-                    result["state"] == "completed" and not result["publication_errors"]
+                    (result["state"] == "completed" and not result["publication_errors"])
+                    or result.get("resolved_by")
                     for result in results
                 ),
             }

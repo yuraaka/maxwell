@@ -5,7 +5,11 @@ Maxwell discovers repository problems, assesses evidence, and carries repairs th
 ## Language
 
 **measure**:
-The baseline measurement that establishes repository entropy and its components from source and test observations.
+The operation that establishes repository entropy and its components from source and test observations.
+_Avoid_: measurement as an operation name.
+
+**measurement**:
+The result of measure, recording factor values and source or test evidence for a repository revision.
 
 **hunt**:
 The stage that identifies candidate findings in a repository.
@@ -40,3 +44,9 @@ The findings occupying a stage up to its configured capacity. Findings waiting f
 
 **merge**:
 The act of incorporating a validated repair PR into its target branch. It precedes the integrate stage.
+
+**drain**:
+Repeatedly process selected stages for a bounded batch of findings until no further progress is possible, then exit.
+
+**infinite**:
+Continuously process selected stages, admitting new eligible findings and waiting when no work can proceed.

@@ -2,13 +2,14 @@ import json
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 
 from maxwell.cli import execute, parser
-from maxwell.config import Limits, Paths
+from maxwell.config import Config, Limits, Paths
 from maxwell.config_validation import validate_config
 from maxwell.github import GitHub
 from maxwell.store import Store
@@ -18,6 +19,28 @@ def update_config(home, update):
     data = yaml.safe_load(home.config.read_text())
     update(data)
     home.config.write_text(yaml.safe_dump(data))
+
+
+def test_generated_and_example_configs_use_measure(directory):
+    paths = Paths(directory / "generated")
+    paths.init_config()
+    generated = yaml.safe_load(paths.config.read_text())
+    example = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config.example.yaml").read_text()
+    )
+    for data in (generated, example):
+        assert "measure" in data
+        assert "measurement" not in data
+        assert Config.model_validate(data).measure.auto_test_runtime_budget_seconds == 60
+    assert paths.load().measure.tests == {}
+
+
+def test_obsolete_measurement_config_reports_replacement(home, github_requests, capsys):
+    update_config(home, lambda data: data.update(measurement={"tests": {}}))
+    code, report = command(home, capsys)
+    assert code == 1
+    assert "measurement: Obsolete key; use measure" in json.dumps(report)
+    assert github_requests[0] == []
 
 
 @pytest.fixture
@@ -241,6 +264,10 @@ def test_missing_settings_are_reported_together(home, github_requests, capsys, m
             "github.accounts.<key>.token",
         ),
         ("provider: {api_key: [secret-value]}", "provider.api_key"),
+        (
+            "measure: {tests: {secret-value: {command: []}}}",
+            "measure.tests.<key>.command",
+        ),
         (
             "fix: {auto_merge: {required_reviews: 0}}",
             "fix.auto_merge.required_reviews: Input should be greater than or equal to 1",

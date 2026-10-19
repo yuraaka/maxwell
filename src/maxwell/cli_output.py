@@ -249,6 +249,9 @@ def human_lines(value, command, repo_command=None):
             if measurement:
                 score = measurement.get("score")
                 parts.append(f"entropy {score:.2f}/100" if score is not None else "entropy unknown")
+            recovered = [item for item in runs if item.get("resolved_by")]
+            if recovered:
+                parts.append(f"{len(recovered)} review blockers resolved through fix")
             lines.append(f"{color(repository, '1;36')}: {'; '.join(parts) or 'scan finished'}")
             failures = {}
             for item in errors:
@@ -256,6 +259,11 @@ def human_lines(value, command, repo_command=None):
                     key = (item["stage"], item["error"])
                     failures[key] = failures.get(key, 0) + 1
             for item in runs:
+                if item.get("resolved_by"):
+                    reason = item.get("error") or item.get("summary") or "review required changes"
+                    reason = reason.split("; repair required for PR", 1)[0]
+                    lines.append(f"[RECOVERED] {repository} / {item['stage']}: {reason}")
+                    continue
                 if item["state"] != "completed" or item["publication_errors"]:
                     key = (
                         item["stage"],
@@ -276,7 +284,10 @@ def human_lines(value, command, repo_command=None):
                 ]
                 if unknown:
                     lines.append("Unknown factors: " + "; ".join(unknown))
+            seen_prs = set()
             for item in runs:
+                if item.get("resolved_by"):
+                    continue
                 for validation in item.get("validations", []):
                     from maxwell.measurement import validation_changes
                     from maxwell.records import RECORD_ADAPTER
@@ -297,10 +308,21 @@ def human_lines(value, command, repo_command=None):
                     )
                     lines.append(f"review: {validation['outcome']} · {delta}")
                 for link in item.get("pull_requests", []):
-                    lines.append(f"fix PR: https://github.com/{repository}/pull/{link['number']}")
+                    if link["number"] not in seen_prs:
+                        lines.append(
+                            f"fix PR: https://github.com/{repository}/pull/{link['number']}"
+                        )
+                        seen_prs.add(link["number"])
                 if not item.get("pull_requests"):
                     for repair in item.get("repairs", []):
-                        lines.append(f"fix: {repair['outcome']} · PR publication pending")
+                        publication = (
+                            "PR publication pending"
+                            if repair["outcome"] == "prepared"
+                            else "local draft retained; PR not published"
+                            if repair.get("commit")
+                            else "no PR prepared"
+                        )
+                        lines.append(f"fix: {repair['outcome']} · {publication}")
             status = next(
                 (item for item in value.get("statuses", []) if item["repository"] == repository),
                 None,

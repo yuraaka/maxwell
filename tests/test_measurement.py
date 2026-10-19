@@ -9,7 +9,7 @@ import yaml
 from pydantic import ValidationError
 
 from maxwell.cli import execute, parser
-from maxwell.config import MeasurementSettings, MeasurementTests
+from maxwell.config import MeasureSettings, MeasureTests
 from maxwell.github import GitHub
 from maxwell.measurement import (
     ANALYZER,
@@ -111,16 +111,16 @@ def test_legacy_measurement_digest_is_stable_and_not_a_full_baseline():
 )
 def test_invalid_weight_policies_are_rejected(weights):
     with pytest.raises(ValidationError):
-        MeasurementSettings(weights=weights)
+        MeasureSettings(weights=weights)
 
 
 def configure(home, source, **profile):
     with StoreContext(home) as store:
         store.register("acme/repo", str(source), "main")
     values = yaml.safe_load(home.config.read_text())
-    values["measurement"] = {"complexity_threshold": 1, "clone_tokens": 5, "clone_lines": 1}
+    values["measure"] = {"complexity_threshold": 1, "clone_tokens": 5, "clone_lines": 1}
     if profile:
-        values["measurement"]["tests"] = {
+        values["measure"]["tests"] = {
             "acme/repo": {
                 "command": [sys.executable, "-m", "pytest", "-q"],
                 "runs": 2,
@@ -254,9 +254,9 @@ def test_skipped_stages_reuse_github_history_without_running_them(
                 str(home.root),
                 "measure",
                 "acme/repo",
-                "--skip-stage",
+                "--skip",
                 "source",
-                "--skip-stage",
+                "--skip",
                 "tests",
                 "--json",
             ]
@@ -369,15 +369,20 @@ def test_incomplete_test_evidence_is_unknown_and_snapshots_cleaned(home, source,
         record = projected_measurements(store, "acme/repo")[0]
         assert "test_runtime" not in record.factors and "test_flakiness" not in record.factors
         assert record.evidence["tests"]["invalid_runs"]
+        if mode == "timeout":
+            assert "timeout after 0.8s" in record.factor_status["test_runtime"]
+            assert (
+                "measure.tests.<owner/repo>.timeout_seconds" in record.factor_status["test_runtime"]
+            )
     assert (source / "app.py").read_text().startswith("def average")
     assert not list((home.root / "repos").glob("*/worktrees/*"))
 
 
 def test_test_profile_paths_and_no_population_are_not_zero():
     with pytest.raises(ValidationError):
-        MeasurementTests(command=["pytest"], cwd="../escape")
+        MeasureTests(command=["pytest"], cwd="../escape")
     with pytest.raises(ValidationError):
-        MeasurementTests(command=["pytest"], runs=1)
+        MeasureTests(command=["pytest"], runs=1)
     assert measurement_score(measured(factors={})) is None
 
 
@@ -583,7 +588,7 @@ def test_auto_detected_pytest_profile_runs_without_configuration(home, source, g
     with StoreContext(home) as store:
         store.register("acme/repo", str(source), "main")
     config = home.load()
-    assert not config.measurement.tests
+    assert not config.measure.tests
     result = asyncio.run(run_measurements(home, config, "acme/repo"))
     assert result["valid"]
     assert result["measurements"][0]["score"] is not None
@@ -612,7 +617,7 @@ def test_auto_detection_uses_existing_checkout_venv_without_installing(source, m
     )
     interpreter.chmod(0o755)
     monkeypatch.setattr("maxwell.measurement_runner.importlib.util.find_spec", lambda name: None)
-    profile, reason = test_profile(source, MeasurementSettings(), "acme/repo", source)
+    profile, reason = test_profile(source, MeasureSettings(), "acme/repo", source)
     assert profile.command[0] == str(interpreter)
     assert profile.runs == 2 and "auto-detected" in reason
 

@@ -39,6 +39,7 @@ class ScanDisplay:
         self.settled_spending = None
         self.unknown_spending = False
         self.status_url = None
+        self.recovery_note = ""
 
     def __call__(self, event):
         with self.lock:
@@ -52,7 +53,7 @@ class ScanDisplay:
             self.stage = None
             self.stage_fraction = None
             self.repository = event["repository"]
-            self.stages = event["stages"]
+            self.stages = list(event["stages"])
             self.statuses = {}
             self.started = time.monotonic()
             self.last_wait = None
@@ -64,6 +65,7 @@ class ScanDisplay:
             self.execution_count = 0
             self.pipeline_counts = {}
             self.status_url = None
+            self.recovery_note = ""
             self.settled_spending = None
             self.unknown_spending = False
             return
@@ -116,6 +118,14 @@ class ScanDisplay:
             self.statuses = {}
             self.stage = None
             self.render()
+            return
+        if state == "recovery":
+            self.recovery_note = event["detail"]
+            if "fix" not in self.stages:
+                self.stages.insert(self.stages.index("review"), "fix")
+            if not self.interactive:
+                self.write(f"[LOOP] {self.repository}: {self.recovery_note}")
+            self.update({**event, "state": "stage", "status": "running"})
             return
         if state == "stage":
             if self.pipeline:
@@ -237,11 +247,7 @@ class ScanDisplay:
             )
 
         mode = (
-            " · continuous"
-            if self.pipeline == "infinite"
-            else " · fix queue"
-            if self.pipeline
-            else ""
+            " · continuous" if self.pipeline == "infinite" else " · drain" if self.pipeline else ""
         )
         title = clipped(f" Maxwell · {self.repository}{mode} ", width - 2)
         top = (
@@ -342,6 +348,8 @@ class ScanDisplay:
         if current:
             stage_rows.append(row(current))
         lines = [top, *stage_rows, row(bar), row(detail)]
+        if self.recovery_note:
+            lines.append(row([("Recovery: ", "33"), (self.recovery_note, "2")]))
         if self.pipeline:
             backlog = ", ".join(
                 f"{stage} {count}" for stage, count in self.backlog.items() if count

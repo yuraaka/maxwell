@@ -262,7 +262,7 @@ class Daemon:
             else:
                 if target:
                     context = measurement_context(
-                        self.store, job["repository"], sha, self.config.measurement
+                        self.store, job["repository"], sha, self.config.measure
                     )
                     (artifact / "assessment-context.json").write_text(
                         self.config.redact(json.dumps(context, indent=2))

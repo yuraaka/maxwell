@@ -88,7 +88,7 @@ def classify_item(
             record.id for record in input_assessments(finding, assessments)
         }:
             return item("fix", reason="repair assessment inputs changed")
-        if any(record.state == "failed" and record.requires_rebase for record in votes):
+        if any(record.requires_fix for record in votes):
             return item("fix", "fix")
         completed = [record for record in votes if record.state == "completed"]
         if any(record.outcome == "rejected" for record in completed):
@@ -285,11 +285,15 @@ class AttemptLedger:
             (repository, key_stage, subject),
         )["attempted"]
         if stage in ("fix", "hunt") and latest is not None:
-            if stage == "fix" and not self.infinite and latest >= self.started:
-                return (
-                    "repair already attempted in this batch; remaining feedback needs another run"
-                )
-            if time.time() < latest + interval:
+            new_feedback = stage == "fix" and row is None and latest >= self.started
+            if stage == "fix":
+                count = self.store.one(
+                    "SELECT COUNT(*) AS n FROM pipeline_attempts WHERE repository=? AND stage=? AND subject=? AND attempted>=?",
+                    (repository, key_stage, subject, self.started),
+                )["n"]
+                if count >= max(1, self.config.review.max_fix_attempts):
+                    return "review recovery reached review.max_fix_attempts; unresolved feedback retained"
+            if not new_feedback and time.time() < latest + interval:
                 return f"{stage} cooldown; retry at {datetime.fromtimestamp(latest + interval, UTC):%H:%M:%S UTC}"
         if row:
             if row["state"] == "completed" and stage != "hunt":
@@ -325,6 +329,7 @@ class PipelineRepository:
     deferred: set = field(default_factory=set)
     pools: dict = field(default_factory=dict)
     backlog: dict = field(default_factory=dict)
+    review_fixes: Counter = field(default_factory=Counter)
 
 
 async def targets_for(reporter, repository, snapshot, stage, issue):
@@ -388,6 +393,8 @@ async def run_pipeline(
     selector,
     *,
     infinite,
+    stages,
+    measure_before_hunt,
     priority,
     on_progress,
     execute,
@@ -395,6 +402,13 @@ async def run_pipeline(
     from maxwell.manual import independent_agents
 
     capacities = config.pipeline.pools.model_dump(by_alias=True)
+    recovery_only = (
+        "review" in stages and "fix" not in stages and config.review.max_fix_attempts > 0
+    )
+    execution_stages = tuple(
+        stage for stage in STAGES if stage in stages or recovery_only and stage == "fix"
+    )
+    allow_merge = "review" in stages
     ledger = AttemptLedger(store, config, infinite)
     contexts = []
     errors = []
@@ -412,7 +426,11 @@ async def run_pipeline(
                 account=registration["github_account"],
             )
             reporter = Reporter(
-                store, client, config, paths, merge_issues=set() if not infinite else None
+                store,
+                client,
+                config,
+                paths,
+                merge_issues=None if infinite and allow_merge else set(),
             )
             contexts.append(PipelineRepository(registration, reporter))
         if on_progress:
@@ -422,8 +440,8 @@ async def run_pipeline(
                     if len(registrations) == 1
                     else "all repositories",
                     "state": "plan",
-                    "stages": list(POOLS),
-                    "pipeline": "infinite" if infinite else "repair-all",
+                    "stages": list(stages),
+                    "pipeline": "infinite" if infinite else "drain",
                 }
             )
         while True:
@@ -442,11 +460,31 @@ async def run_pipeline(
                     if context.scope is None and not infinite:
                         context.scope = {item.identity for item in snapshot.items}
                         context.initial = {item.identity: item.issue for item in snapshot.items}
-                        context.reporter.merge_issues = set(context.initial.values())
+                        if allow_merge:
+                            context.reporter.merge_issues = set(context.initial.values())
                         async with preparation.watch():
                             snapshot = await load_snapshot(context.reporter, repository)
                         context.snapshot = snapshot
-                    candidates = {stage: [] for stage in STAGES}
+                    if context.scope is not None:
+                        context.initial.update(
+                            (item.identity, item.issue)
+                            for item in snapshot.items
+                            if item.identity in context.scope
+                        )
+                        if allow_merge:
+                            context.reporter.merge_issues = set(context.initial.values())
+                    candidates = {stage: [] for stage in execution_stages}
+                    repair_prs = (
+                        {link.finding_id for link in records(store, repository, "pull_request")}
+                        if recovery_only
+                        else set()
+                    )
+
+                    def selected(item):
+                        return item.stage in candidates and (
+                            not recovery_only or item.stage != "fix" or item.identity in repair_prs
+                        )
+
                     scoped = [
                         item
                         for item in snapshot.items
@@ -465,7 +503,7 @@ async def run_pipeline(
                         snapshot.items,
                         key=lambda item: (
                             context.scope is not None and item.identity not in context.scope,
-                            item.stage is None or item.identity in context.deferred,
+                            not selected(item) or item.identity in context.deferred,
                             ranks.get(item.issue, len(ranks)),
                             item.issue,
                         ),
@@ -491,20 +529,30 @@ async def run_pipeline(
                     for item in admitted:
                         if context.scope is not None and item.identity not in context.scope:
                             continue
-                        if item.stage:
+                        if selected(item):
                             candidates[item.stage].append(item)
                     for stage, count in context.backlog.items():
                         if count:
                             context.waiting.append(
                                 f"{stage} backlog: {count} waiting for a pool slot"
                             )
-                    if infinite:
+                    if "hunt" in candidates and (infinite or not context.counts["hunt"]):
                         candidates["hunt"] = [None]
                     executed = False
-                    for stage in STAGES:
+                    for stage in execution_stages:
                         if executed:
                             break
                         for item in candidates[stage]:
+                            if (
+                                recovery_only
+                                and stage == "fix"
+                                and context.review_fixes[item.identity]
+                                >= config.review.max_fix_attempts
+                            ):
+                                context.waiting.append(
+                                    f"#{item.issue}: review recovery reached review.max_fix_attempts={config.review.max_fix_attempts}; unresolved work retained"
+                                )
+                                continue
                             if not has_room(snapshot, item, stage, capacities):
                                 context.waiting.append(
                                     f"{stage} pool full ({snapshot.occupancy()[stage]}/{capacities[stage]})"
@@ -565,7 +613,11 @@ async def run_pipeline(
                                 if blocked:
                                     context.waiting.append(blocked)
                                     continue
-                                if stage == "hunt" and context.measured_head != snapshot.head:
+                                if (
+                                    measure_before_hunt
+                                    and stage == "hunt"
+                                    and context.measured_head != snapshot.head
+                                ):
                                     context.measured_head = snapshot.head
                                     emit(context, "stage", stage="measure", status="running")
                                     async with preparation.watch():
@@ -593,6 +645,14 @@ async def run_pipeline(
                                             }
                                         )
                                         errors[:] = errors[-20:]
+                                if recovery_only and stage == "fix":
+                                    context.review_fixes[item.identity] += 1
+                                    emit(
+                                        context,
+                                        "recovery",
+                                        stage="fix",
+                                        detail=f"issue #{issue}: fix attempt {context.review_fixes[item.identity]}/{config.review.max_fix_attempts} for review feedback",
+                                    )
                                 emit(
                                     context,
                                     "stage",
@@ -649,6 +709,10 @@ async def run_pipeline(
                                     message,
                                 )
                                 context.counts[stage] += 1
+                                if stage == "hunt" and context.scope is not None:
+                                    context.scope.update(
+                                        finding["id"] for finding in result.get("findings", [])
+                                    )
                                 context.failed += not success
                                 if not success:
                                     context.deferred.add(subject)
@@ -734,7 +798,7 @@ async def run_pipeline(
                 }
             )
         return {
-            "pipeline": "infinite" if infinite else "repair-all",
+            "pipeline": "infinite" if infinite else "drain",
             "pipeline_repositories": summaries,
             "scans": recent,
             "measurements": measurements,

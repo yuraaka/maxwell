@@ -1,4 +1,4 @@
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from maxwell.contracts import Spending, estimate_cost, micros
 
@@ -92,11 +92,14 @@ def combine_spending(first, second):
 
 
 def money(amount):
-    return f"${Decimal(amount) / 1_000_000:,.4f}"
+    dollars = (Decimal(amount) / 1_000_000).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"${dollars:,}"
 
 
 def cost_range(amount, upper=None):
-    return money(amount) + (f"–{money(upper)}" if upper is not None and upper != amount else "")
+    lower = money(amount)
+    higher = money(upper) if upper is not None else lower
+    return lower + (f"–{higher}" if higher != lower else "")
 
 
 def spending_summary(spending):

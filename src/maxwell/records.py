@@ -293,6 +293,26 @@ class ValidationRecord(Record):
     merge_conflicts: list[str] = Field(default_factory=list)
 
     @property
+    def has_failed_ci(self):
+        return any(
+            check.command[:1] == ["github-ci"] and check.state == "failed" for check in self.checks
+        )
+
+    @property
+    def requires_fix(self):
+        return bool(
+            self.requires_rebase
+            or self.has_failed_ci
+            or self.state == "completed"
+            and (
+                self.outcome == "rejected"
+                or self.outcome == "inconclusive"
+                and self.result
+                and (self.result.concerns or self.result.comments)
+            )
+        )
+
+    @property
     def requires_rebase(self):
         return (
             self.type == "validation"

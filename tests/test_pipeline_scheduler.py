@@ -25,6 +25,7 @@ from maxwell.pipeline import (
     run_pipeline,
 )
 from maxwell.records import AssessmentRecord, FindingRecord, PublicAgent
+from maxwell.stages import AGENT_STAGES, select_stages
 from maxwell.store import Store
 
 _automatic = pytest.fixture(name="automatic")(automatic_fixture.__wrapped__)
@@ -105,14 +106,20 @@ def test_partial_validation_quorum_and_amendments_count_one_issue(subject):
     repair = Namespace(references=[review.id, audit.id])
     pull = {"state": "open"}
     vote = Namespace(
-        state="completed", outcome="accepted", agent=Namespace(adapter="codex", model="v1")
+        state="completed",
+        outcome="accepted",
+        requires_fix=False,
+        agent=Namespace(adapter="codex", model="v1"),
     )
     first = classify(subject, repair=repair, pull=pull, votes=[vote])
     assert (first.pool, first.stage) == ("fix", "review")
     duplicate = Namespace(**vars(vote))
     assert classify(subject, repair=repair, pull=pull, votes=[vote, duplicate]).stage == "review"
     second = Namespace(
-        state="completed", outcome="accepted", agent=Namespace(adapter="codex", model="v2")
+        state="completed",
+        outcome="accepted",
+        requires_fix=False,
+        agent=Namespace(adapter="codex", model="v2"),
     )
     ready = classify(subject, repair=repair, pull=pull, votes=[vote, second])
     assert ready.pool == "review" and ready.stage is None
@@ -121,6 +128,8 @@ def test_partial_validation_quorum_and_amendments_count_one_issue(subject):
     assert (amendment.pool, amendment.stage) == ("fix", "fix")
     second.outcome = "inconclusive"
     assert classify(subject, repair=repair, pull=pull, votes=[second]).stage is None
+    second.requires_fix = True
+    assert classify(subject, repair=repair, pull=pull, votes=[second]).stage == "fix"
 
 
 def test_existing_provisional_repair_can_resume_and_merged_repairs_get_integration(subject):
@@ -201,7 +210,6 @@ def test_failed_validation_execution_ids_do_not_bypass_backoff():
 @pytest.mark.parametrize(
     "options",
     [
-        {"stage": "hunt"},
         {"issue": 1},
         {"limit": 2},
         {"force": True},
@@ -210,15 +218,40 @@ def test_failed_validation_execution_ids_do_not_bypass_backoff():
     ],
 )
 def test_pipeline_rejects_ambiguous_overrides_before_execution(home, options):
-    with pytest.raises(ValueError, match="--repair-all/--infinite"):
-        asyncio.run(run_scans(home, home.load(), repair_all=True, **options))
+    with pytest.raises(ValueError, match="--drain/--infinite"):
+        asyncio.run(run_scans(home, home.load(), drain=True, stage="validate-", **options))
 
 
 def test_cli_modes_are_mutually_exclusive():
     assert parser().parse_args(["scan", "--infinite"]).infinite
-    assert parser().parse_args(["scan", "--repair-all"]).repair_all
+    assert parser().parse_args(["scan", "--drain"]).drain
     with pytest.raises(SystemExit):
-        parser().parse_args(["scan", "--repair-all", "--infinite"])
+        parser().parse_args(["scan", "--drain", "--infinite"])
+    with pytest.raises(SystemExit):
+        parser().parse_args(["scan", "--repair-all"])
+
+
+@pytest.mark.parametrize("mode", ["drain", "infinite"])
+@pytest.mark.parametrize("selection", [None, "validate-", "audit-review", "review"])
+def test_repeat_modes_forward_stage_selection(automatic, monkeypatch, mode, selection):
+    home, _, config = automatic
+    argv = ["scan", f"--{mode}"] + (["--stage", selection] if selection else [])
+    args = parser().parse_args(argv)
+    assert getattr(args, mode)
+    assert args.stage == selection
+    calls = []
+
+    async def pipeline(*args, **kwargs):
+        calls.append(kwargs)
+        return {"valid": True}
+
+    monkeypatch.setattr("maxwell.pipeline.run_pipeline", pipeline)
+    result = asyncio.run(run_scans(home, config, "acme/repo", stage=selection, **{mode: True}))
+    assert result["valid"]
+    assert len(calls) == 1
+    assert calls[0]["stages"] == select_stages(selection)
+    assert calls[0]["infinite"] == (mode == "infinite")
+    assert calls[0]["measure_before_hunt"] == (selection is None)
 
 
 def test_admission_precheck_does_not_create_failed_jobs(home, monkeypatch):
@@ -243,12 +276,12 @@ def test_real_batch_reviews_and_audits_all_existing_findings_without_hunting(
     home, store, config = automatic
     github["branches"]["main"] = git("rev-parse", "HEAD", cwd=source)
     config.pipeline.pools.fix = 0
-    result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
+    result = asyncio.run(run_scans(home, config, "acme/repo", drain=True, stage="validate-"))
     assert result["valid"], json.dumps(result, indent=2)
     assert [item["stage"] for item in result["scans"]] == ["validate", "audit", "validate", "audit"]
     assert result["pipeline_repositories"][0]["remaining"] == 2
     assert store.one("SELECT COUNT(*) AS n FROM scans")["n"] == 4
-    again = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
+    again = asyncio.run(run_scans(home, config, "acme/repo", drain=True, stage="validate-"))
     assert again["valid"] and not again["scans"]
 
 
@@ -285,7 +318,7 @@ def test_real_batch_resumes_prepared_pr_with_independent_validation(
 ):
     store, config, _, _, _, _ = repairable
     cache_models(home, store, config)
-    result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
+    result = asyncio.run(run_scans(home, config, "acme/repo", drain=True, stage="validate-"))
     assert result["valid"], json.dumps(result, indent=2)
     assert [item["stage"] for item in result["scans"]] == ["review"]
     scan = result["scans"][0]
@@ -295,6 +328,20 @@ def test_real_batch_resumes_prepared_pr_with_independent_validation(
     assert any(
         "auto-merge disabled" in reason for reason in result["pipeline_repositories"][0]["waiting"]
     )
+    assert not github["merges"]
+
+
+def test_integrate_only_drain_does_not_auto_merge_reviewed_pr(home, prepared, repairable, github):
+    from test_validation import validate
+
+    store, config, _, _, _, _ = repairable
+    cache_models(home, store, config)
+    assert validate(home)["valid"]
+    config.fix.auto_merge.enabled = True
+    config.fix.auto_merge.required_reviews = 1
+    result = asyncio.run(run_scans(home, config, "acme/repo", stage="integrate", drain=True))
+    assert result["valid"], json.dumps(result, indent=2)
+    assert not result["scans"]
     assert not github["merges"]
 
 
@@ -345,6 +392,7 @@ def scheduler(home, monkeypatch, subject):
     )
 
     async def run(execute, **kwargs):
+        infinite = kwargs.pop("infinite", False)
         return await run_pipeline(
             home,
             config,
@@ -352,7 +400,9 @@ def scheduler(home, monkeypatch, subject):
             None,
             kwargs.pop("registrations", [store.repository("acme/repo")]),
             selector,
-            infinite=kwargs.pop("infinite", False),
+            infinite=infinite,
+            stages=kwargs.pop("stages", AGENT_STAGES if infinite else AGENT_STAGES[1:]),
+            measure_before_hunt=kwargs.pop("measure_before_hunt", True),
             priority=2,
             on_progress=kwargs.pop("on_progress", None),
             execute=execute,
@@ -441,6 +491,103 @@ def test_scheduler_drains_downstream_before_admitting_upstream(scheduler):
     report = asyncio.run(scheduler.run(execute))
     assert report["valid"]
     assert scheduler.executions == [(2, "audit"), (1, "validate")]
+
+
+@pytest.mark.parametrize(
+    "selection, expected",
+    [
+        ("validate", [(1, "validate")]),
+        ("validate-audit", [(2, "audit"), (1, "validate"), (1, "audit")]),
+        ("review", [(4, "review")]),
+    ],
+)
+def test_drain_executes_only_selected_stages(scheduler, selection, expected):
+    scheduler.state.update({2: ("validate", "audit"), 3: ("audit", "fix"), 4: ("fix", "review")})
+    following = {"validate": "audit", "audit": "fix", "review": None}
+    stages = select_stages(selection)
+    events = []
+
+    async def execute(*args, stage, **kwargs):
+        issue = args[5]["target"]["issue"]
+        scheduler.executions.append((issue, stage))
+        scheduler.state[issue] = (stage, following[stage])
+        assert (kwargs["merge_issues"] == set()) == ("review" not in stages)
+        return scheduler.result(stage)
+
+    report = asyncio.run(scheduler.run(execute, stages=stages, on_progress=events.append))
+    assert report["valid"]
+    assert report["pipeline"] == "drain"
+    assert events[0]["stages"] == list(stages)
+    assert scheduler.executions == expected
+
+
+def test_selected_review_gets_pool_slot_before_excluded_fix(scheduler):
+    scheduler.config.pipeline.pools.fix = 1
+    scheduler.state.update({1: ("fix", "fix"), 2: ("fix", "review")})
+
+    async def execute(*args, stage, **kwargs):
+        issue = args[5]["target"]["issue"]
+        scheduler.executions.append((issue, stage))
+        scheduler.state[issue] = ("review", None)
+        return scheduler.result(stage)
+
+    report = asyncio.run(scheduler.run(execute, stages=("review",)))
+    assert report["valid"]
+    assert scheduler.executions == [(2, "review")]
+
+
+def test_drain_hunts_once_and_admits_its_findings_only(scheduler, monkeypatch):
+    scheduler.state.clear()
+    now = [1000.0]
+    monkeypatch.setattr("maxwell.pipeline.time.time", lambda: now[0])
+
+    async def measure(*args):
+        pytest.fail("explicit stage selections must reuse measurement history")
+
+    async def execute(*args, stage, **kwargs):
+        now[0] += scheduler.config.limits.scan_interval_seconds * 2
+        if stage == "hunt":
+            scheduler.executions.append((None, stage))
+            scheduler.state.update({3: ("hunt", "validate"), 4: ("hunt", "validate")})
+            return {**scheduler.result(stage), "findings": [{"id": "3"}]}
+        issue = args[5]["target"]["issue"]
+        scheduler.executions.append((issue, stage))
+        scheduler.state[issue] = ("validate", "audit")
+        return scheduler.result(stage)
+
+    monkeypatch.setattr("maxwell.pipeline.measure_one", measure)
+    report = asyncio.run(
+        scheduler.run(execute, stages=("hunt", "validate"), measure_before_hunt=False)
+    )
+    assert report["valid"]
+    assert scheduler.executions == [(None, "hunt"), (3, "validate")]
+    assert scheduler.state[4] == ("hunt", "validate")
+
+
+def test_infinite_stage_selection_waits_and_admits_new_work_without_hunting(scheduler, monkeypatch):
+    scheduler.state[2] = ("validate", "audit")
+    waits = []
+
+    async def execute(*args, stage, **kwargs):
+        assert stage == "audit"
+        assert kwargs["merge_issues"] == set()
+        issue = args[5]["target"]["issue"]
+        scheduler.executions.append((issue, stage))
+        scheduler.state[issue] = ("audit", "fix")
+        return scheduler.result(stage)
+
+    async def wait(seconds, progress):
+        waits.append(seconds)
+        if len(waits) == 1:
+            scheduler.state[3] = ("validate", "audit")
+        else:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("maxwell.pipeline.wait_for_work", wait)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scheduler.run(execute, infinite=True, stages=("audit",)))
+    assert scheduler.executions == [(2, "audit"), (3, "audit")]
+    assert waits == [scheduler.config.pipeline.poll_seconds] * 2
 
 
 def test_existing_backlog_refills_bounded_pool_before_new_reviews(scheduler):
@@ -596,7 +743,7 @@ def test_real_batch_validates_quorum_merges_and_verifies_main(
         return result
 
     monkeypatch.setattr(GitHub, "merge_pull", merge)
-    result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
+    result = asyncio.run(run_scans(home, config, "acme/repo", drain=True, stage="validate-"))
     assert result["valid"], json.dumps(result, indent=2)
     assert [run["stage"] for run in result["scans"]] == (
         ["integrate"] if already_validated else ["review", "review", "integrate"]
@@ -608,12 +755,21 @@ def test_real_batch_validates_quorum_merges_and_verifies_main(
     assert len(github["merges"]) == 1
 
 
-def test_real_batch_creates_second_repair_and_validates_both(home, prepared, repairable, github):
+@pytest.mark.parametrize("fix_only", [False, True])
+def test_real_batch_creates_second_repair_and_validates_both(
+    home, prepared, repairable, github, fix_only
+):
     from maxwell.records import encode_record
     from maxwell.reporting import record_report
 
     store, config, reporter, original, review, _ = repairable
     cache_models(home, store, config)
+    if fix_only:
+        from test_validation import validate
+
+        assert validate(home)["valid"]
+        config.fix.auto_merge.enabled = True
+        config.fix.auto_merge.required_reviews = 1
     value = original.finding.model_copy(update={"title": "Another existing empty-input finding"})
     finding = original.model_copy(update={"id": value.identity("acme/repo"), "finding": value})
     second = reporter.github.create_issue(
@@ -632,11 +788,15 @@ def test_real_batch_creates_second_repair_and_validates_both(home, prepared, rep
     )
     reporter.github.create_comment("acme/repo", second, record_report(review))
     reporter.github.create_comment("acme/repo", second, record_report(audit))
-    result = asyncio.run(run_scans(home, config, "acme/repo", repair_all=True))
+    result = asyncio.run(
+        run_scans(home, config, "acme/repo", drain=True, stage="fix" if fix_only else "validate-")
+    )
     assert result["valid"], json.dumps(result, indent=2)
-    assert [run["stage"] for run in result["scans"]] == ["review", "fix", "review"]
+    assert [run["stage"] for run in result["scans"]] == (
+        ["fix"] if fix_only else ["review", "fix", "review"]
+    )
     assert len(github["pulls"]) == 2
-    assert result["pipeline_repositories"][0]["pools"]["review"] == 2
+    assert result["pipeline_repositories"][0]["pools"]["review"] == (1 if fix_only else 2)
     assert not github["merges"]
 
 

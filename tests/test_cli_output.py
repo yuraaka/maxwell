@@ -166,6 +166,34 @@ def test_scan_summary_groups_failures_and_links_main_status():
 
 
 @pytest.mark.parametrize(
+    "outcome, commit, expected",
+    [
+        ("prepared", "abc", "PR publication pending"),
+        ("checks_failed", "abc", "local draft retained; PR not published"),
+        ("blocked", None, "no PR prepared"),
+    ],
+)
+def test_scan_summary_distinguishes_local_fix_from_pending_pr(outcome, commit, expected):
+    report = {
+        "scans": [
+            {
+                "repository": "acme/repo",
+                "stage": "fix",
+                "state": "completed",
+                "publication_errors": [],
+                "findings": [],
+                "assessments": [],
+                "repairs": [{"outcome": outcome, "commit": commit}],
+            }
+        ],
+    }
+    text = "\n".join(human_lines(report, "scan"))
+    assert f"fix: {outcome} · {expected}" in text
+    if outcome != "prepared":
+        assert "PR publication pending" not in text
+
+
+@pytest.mark.parametrize(
     "arguments",
     [
         ["--json", "config", "apply"],
@@ -433,7 +461,7 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
     display({"state": "progress", "phase": "Waiting: integration pool full; Ctrl+C to stop"})
     panel = "\n".join(display.panel("2:00"))
     assert "continuous" in panel and "integrate 1/3" in panel
-    assert "100 executions" in panel and "$0.1000 USD" in panel
+    assert "100 executions" in panel and "$0 USD" in panel
     assert "100%" not in panel and "integration pool full" in panel
     assert "https://github.com/acme/repo/issues/4" in panel
     assert "Backlog:" in panel and "validate 23" in panel
@@ -443,9 +471,7 @@ def test_continuous_panel_shows_pool_capacity_and_aggregates_spending(monkeypatc
 def test_pipeline_counts_preparation_failures_without_inventing_agent_spending():
     display = ScanDisplay(io.StringIO())
     stages = ["fix", "review"]
-    display(
-        {"repository": "acme/repo", "state": "plan", "stages": stages, "pipeline": "repair-all"}
-    )
+    display({"repository": "acme/repo", "state": "plan", "stages": stages, "pipeline": "drain"})
     for index in range(4):
         display(
             {
@@ -465,7 +491,7 @@ def test_pipeline_counts_preparation_failures_without_inventing_agent_spending()
     display(event)
     display(event)
     panel = "\n".join(display.panel("1:00"))
-    assert "4 executions" in panel and "$0.0010 USD" in panel
+    assert "4 executions" in panel and "$0 USD" in panel
     assert not display.unknown_spending
     display({**event, "repository": "acme/other", "counts": {"fix": 2}})
     assert display.execution_count == 6
@@ -473,7 +499,7 @@ def test_pipeline_counts_preparation_failures_without_inventing_agent_spending()
 
 def test_batch_summary_uses_dashboard_without_per_execution_link_wall():
     result = {
-        "pipeline": "repair-all",
+        "pipeline": "drain",
         "scans": [{"report": "/private/report.md"}],
         "pipeline_repositories": [
             {

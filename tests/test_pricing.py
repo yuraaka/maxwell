@@ -39,7 +39,7 @@ def test_published_prices_apply_cache_rates_without_inferring_context_from_aggre
     )
     assert provider.usage.spending.micros == 865_000
     assert provider.usage.spending.upper_micros == 1_285_000
-    assert "$0.8650–$1.2850 USD" in spending_summary(provider.usage.spending)
+    assert "$1 USD" in spending_summary(provider.usage.spending)
     assert provider.usage.spending.source == OPENAI_PRICING
     assert provider.usage.cache_write_tokens == 10_000
     assert not provider.usage.spending.complete
@@ -90,7 +90,7 @@ def test_progress_cost_totals_replace_execution_snapshots_and_reset_per_reposito
     display({"state": "plan", "repository": "acme/repo", "stages": ["hunt", "review"]})
     display({"state": "running", "id": "hunt"})
     assert display.cost_label() == "Cost unknown"
-    for amount in (10_000, 20_000, 20_000):
+    for amount in (1_000_000, 2_000_000, 2_000_000):
         display(
             {
                 "state": "progress",
@@ -99,30 +99,30 @@ def test_progress_cost_totals_replace_execution_snapshots_and_reset_per_reposito
                 "usage": {"spending": Spending(micros=amount, source="test").model_dump()},
             }
         )
-    assert display.cost_label() == "$0.0200 USD est · partial"
+    assert display.cost_label() == "$2 USD est · partial"
     display(
         {
             "state": "completed",
             "id": "hunt",
             "usage": {
-                "spending": Spending(micros=25_000, source="test", complete=True).model_dump()
+                "spending": Spending(micros=2_500_000, source="test", complete=True).model_dump()
             },
         }
     )
     display({"state": "running", "id": "review"})
-    assert display.cost_label() == "$0.0250 USD est · partial"
+    assert display.cost_label() == "$3 USD est · partial"
     display(
         {
             "state": "completed",
             "id": "review",
             "usage": {
-                "spending": Spending(micros=15_000, source="test", complete=True).model_dump()
+                "spending": Spending(micros=1_500_000, source="test", complete=True).model_dump()
             },
         }
     )
-    assert display.cost_label() == "$0.0400 USD est"
+    assert display.cost_label() == "$4 USD est"
     display({"state": "plan", "repository": "acme/other", "stages": ["hunt"]})
-    assert display.cost_label() == "$0.0000 USD est"
+    assert display.cost_label() == "$0 USD est"
 
 
 def test_long_cost_ranges_fit_small_terminal_without_hiding_progress(monkeypatch):
@@ -147,11 +147,11 @@ def test_long_cost_ranges_fit_small_terminal_without_hiding_progress(monkeypatch
     )
     lines = [re.sub(r"\033\[[0-9;]*m", "", line) for line in display.panel("0:01")]
     assert all(len(line) == 39 for line in lines)
-    assert "0%" in lines[2] and "$1.0000–$2.0000" in lines[2]
+    assert "0%" in lines[2] and "$1–$2" in lines[2]
 
 
 def test_skipped_execution_without_model_call_does_not_create_unknown_cost():
     display = ScanDisplay(io.StringIO())
     display({"state": "running", "id": "hunt", "usage": None})
     display({"state": "skipped", "id": "hunt", "executed": 0, "usage": {}})
-    assert display.cost_label() == "$0.0000 USD est"
+    assert display.cost_label() == "$0 USD est"

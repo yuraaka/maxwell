@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 github:
   token: ""
@@ -37,13 +37,13 @@ limits:
   max_candidates_per_scan: 100
   max_hunt_diff_chars: 30000
   max_hunt_changed_files: 200
-  max_reviews_per_scan: 1
+  max_validations_per_scan: 1
   max_audits_per_scan: 1
   human_queue_max: 6
   minimum_confidence: 0.8
   shutdown_grace_seconds: 10
 
-measurement:
+measure:
   complexity_threshold: 10
   clone_tokens: 50
   clone_lines: 5
@@ -71,3 +71,13 @@ measurement:
   #     timeout_seconds: 600
   #     runtime_budget_seconds: 300
   #     environment: {}
+
+review:
+  max_fix_attempts: 3
+  ci: {}
+  # ci:
+  #   owner/repo:
+  #     checks: [tests]
+  #     poll_seconds: 30
+  #     timeout_seconds: 3600
+  #     measurement_check: tests

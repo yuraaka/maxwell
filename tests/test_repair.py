@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from maxwell.cli import parser
-from maxwell.config import MeasurementTests
+from maxwell.config import MeasureTests
 from maxwell.contracts import Finding
 from maxwell.daemon import Daemon
 from maxwell.github import GitHub
@@ -64,7 +64,7 @@ def repairable(home, source, finding, executable, github, monkeypatch):
     monkeypatch.setattr(Repository, "push_repair", push)
     monkeypatch.setattr(Repository, "fetch_pull", fetch)
     data = yaml.safe_load(home.config.read_text())
-    data["measurement"] = {
+    data["measure"] = {
         "tests": {
             "acme/repo": {
                 "command": [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
@@ -157,7 +157,7 @@ def test_repair_end_to_end_pinned_local_branch_and_repeat(home, source, repairab
     assert public["sha"] == finding.sha and public["references"] == [review.id]
     assert public["agent"]["role"] == "fixer" and public["availability"] == "local-only"
     assert public["spending"]["micros"] == 1900 and public["spending"]["complete"]
-    assert "$0.0019 USD" in next(iter(github["pulls"].values()))["body"]
+    assert "$0 USD" in next(iter(github["pulls"].values()))["body"]
     worktree = Path(public["worktree"])
     assert worktree.is_dir() and git("rev-parse", "HEAD", cwd=worktree) == public["commit"]
     assert git("rev-parse", "HEAD^", cwd=worktree) == finding.sha
@@ -181,6 +181,38 @@ def test_repair_end_to_end_pinned_local_branch_and_repeat(home, source, repairab
     assert not forced["valid"]
     assert len(github["pulls"]) == 1
     assert forced["scans"][0]["repairs"][0]["branch"] == public["branch"]
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "missing.py::test_empty",
+        "../test_app.py::test_empty",
+        "/test_app.py::test_empty",
+        "--test_app.py::test_empty",
+        "app.py::test_empty",
+    ],
+)
+def test_fix_rejects_selectors_without_changed_files(home, repairable, executable, reference):
+    executable.write_text(
+        executable.read_text().replace(
+            "['test_app.py'] if behavior", f"{[reference]!r} if behavior"
+        )
+    )
+    if reference == "app.py::test_empty":
+        executable.write_text(
+            "\n".join(
+                line[: len(line) - len(line.lstrip())] + "pass"
+                if "(workspace / 'app.py').write_text" in line
+                else line
+                for line in executable.read_text().splitlines()
+            )
+            + "\n"
+        )
+    result = run(home)
+    assert not result["valid"]
+    assert result["scans"][0]["error"] == "Regression coverage must refer to changed test files"
+    assert result["scans"][0]["repairs"][0]["commit"] is None
 
 
 @pytest.mark.parametrize(
@@ -299,11 +331,13 @@ def test_host_check_timeout_and_no_runner(home, source, directory):
     artifact = directory / "checks"
     artifact.mkdir()
     config = home.load()
-    profile = MeasurementTests(
+    profile = MeasureTests(
         command=[sys.executable, "-c", "import time; time.sleep(60)"], timeout_seconds=0.1
     )
     result = asyncio.run(run_checks(source, artifact, profile, config, lambda pid: None))
     assert result.state == "timeout" and result.returncode != 0
+    assert "Checks timed out after 0.1s" in result.detail
+    assert "measure.tests.<owner/repo>.timeout_seconds" in result.detail
     assert not (artifact / "check-process.json").exists()
     result = asyncio.run(run_checks(source, artifact, None, config, lambda pid: None))
     assert result.state == "unavailable"
@@ -386,7 +420,7 @@ def test_changed_assessments_block_prepared_repair(home, repairable, monkeypatch
 
 def test_missing_runner_retains_unready_draft(home, repairable):
     data = yaml.safe_load(home.config.read_text())
-    data.pop("measurement")
+    data.pop("measure")
     home.config.write_text(yaml.safe_dump(data))
     result = run(home)
     assert not result["valid"]
@@ -398,7 +432,7 @@ def test_missing_runner_retains_unready_draft(home, repairable):
 def test_host_check_cancellation_terminates_process(home, source, directory):
     artifact = directory / "cancel-checks"
     artifact.mkdir()
-    profile = MeasurementTests(command=[sys.executable, "-c", "import time; time.sleep(60)"])
+    profile = MeasureTests(command=[sys.executable, "-c", "import time; time.sleep(60)"])
     config = home.load()
 
     async def cancel():

@@ -65,8 +65,8 @@ def test_validator_updates_one_summary_and_comment_review(
     review = github["reviews"][number][0]
     assert review["event"] == "COMMENT" and review["commit_id"] == prepared["commit"]
     assert "### review agent · accepted" in review["body"]
-    assert "$0.0019 USD" in review["body"]
-    assert "$0.0019 USD" in review["comments"][0]["body"]
+    assert "$0 USD" in review["body"]
+    assert "$0 USD" in review["comments"][0]["body"]
     assert review["comments"][0]["body"].startswith("**review agent**")
     assert review["comments"][0]["line"] == 2
     review["body"] = review["body"].replace("### review agent ·", "### Validator ·", 1)
@@ -272,6 +272,7 @@ def test_merge_conflict_returns_pr_to_fixer_on_current_base(
     record = result["scans"][0]["validations"][0]
     assert record["outcome"] == "inconclusive" and record["state"] == "failed"
     assert record["merge_conflicts"] == ["app.py"]
+    assert "maxwell scan acme/repo --stage fix --issue 1" in result["scans"][0]["error"]
     assert not result["scans"][0]["usage"]["reported"]
     assert pull["draft"] and github["issues"][1]["state"] == "open"
     from maxwell.repair import collect_repair_targets
