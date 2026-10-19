@@ -30,6 +30,15 @@ class ProbeResult(BaseModel):
     ok: Literal[True]
 
 
+def usage_counters(usage, names, optional=()):
+    if not isinstance(usage, dict):
+        return None
+    values = [usage.get(name, 0 if name in optional else None) for name in names]
+    if any(type(value) is not int or value < 0 for value in values):
+        return None
+    return values
+
+
 def strict_output_schema(node):
     if isinstance(node, dict):
         if "properties" in node:
@@ -48,6 +57,7 @@ class CLIProvider:
     def __init__(self, paths, config):
         self.paths, self.config = paths, config
         self.usage = Usage()
+        self.usage_invalid = False
         self.started = False
         self.secrets = []
         self.errors = []
@@ -245,7 +255,7 @@ class CLIProvider:
                     f"{settings.adapter} agent timed out after {timeout:g}s "
                     "(limits.scan_timeout_seconds); see redacted artifacts"
                 ) from exc
-            self.usage.complete = process.returncode == 0
+            self.usage.complete = process.returncode == 0 and not self.usage_invalid
             if process.returncode:
                 message = f"{settings.adapter} exited with status {process.returncode}"
                 detail = self.failure_detail(artifact)
@@ -324,22 +334,30 @@ class CodexProvider(CLIProvider):
 
     def event(self, event):
         if event.get("type") == "turn.completed" and "usage" in event:
-            usage = event["usage"]
+            values = usage_counters(
+                event["usage"],
+                ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens"),
+                optional=("cache_write_tokens",),
+            )
+            if values is None:
+                self.usage_invalid = True
+                return
+            input_tokens, cached_input_tokens, cache_write_tokens, output_tokens = values
             turn = Usage(
-                input_tokens=max(0, int(usage.get("input_tokens", 0))),
-                cached_input_tokens=max(0, int(usage.get("cached_input_tokens", 0))),
-                cache_write_tokens=max(0, int(usage.get("cache_write_tokens", 0))),
-                output_tokens=max(0, int(usage.get("output_tokens", 0))),
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                cache_write_tokens=cache_write_tokens,
+                output_tokens=output_tokens,
                 reported=True,
             )
             spending = price_usage(turn, self.config.provider)
             self.usage.spending = (
                 combine_spending(self.usage.spending, spending) if self.usage.reported else spending
             )
-            self.usage.input_tokens += max(0, int(usage.get("input_tokens", 0)))
-            self.usage.cached_input_tokens += max(0, int(usage.get("cached_input_tokens", 0)))
+            self.usage.input_tokens += input_tokens
+            self.usage.cached_input_tokens += cached_input_tokens
             self.usage.cache_write_tokens += turn.cache_write_tokens
-            self.usage.output_tokens += max(0, int(usage.get("output_tokens", 0)))
+            self.usage.output_tokens += output_tokens
             self.usage.reported = True
 
 
@@ -497,15 +515,23 @@ class ClaudeProvider(CLIProvider):
         if event.get("type") != "result":
             return
         self.result = event
-        usage = event.get("usage")
-        if isinstance(usage, dict):
-            uncached = max(0, int(usage.get("input_tokens", 0)))
-            cached = max(0, int(usage.get("cache_read_input_tokens", 0)))
-            written = max(0, int(usage.get("cache_creation_input_tokens", 0)))
+        values = usage_counters(
+            event.get("usage"),
+            (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            ),
+        )
+        if "usage" in event and values is None:
+            self.usage_invalid = True
+        if values is not None:
+            uncached, cached, written, output = values
             self.usage.input_tokens = uncached + cached + written
             self.usage.cached_input_tokens = cached
             self.usage.cache_write_tokens = written
-            self.usage.output_tokens = max(0, int(usage.get("output_tokens", 0)))
+            self.usage.output_tokens = output
             self.usage.reported = True
         self.usage.spending = (
             price_usage(self.usage, self.config.provider)
