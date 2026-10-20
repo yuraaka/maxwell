@@ -34,8 +34,9 @@ def test_foreground_scan_publishes_without_daemon_and_leaves_other_jobs_alone(
     try:
         execute(scan_args(home, "acme/repo"))
         text = capsys.readouterr().out
-        assert "Hunt>" in text and "Hunt+" in text
-        assert "Hunt+ 1/1" not in text
+        lower = text.lower()
+        assert "hunt>" in lower and "hunt+" in lower
+        assert "hunt+ 1/1" not in lower
         assert "acme/repo: 1 new findings" in text
         assert "Status: https://github.com/acme/repo/issues/" in text
         assert "Report:" not in text and "Finding:" not in text
@@ -261,7 +262,7 @@ def test_silent_provider_reports_waiting_until_timeout(
         execute(scan_args(home, "acme/repo"))
     assert error.value.code == 1
     text = capsys.readouterr().out
-    assert "Hunt>" in text
+    assert "hunt>" in text.lower()
     assert "[WAIT]" not in text
     assert "[FAIL] acme/repo" in text
     detail = "codex agent timed out after 1s (limits.scan_timeout_seconds)"

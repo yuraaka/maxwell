@@ -47,7 +47,8 @@ print(json.dumps({'type':'assistant','message':{'content':[
     {'type':'text','text':'<StructuredOutput>'+json.dumps(assessment)+'</StructuredOutput>'}]}}))
 result={'type':'result','subtype':'success','is_error':False,
         'result':'I provided the assessment above.',
-        'usage':{'input_tokens':100,'output_tokens':10}}
+        'usage':{'input_tokens':100,'cache_read_input_tokens':0,
+                 'cache_creation_input_tokens':0,'output_tokens':10}}
 if retry and mode!='fail':result['structured_output']=assessment
 print(json.dumps(result))
 """

@@ -118,7 +118,7 @@ def test_manual_run_and_repo_account_change_from_another_directory(home, source,
     )
     assert registered.returncode == 0, registered.stderr
     scanned = subprocess.run(
-        [*prefix, "scan", "company/late", "--model", "fake-model", "--json"],
+        [*prefix, "scan", "company/late", "--stage", "hunt", "--model", "fake-model", "--json"],
         capture_output=True,
         text=True,
         cwd=directory,
